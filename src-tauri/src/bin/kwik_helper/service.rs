@@ -46,6 +46,8 @@ const STARTUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(25);
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(35);
 const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+const SERVICE_SPECIFIC_RUNTIME_FAILURE: u32 = 1;
+const MAX_STARTUP_DIAGNOSTIC_BYTES: usize = 4096;
 
 #[derive(Debug)]
 struct InstalledPaths {
@@ -174,8 +176,8 @@ fn write_install_manifest(paths: &InstalledPaths) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalized, valid_sid_text, GEOIP_RELATIVE_PATH, GEOSITE_RELATIVE_PATH,
-        HELPER_FILENAME, MIHOMO_FILENAME, UI_FILENAME, WINTUN_FILENAME,
+        normalized, valid_sid_text, GEOIP_RELATIVE_PATH, GEOSITE_RELATIVE_PATH, HELPER_FILENAME,
+        MIHOMO_FILENAME, UI_FILENAME, WINTUN_FILENAME,
     };
     use std::path::Path;
     use windows_service::service::ServiceState;
@@ -406,15 +408,27 @@ pub fn install() -> Result<()> {
 
     let deadline = std::time::Instant::now() + SERVICE_START_TIMEOUT;
     loop {
-        let state = service
+        let status = service
             .query_status()
-            .context("poll protected service start")?
-            .current_state;
-        if state == ServiceState::Running {
+            .context("poll protected service start")?;
+        if status.current_state == ServiceState::Running {
             break;
         }
-        if state == ServiceState::Stopped || std::time::Instant::now() >= deadline {
-            bail!("protected service did not reach Running within {SERVICE_START_TIMEOUT:?}");
+        if status.current_state == ServiceState::Stopped {
+            let diagnostic = super::helper_log::recent(MAX_STARTUP_DIAGNOSTIC_BYTES)
+                .unwrap_or_else(|| "protected startup diagnostic unavailable".to_string());
+            bail!(
+                "protected service stopped during startup ({:?}): {diagnostic}",
+                status.exit_code
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "protected service did not reach Running within {SERVICE_START_TIMEOUT:?} \
+                 (last_state={:?}, exit={:?})",
+                status.current_state,
+                status.exit_code
+            );
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -597,13 +611,21 @@ fn service_loop() -> Result<()> {
         cleanup_result.context("privileged shutdown transaction failed")
     })();
 
-    // Сообщаем SCM что мы остановились (любой исход)
-    let exit_code = if service_result.is_ok() { 0 } else { 1 };
+    // Persist the precise error in the ACL-protected runtime before reporting
+    // Stopped. The installing parent can then include it in its captured error
+    // chain before rollback removes the runtime leaf.
+    let exit_code = match &service_result {
+        Ok(()) => ServiceExitCode::Win32(0),
+        Err(error) => {
+            super::helper_log::log(&format!("[helper-service] fatal error: {error:#}"));
+            ServiceExitCode::ServiceSpecific(SERVICE_SPECIFIC_RUNTIME_FAILURE)
+        }
+    };
     let _ = status_handle.set_service_status(ServiceStatus {
         service_type: SERVICE_TYPE,
         current_state: ServiceState::Stopped,
         controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(exit_code),
+        exit_code,
         checkpoint: 0,
         wait_hint: Duration::default(),
         process_id: None,

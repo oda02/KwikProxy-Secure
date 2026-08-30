@@ -33,9 +33,15 @@ use std::ptr;
 use anyhow::{anyhow, bail, Context, Result};
 
 use windows_sys::core::GUID;
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
+use windows_sys::Win32::Foundation::{
+    ERROR_SUCCESS, FWP_E_PROVIDER_NOT_FOUND, FWP_E_SUBLAYER_NOT_FOUND, HANDLE,
+};
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
+
+fn is_success_or_expected_not_found(result: u32, expected_not_found: i32) -> bool {
+    result == ERROR_SUCCESS || result == expected_not_found as u32
+}
 
 /// GUID нашего provider'а — постоянная метка чтобы при cleanup мы могли
 /// найти именно «наши» объекты, не задев чужие WFP-фильтры (Defender,
@@ -512,7 +518,6 @@ impl Drop for WfpEngine {
 /// При любых других ошибках (engine не открылся, RPC fail) — `false`,
 /// чтобы не пугать пользователя ложным сигналом.
 pub fn has_orphan_filters() -> Result<bool> {
-    const FWP_E_SUBLAYER_NOT_FOUND: u32 = 0x8032_0006;
     let engine = WfpEngine::open_persistent().context("orphan-check: open engine")?;
     let mut sublayer_ptr: *mut FWPM_SUBLAYER0 = ptr::null_mut();
     unsafe {
@@ -523,7 +528,7 @@ pub fn has_orphan_filters() -> Result<bool> {
                 FwpmFreeMemory0(&mut (sublayer_ptr as *mut std::ffi::c_void));
             }
             Ok(true)
-        } else if rc == FWP_E_SUBLAYER_NOT_FOUND {
+        } else if rc == FWP_E_SUBLAYER_NOT_FOUND as u32 {
             Ok(false)
         } else {
             bail!("FwpmSubLayerGetByKey0 failed: 0x{:08x}", rc)
@@ -542,22 +547,17 @@ pub fn has_orphan_filters() -> Result<bool> {
 /// убрать всё, но если по какому-то редкому сценарию (kernel panic
 /// в момент crash и т.п.) фильтры остались, тут мы их добиваем.
 pub fn cleanup_provider() -> Result<()> {
-    // FWP_E_FILTER_NOT_FOUND = 0x80320005, _PROVIDER_NOT_FOUND = 0x80320007,
-    // _SUBLAYER_NOT_FOUND = 0x80320006
-    const FWP_E_PROVIDER_NOT_FOUND: u32 = 0x8032_0007;
-    const FWP_E_SUBLAYER_NOT_FOUND: u32 = 0x8032_0006;
-
     let engine = WfpEngine::open_persistent().context("cleanup: open engine")?;
     engine.transaction(|e| {
         unsafe {
             // Порядок: sublayer → provider. Удаление sublayer удаляет
             // все его фильтры автоматически.
             let rc = FwpmSubLayerDeleteByKey0(e.handle, &KWIK_SUBLAYER_GUID);
-            if rc != ERROR_SUCCESS && rc != FWP_E_SUBLAYER_NOT_FOUND {
+            if !is_success_or_expected_not_found(rc, FWP_E_SUBLAYER_NOT_FOUND) {
                 return Err(anyhow!("delete sublayer: 0x{:08x}", rc));
             }
             let rc = FwpmProviderDeleteByKey0(e.handle, &KWIK_PROVIDER_GUID);
-            if rc != ERROR_SUCCESS && rc != FWP_E_PROVIDER_NOT_FOUND {
+            if !is_success_or_expected_not_found(rc, FWP_E_PROVIDER_NOT_FOUND) {
                 return Err(anyhow!("delete provider: 0x{:08x}", rc));
             }
         }
@@ -569,6 +569,7 @@ pub fn cleanup_provider() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Foundation::FWP_E_PROVIDER_CONTEXT_NOT_FOUND;
 
     #[test]
     fn fork_uses_distinct_provider_and_sublayer_identity() {
@@ -576,5 +577,31 @@ mod tests {
         assert_eq!(KWIK_SUBLAYER_GUID.data1, 0xaef0_1ce1);
         assert_ne!(KWIK_PROVIDER_GUID.data1, 0xc6f1_bd86);
         assert_ne!(KWIK_SUBLAYER_GUID.data1, 0xc6f1_bd87);
+    }
+
+    #[test]
+    fn clean_startup_treats_official_wfp_not_found_codes_as_idempotent() {
+        assert_eq!(FWP_E_PROVIDER_NOT_FOUND as u32, 0x8032_0005);
+        assert_eq!(FWP_E_SUBLAYER_NOT_FOUND as u32, 0x8032_0007);
+        assert!(is_success_or_expected_not_found(
+            ERROR_SUCCESS,
+            FWP_E_PROVIDER_NOT_FOUND
+        ));
+        assert!(is_success_or_expected_not_found(
+            FWP_E_PROVIDER_NOT_FOUND as u32,
+            FWP_E_PROVIDER_NOT_FOUND
+        ));
+        assert!(is_success_or_expected_not_found(
+            FWP_E_SUBLAYER_NOT_FOUND as u32,
+            FWP_E_SUBLAYER_NOT_FOUND
+        ));
+        assert!(!is_success_or_expected_not_found(
+            FWP_E_PROVIDER_CONTEXT_NOT_FOUND as u32,
+            FWP_E_PROVIDER_NOT_FOUND
+        ));
+        assert!(!is_success_or_expected_not_found(
+            FWP_E_PROVIDER_CONTEXT_NOT_FOUND as u32,
+            FWP_E_SUBLAYER_NOT_FOUND
+        ));
     }
 }

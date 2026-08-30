@@ -9,7 +9,7 @@
 //! доступен). Файл переоткрывается на каждое сообщение — медленно, но
 //! kill-switch enable случается раз в connect-сессию, не критично.
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::security::Installation;
@@ -54,4 +54,22 @@ pub fn log(msg: &str) {
         let _ = f.seek(SeekFrom::End(0));
         let _ = writeln!(f, "[{ts}] {msg}");
     }
+}
+
+/// Read a bounded tail of the protected service log so the elevated installer
+/// process can surface an early startup failure before its safe rollback
+/// removes the per-install runtime directory.
+pub fn recent(max_bytes: usize) -> Option<String> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let installation = Installation::load().ok()?;
+    let mut file = installation.open_runtime_log("helper.log").ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(max_bytes as u64);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::with_capacity((length - start) as usize);
+    file.take(max_bytes as u64).read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
