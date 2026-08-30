@@ -75,8 +75,13 @@ pub async fn run_prepared_pipe_server(
 ) -> Result<()> {
     let PreparedPipeServer {
         installation,
-        mut server,
+        server,
     } = prepared;
+    // Keep listener ownership explicit: a successful connect transfers the
+    // sole instance to a worker, while an accept failure closes it before a
+    // replacement is created. This also lets shutdown close the listener
+    // before waiting for connected workers to drain.
+    let mut server = Some(server);
     eprintln!(
         "[helper-pipe] listening {PIPE_NAME}, install_id={}",
         installation.install_id
@@ -100,26 +105,48 @@ pub async fn run_prepared_pipe_server(
             permit = workers.clone().acquire_owned() => permit.context("pipe worker semaphore closed")?,
             _ = tick.tick() => continue,
         };
-        tokio::select! {
-            connect_result = server.connect() => {
+        enum ListenerEvent {
+            Connected(std::io::Result<()>),
+            Tick,
+        }
+        let event = {
+            let listener = server
+                .as_ref()
+                .context("named-pipe listener ownership invariant failed")?;
+            tokio::select! {
+                connect_result = listener.connect() => ListenerEvent::Connected(connect_result),
+                _ = tick.tick() => ListenerEvent::Tick,
+            }
+        };
+        match event {
+            ListenerEvent::Connected(connect_result) => {
                 if let Err(error) = connect_result {
+                    let stale = server
+                        .take()
+                        .context("named-pipe listener ownership invariant failed")?;
+                    drop(stale);
                     if !is_transient_accept_error(&error) {
                         return Err(error).context("named-pipe accept failed");
                     }
-                    drop(server);
-                    let Some(replacement) = create_replacement_pipe(&installation.owner_sid, &shutdown).await? else {
+                    let Some(replacement) =
+                        create_replacement_pipe(&installation.owner_sid, &shutdown).await?
+                    else {
                         break;
                     };
-                    server = replacement;
+                    server = Some(replacement);
                     drop(permit);
                     continue;
                 }
-                let connected = server;
-                let Some(replacement) = create_replacement_pipe(&installation.owner_sid, &shutdown).await? else {
+                let connected = server
+                    .take()
+                    .context("named-pipe listener ownership invariant failed")?;
+                let Some(replacement) =
+                    create_replacement_pipe(&installation.owner_sid, &shutdown).await?
+                else {
                     drop(connected);
                     break;
                 };
-                server = replacement;
+                server = Some(replacement);
                 let context = installation.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
@@ -128,10 +155,10 @@ pub async fn run_prepared_pipe_server(
                     }
                 });
             }
-            _ = tick.tick() => drop(permit),
+            ListenerEvent::Tick => drop(permit),
         }
     }
-    drop(server);
+    drop(server.take());
     let drain = async {
         while let Some(result) = tasks.join_next().await {
             if let Err(error) = result {

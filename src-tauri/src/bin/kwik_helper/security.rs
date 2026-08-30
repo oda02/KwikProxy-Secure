@@ -1198,7 +1198,7 @@ fn write_runtime_marker(installation: &Installation) -> Result<()> {
     if unsafe {
         WriteFile(
             handle.0,
-            contents.as_ptr() as *const c_void,
+            contents.as_ptr(),
             contents.len() as u32,
             &mut written,
             std::ptr::null_mut(),
