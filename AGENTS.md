@@ -2,8 +2,8 @@
 
 ## Dependency safety
 
-- Do not run `npm install`, `npm ci`, `npm update`, `npx`, `pnpm`, `yarn`, or any command that downloads or executes JavaScript packages.
-- Do not add or update npm dependencies without explicit user approval after reviewing the exact package, version, source, integrity metadata, maintainers, install scripts, and necessity.
+- JavaScript dependencies may be installed only when every package is a known, necessary dependency already fixed by the exact reviewed lockfile, and only after reviewing its source, integrity metadata, maintainers, and lifecycle/install scripts. Prefer a disposable least-privilege runner and require explicit user approval before executing package code.
+- Do not add random packages or use `npm update`, `npx`, `pnpm`, or `yarn` as a shortcut. Any dependency addition or version change requires explicit user approval and the same package-by-package review before the lockfile changes.
 - Treat npm lifecycle scripts and package binaries as untrusted code. Static inspection of `package.json` and `package-lock.json` is allowed.
 - Prefer existing platform tools and repository code over adding dependencies.
 

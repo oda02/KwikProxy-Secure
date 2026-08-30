@@ -1,4 +1,4 @@
-name: Rust security check (manual)
+name: Rust build and tests (manual)
 
 on:
   workflow_dispatch:
