@@ -5,6 +5,8 @@
 
 use std::ffi::c_void;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -12,7 +14,7 @@ use serde_yaml::{Mapping, Value};
 use sha2::{Digest, Sha256};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -24,15 +26,7 @@ use super::security::Installation;
 const MAX_CONFIG_BYTES: usize = 1400 * 1024;
 const SECURE_TUN_PREFIX: &str = "kwikproxy-secure-";
 
-struct Job(HANDLE);
-
-unsafe impl Send for Job {}
-
-impl Drop for Job {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.0) };
-    }
-}
+struct Job(OwnedHandle);
 
 struct State {
     child: Child,
@@ -100,7 +94,7 @@ pub async fn start(
         .raw_handle()
         .ok_or_else(|| anyhow!("spawned Mihomo has no process handle"))?
         as HANDLE;
-    if unsafe { AssignProcessToJobObject(job.0, process) } == 0 {
+    if unsafe { AssignProcessToJobObject(job.0.as_raw_handle() as HANDLE, process) } == 0 {
         let _ = child.kill().await;
         bail!("AssignProcessToJobObject failed");
     }
@@ -169,12 +163,13 @@ fn create_kill_on_close_job() -> Result<Job> {
     if handle.is_null() {
         bail!("CreateJobObjectW failed");
     }
-    let job = Job(handle);
+    // SAFETY: CreateJobObjectW returned a fresh owned job HANDLE.
+    let job = Job(unsafe { OwnedHandle::from_raw_handle(handle) });
     let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     if unsafe {
         SetInformationJobObject(
-            job.0,
+            job.0.as_raw_handle() as HANDLE,
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const c_void,
             std::mem::size_of_val(&info) as u32,

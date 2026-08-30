@@ -10,7 +10,7 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::MetadataExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle as StdOwnedHandle};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -393,7 +393,8 @@ impl Installation {
 
 fn known_folder(id: *const windows_sys::core::GUID) -> Result<PathBuf> {
     let mut raw = std::ptr::null_mut();
-    let hr = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, std::ptr::null_mut(), &mut raw) };
+    let hr =
+        unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT as u32, std::ptr::null_mut(), &mut raw) };
     if hr < 0 || raw.is_null() {
         bail!("SHGetKnownFolderPath failed: HRESULT {hr:#x}");
     }
@@ -1528,15 +1529,9 @@ pub fn interactive_shell_user_sid() -> Result<String> {
 /// Keeps the client process handle alive until request completion, preventing
 /// PID reuse after authentication.
 pub struct AuthenticatedClient {
-    process: HANDLE,
+    _process: StdOwnedHandle,
     pub pid: u32,
     pub session_id: u32,
-}
-
-impl Drop for AuthenticatedClient {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.process) };
-    }
 }
 
 pub fn authenticate_client(
@@ -1549,13 +1544,17 @@ pub fn authenticate_client(
         bail!("GetNamedPipeClientProcessId failed");
     }
 
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if process.is_null() {
+    let raw_process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw_process.is_null() {
         bail!("OpenProcess({pid}) failed");
     }
+    // SAFETY: OpenProcess returned a fresh owned process HANDLE. OwnedHandle
+    // provides exactly-once close and is safe to retain across async dispatch.
+    let process = unsafe { StdOwnedHandle::from_raw_handle(raw_process) };
+    let raw_process = process.as_raw_handle() as HANDLE;
 
     let result = (|| -> Result<u32> {
-        let sid = process_sid(process)?;
+        let sid = process_sid(raw_process)?;
         if !sid.eq_ignore_ascii_case(&installation.owner_sid) {
             bail!("pipe client SID is not the installation owner");
         }
@@ -1566,24 +1565,18 @@ pub fn authenticate_client(
         {
             bail!("pipe client is not in an active interactive session");
         }
-        let image = canonical_file(process_image(process)?)?;
+        let image = canonical_file(process_image(raw_process)?)?;
         if !same_path(&image, &installation.ui_path) {
             bail!("pipe client image is not the protected UI executable");
         }
         Ok(session_id)
     })();
 
-    match result {
-        Ok(session_id) => Ok(AuthenticatedClient {
-            process,
-            pid,
-            session_id,
-        }),
-        Err(error) => {
-            unsafe { CloseHandle(process) };
-            Err(error)
-        }
-    }
+    result.map(|session_id| AuthenticatedClient {
+        _process: process,
+        pid,
+        session_id,
+    })
 }
 
 fn is_active_interactive_session(session_id: u32) -> Result<bool> {
@@ -1748,5 +1741,11 @@ mod tests {
             validate_sha256_text(digest, "test digest").unwrap();
             assert!(artifacts.contains(digest));
         }
+    }
+
+    #[test]
+    fn authenticated_client_guard_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AuthenticatedClient>();
     }
 }

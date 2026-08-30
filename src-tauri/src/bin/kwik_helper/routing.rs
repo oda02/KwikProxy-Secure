@@ -11,12 +11,13 @@
 use std::ffi::c_void;
 use std::mem;
 use std::net::Ipv4Addr;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command as AsyncCommand;
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NOT_FOUND, HANDLE, NO_ERROR};
+use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, HANDLE, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     DeleteIpForwardEntry2, FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
 };
@@ -30,27 +31,20 @@ use windows_sys::Win32::System::JobObjects::{
 
 use super::security;
 
-struct CleanupJob(HANDLE);
-
-unsafe impl Send for CleanupJob {}
-
-impl Drop for CleanupJob {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.0) };
-    }
-}
+struct CleanupJob(OwnedHandle);
 
 fn create_cleanup_job() -> Result<CleanupJob> {
     let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if handle.is_null() {
         bail!("CreateJobObjectW(cleanup) failed");
     }
-    let job = CleanupJob(handle);
+    // SAFETY: CreateJobObjectW returned a fresh owned job HANDLE.
+    let job = CleanupJob(unsafe { OwnedHandle::from_raw_handle(handle) });
     let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { mem::zeroed() };
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     if unsafe {
         SetInformationJobObject(
-            job.0,
+            job.0.as_raw_handle() as HANDLE,
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const c_void,
             mem::size_of_val(&info) as u32,
@@ -207,7 +201,7 @@ pub async fn cleanup_orphan_tun(name: &str) -> Result<()> {
         .raw_handle()
         .ok_or_else(|| anyhow::anyhow!("cleanup PowerShell has no process handle"))?
         as HANDLE;
-    if unsafe { AssignProcessToJobObject(job.0, process) } == 0 {
+    if unsafe { AssignProcessToJobObject(job.0.as_raw_handle() as HANDLE, process) } == 0 {
         let _ = child.start_kill();
         bail!("AssignProcessToJobObject(cleanup) failed");
     }
