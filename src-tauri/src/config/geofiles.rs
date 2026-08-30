@@ -5,7 +5,7 @@
 //! берём `.sha256` (64 hex-символа, ≤100 байт) и сравниваем с
 //! сохранённым. Если совпадает — пропускаем `.dat` (5-15 МБ экономии).
 //!
-//! Файлы кешируются в `%LOCALAPPDATA%\KwikVPN\geofiles\`. Mihomo
+//! Файлы кешируются в `%LOCALAPPDATA%\KwikProxy Secure\geofiles\`. Mihomo
 //! читает geo-базы из своей `-d` data-dir, поэтому перед стартом мы
 //! копируем туда лучший доступный источник через [`provision_into`]:
 //! пользовательский (свежескачанный) приоритетнее бандла из ресурсов.
@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
-const DIR_NAME: &str = "KwikVPN";
+const DIR_NAME: &str = "KwikProxy Secure";
 const GEOFILES_SUBDIR: &str = "geofiles";
 
 /// Размер response-body, выше которого мы считаем файл подозрительным
@@ -29,7 +29,7 @@ const MAX_DOWNLOAD_BYTES: u64 = 50 * 1024 * 1024;
 /// канале (1 МБит/с) загрузятся за ~1.5 минуты — поэтому 90 сек.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Каталог хранения geofiles (`%LOCALAPPDATA%\KwikVPN\geofiles\`).
+/// Каталог хранения geofiles (`%LOCALAPPDATA%\KwikProxy Secure\geofiles\`).
 pub fn geofiles_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -243,6 +243,16 @@ pub async fn update_geofiles_if_changed(geoip_url: &str, geosite_url: &str) -> U
 fn build_no_proxy_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("too many geofile redirects");
+            }
+            if super::routing_profile::is_https_remote_url(attempt.url().as_str()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
         .connect_timeout(Duration::from_secs(15))
         .timeout(DOWNLOAD_TIMEOUT)
         .user_agent(format!("Kwik/{}", env!("CARGO_PKG_VERSION")))
@@ -328,17 +338,26 @@ async fn update_one(
 }
 
 async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String> {
-    let resp = client.get(url).send().await.context("HTTP")?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| anyhow::anyhow!("geofile HTTP error: {}", error.without_url()))?;
     if !resp.status().is_success() {
-        bail!("HTTP {} для {url}", resp.status());
+        bail!("geofile server returned HTTP {}", resp.status());
     }
-    resp.text().await.context("read body")
+    let bytes = response_bytes_limited(resp, 4096).await?;
+    String::from_utf8(bytes).context("response is not UTF-8")
 }
 
 async fn fetch_bytes(client: &reqwest::Client, url: &str, max: u64) -> Result<Vec<u8>> {
-    let resp = client.get(url).send().await.context("HTTP")?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| anyhow::anyhow!("geofile HTTP error: {}", error.without_url()))?;
     if !resp.status().is_success() {
-        bail!("HTTP {} для {url}", resp.status());
+        bail!("geofile server returned HTTP {}", resp.status());
     }
     // Pre-check через Content-Length: если сервер заявил больше max — bail
     // не качая. Если Content-Length нет (chunked transfer) — качаем целиком,
@@ -346,15 +365,23 @@ async fn fetch_bytes(client: &reqwest::Client, url: &str, max: u64) -> Result<Ve
     if let Some(len) = resp.content_length() {
         if len > max {
             bail!(
-                "файл {url}: Content-Length {len} > max {max} — отказ"
+                "geofile Content-Length {len} > max {max} — отказ"
             );
         }
     }
-    let bytes = resp.bytes().await.context("read body")?;
-    if (bytes.len() as u64) > max {
-        bail!("файл {url}: размер {} > max {max}", bytes.len());
+    response_bytes_limited(resp, max).await
+}
+
+async fn response_bytes_limited(mut resp: reqwest::Response, max: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("read body chunk")? {
+        let next_len = bytes.len().saturating_add(chunk.len());
+        if next_len as u64 > max {
+            bail!("response exceeds max size {max}");
+        }
+        bytes.extend_from_slice(&chunk);
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 /// SHA-256 хеш в lowercase hex. Используем только для verify-after-download

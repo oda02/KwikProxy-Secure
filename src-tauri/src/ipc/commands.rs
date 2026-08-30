@@ -13,7 +13,6 @@ use tokio::sync::Mutex as AsyncMutex;
 pub struct KillSwitchContext {
     pub server_ips: Vec<String>,
     pub allow_lan: bool,
-    pub allow_app_paths: Vec<String>,
     pub block_dns: bool,
     pub allow_dns_ips: Vec<String>,
     pub strict_mode: bool,
@@ -165,11 +164,11 @@ pub struct SubscriptionResult {
     pub meta: Option<SubscriptionMeta>,
 }
 
-/// Скачать подписку по URL, распарсить и сохранить список серверов.
+/// Скачать и распарсить подписку без изменения primary runtime state.
 ///
-/// `hwid_override` — если задан и непустой, используется вместо локально
-/// сгенерированного MachineGuid (нужен только для разработки / переноса
-/// с другого клиента).
+/// `hwid_override` — explicit advanced override. Otherwise an origin-scoped
+/// pseudonym is derived from an app-local random secret; MachineGuid is never
+/// read or transmitted.
 /// `user_agent` — позволяет переопределить дефолт `clash-verge/v2.0.0`.
 /// `send_hwid` — если false, заголовок `x-hwid` не отправляется.
 #[tauri::command]
@@ -179,54 +178,121 @@ pub async fn fetch_subscription(
     user_agent: Option<String>,
     send_hwid: Option<bool>,
     hwid: State<'_, HwidState>,
-    sub: State<'_, SubscriptionState>,
+    mihomo: State<'_, MihomoState>,
 ) -> Result<SubscriptionResult, String> {
-    let effective_hwid = hwid_override
+    let send = send_hwid.unwrap_or(false);
+    let explicit_hwid = hwid_override
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&hwid.0);
+        .filter(|s| !s.is_empty());
+    let effective_hwid = match explicit_hwid {
+        Some(value) => value.to_string(),
+        None if send => crate::config::hwid::for_subscription(&hwid.0, &url)
+            .map_err(|e| e.to_string())?,
+        None => String::new(),
+    };
 
     let ua = user_agent.unwrap_or_default();
-    let send = send_hwid.unwrap_or(true);
 
-    let (servers, meta) = fetch_and_parse(&url, effective_hwid, &ua, send)
+    let trusted_socks_port = mihomo.trusted_subscription_proxy_port();
+    let (servers, meta) = fetch_and_parse(
+        &url,
+        &effective_hwid,
+        &ua,
+        send,
+        trusted_socks_port,
+    )
         .await
         .map_err(|e| e.to_string())?;
-
-    *sub.servers.lock().map_err(|e| e.to_string())? = servers.clone();
-    *sub.meta.lock().map_err(|e| e.to_string())? = meta.clone();
     Ok(SubscriptionResult { servers, meta })
 }
 
 /// Вернуть закешированный список серверов без сетевого запроса.
 #[tauri::command]
 pub fn get_servers(sub: State<'_, SubscriptionState>) -> Vec<ProxyEntry> {
-    sub.servers.lock().map(|g| g.clone()).unwrap_or_default()
+    sub.snapshot().0
+}
+
+/// Issue a fresh renderer epoch and invalidate runtime/cache sequences from a
+/// previous WebView instance. This must run before hydration or connection.
+#[tauri::command]
+pub fn begin_subscription_epoch(sub: State<'_, SubscriptionState>) -> Result<String, String> {
+    sub.begin_epoch().map_err(|error| error.to_string())
 }
 
 /// Заменить runtime-список серверов без сетевого запроса.
 ///
-/// `SubscriptionState` живёт только в памяти и теряется на рестарте.
-/// Фронт кеширует серверы в localStorage и на старте заливает их обратно
-/// сюда этой командой — чтобы `connect` (индексирует `sub.servers` по
-/// номеру) работал сразу, без обязательного re-fetch'а подписки по сети.
-/// Это закрывает баг «после перезапуска надо вручную жать загрузить»
-/// (0.3.5). Лишнее поле `subscriptionId` из фронтового ProxyEntry serde
-/// молча игнорирует (нет `deny_unknown_fields`).
+/// A monotonically increasing generation makes concurrent Tauri invokes
+/// deterministic: an older primary can never overwrite a newer selection.
 #[tauri::command]
 pub fn set_servers(
+    session_epoch: String,
+    primary_id: String,
     servers: Vec<ProxyEntry>,
+    meta: Option<SubscriptionMeta>,
+    generation: u64,
     sub: State<'_, SubscriptionState>,
-) -> Result<(), String> {
-    *sub.servers.lock().map_err(|e| e.to_string())? = servers;
-    Ok(())
+) -> Result<bool, String> {
+    sub.commit(&session_epoch, &primary_id, generation, servers, meta)
+        .map_err(|e| e.to_string())
 }
 
 /// Вернуть закешированные метаданные подписки (трафик, срок).
 #[tauri::command]
 pub fn get_subscription_meta(sub: State<'_, SubscriptionState>) -> Option<SubscriptionMeta> {
-    sub.meta.lock().map(|g| g.clone()).unwrap_or(None)
+    sub.snapshot().1
+}
+
+/// Persist a successfully fetched, still-current subscription only after the
+/// frontend generation check. The Rust cache sanitizer runs before DPAPI.
+#[tauri::command]
+pub fn save_subscription_cache(
+    session_epoch: String,
+    subscription_id: String,
+    source_url: String,
+    servers: Vec<ProxyEntry>,
+    meta: Option<SubscriptionMeta>,
+    generation: u64,
+    sub: State<'_, SubscriptionState>,
+) -> Result<bool, String> {
+    sub.with_cache_generation(&session_epoch, &subscription_id, generation, || {
+        crate::config::subscription_cache::save(&subscription_id, &source_url, servers, meta)
+    })
+    .map(|result| result.is_some())
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn load_subscription_cache(
+    session_epoch: String,
+    subscription_id: String,
+    source_url: String,
+    sub: State<'_, SubscriptionState>,
+) -> Result<Option<SubscriptionResult>, String> {
+    sub.validate_epoch(&session_epoch)
+        .map_err(|error| error.to_string())?;
+    crate::config::subscription_cache::load(&subscription_id, &source_url)
+        .map(|record| {
+            record.map(|record| SubscriptionResult {
+                servers: record.servers,
+                meta: record.meta,
+            })
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_subscription_cache(
+    session_epoch: String,
+    subscription_id: String,
+    generation: u64,
+    sub: State<'_, SubscriptionState>,
+) -> Result<(), String> {
+    sub.with_cache_delete_generation(&session_epoch, &subscription_id, generation, || {
+        crate::config::subscription_cache::delete(&subscription_id)
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 // ─── Подключение ──────────────────────────────────────────────────────────────
@@ -244,6 +310,9 @@ pub fn get_subscription_meta(sub: State<'_, SubscriptionState>) -> Option<Subscr
 #[tauri::command]
 pub async fn connect(
     server_index: usize,
+    subscription_epoch: String,
+    subscription_id: String,
+    subscription_generation: u64,
     mode: String,
     engine: Option<String>,
     allow_lan: Option<bool>,
@@ -302,7 +371,13 @@ pub async fn connect(
 
     // Клонируем ProxyEntry, чтобы сразу освободить lock на список серверов
     let entry = {
-        let servers = sub.servers.lock().map_err(|e| e.to_string())?;
+        let servers = sub
+            .snapshot_for_connect(
+                &subscription_epoch,
+                &subscription_id,
+                subscription_generation,
+            )
+            .map_err(|error| error.to_string())?;
         servers.get(server_index).cloned().ok_or_else(|| {
             format!(
                 "сервер #{server_index} не найден в списке (всего серверов: {}). \
@@ -353,13 +428,15 @@ pub async fn connect(
         None
     };
 
-    // 12.E TUN-name masking для Mihomo. Когда включено и режим TUN —
-    // генерируем замаскированное имя адаптера (`wlan99` / `Ethernet 7`
-    // и т.п.) и ставим его в `tun.device` собранного конфига. Сторонний
-    // процесс при перечислении интерфейсов не распознает VPN по имени.
-    // В proxy-режиме TUN-адаптера нет — маскировать нечего.
-    let tun_device: Option<String> = if tun_mode && tun_masking.unwrap_or(false) {
-        Some(mihomo_config::masked_tun_name())
+    // A globally unique product prefix is the ownership marker used by the
+    // privileged helper. Generic/masqueraded names cannot be cleaned up or
+    // selected safely because they may belong to another VPN client.
+    let _ = tun_masking; // retained in the public API for settings compatibility
+    let tun_device: Option<String> = if tun_mode {
+        Some(format!(
+            "kwikproxy-secure-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
     } else {
         None
     };
@@ -433,8 +510,8 @@ pub async fn connect(
                 .map_err(|e| format!("патч full-mihomo YAML: {e:#}"))?
         } else {
             // URI/base64-сервер: built-in TUN если запрошен TUN-режим
-            // (mihomo_config::build синтезирует tun-секцию). 12.E
-            // маскировка имени — через tun_device.
+            // (mihomo_config::build синтезирует tun-секцию). Ownership
+            // имени адаптера задаётся через app-generated tun_device.
             mihomo_config::build(
                 &entry,
                 default_socks,
@@ -460,23 +537,6 @@ pub async fn connect(
         // просто tun_mode (а не только mihomo-profile).
         let builtin_tun = tun_mode;
         if builtin_tun {
-            // Конфиг и data-dir в ProgramData — туда у обоих процессов
-            // (helper-SYSTEM и Tauri-user) стандартный read+write.
-            let shared_dir = std::path::PathBuf::from(r"C:\ProgramData\KwikVPN");
-            std::fs::create_dir_all(&shared_dir)
-                .map_err(|e| format!("создание ProgramData/KwikVPN: {e}"))?;
-            // 11.B: geo `.dat` в data-dir mihomo (user-скачанные > бандл) —
-            // нужно для правил GEOSITE:/GEOIP: активного профиля.
-            crate::config::geofiles::provision_into(&shared_dir);
-            let config_path = shared_dir.join("mihomo-config.yaml");
-            std::fs::write(&config_path, &cfg.yaml)
-                .map_err(|e| format!("запись mihomo-config.yaml: {e}"))?;
-            let exe_path = resolve_sidecar_path(&app, "mihomo")
-                .ok_or_else(|| "mihomo binary не найден".to_string())?;
-            let config_str = config_path.to_string_lossy().into_owned();
-            let exe_str = exe_path.to_string_lossy().into_owned();
-            let data_str = shared_dir.to_string_lossy().into_owned();
-
             // Гарантируем что helper доступен и нужной версии
             if let Err(e) = platform::helper_bootstrap::ensure_running().await {
                 return Err(format!("helper-сервис недоступен: {e}"));
@@ -486,9 +546,9 @@ pub async fn connect(
             let _ = platform::helper_client::mihomo_stop().await;
             let _ = mihomo.stop();
 
-            platform::helper_client::mihomo_start(config_str, exe_str, data_str)
+            platform::helper_client::start_tunnel(cfg.yaml.clone(), lan)
                 .await
-                .map_err(|e| format!("helper.mihomo_start: {e}"))?;
+                .map_err(|e| format!("helper.start_tunnel: {e}"))?;
             mihomo.mark_helper_spawned(true);
             // mixed_port запоминаем для is_xray_running и др.
             *mihomo.mixed_port.lock().map_err(|e| format!("mutex: {e}"))? = cfg.mixed_port;
@@ -563,70 +623,6 @@ pub async fn connect(
             server_ips
         };
 
-        // Allow-list: пути к нашему sidecar-бинарю. Без него VPN-движок
-        // не сможет соединиться с сервером (хоть IP и в whitelist —
-        // FwpmGetAppIdFromFileName0 матчит ИМЕННО по path, не по
-        // basename).
-        //
-        // Tauri 2 в dev-режиме запускает sidecar по triplet-имени
-        // (`mihomo-x86_64-pc-windows-msvc.exe`), но наш resolve может
-        // найти plain (`mihomo.exe`) который существует рядом — тогда
-        // path-mismatch и allow не сработает.
-        // Решение: добавляем В АЛЛОУЛИСТ ОБА варианта по факту наличия.
-        let mut allow_app_paths: Vec<String> = Vec::new();
-        let mut push_if_exists = |p: PathBuf| {
-            if p.is_file() {
-                allow_app_paths.push(p.to_string_lossy().into_owned());
-            }
-        };
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                // Все возможные кандидаты sidecar — добавим все которые
-                // существуют. WFP игнорирует дубликаты с разными path
-                // как «всё allow».
-                {
-                    let name = "mihomo";
-                    push_if_exists(exe_dir.join(format!("{name}.exe")));
-                    push_if_exists(
-                        exe_dir.join(format!("{name}-x86_64-pc-windows-msvc.exe")),
-                    );
-                    push_if_exists(exe_dir.join("binaries").join(format!("{name}.exe")));
-                    push_if_exists(
-                        exe_dir
-                            .join("binaries")
-                            .join(format!("{name}-x86_64-pc-windows-msvc.exe")),
-                    );
-                    // Dev: target/{profile}/.. → src-tauri/binaries/
-                    if let Some(dev_root) = exe_dir.parent().and_then(|p| p.parent()) {
-                        push_if_exists(
-                            dev_root.join("binaries").join(format!("{name}.exe")),
-                        );
-                        push_if_exists(
-                            dev_root
-                                .join("binaries")
-                                .join(format!("{name}-x86_64-pc-windows-msvc.exe")),
-                        );
-                    }
-                }
-                // Сам vpn-client.exe — родительский процесс. Tauri может
-                // делать outbound (DNS-проверки leak-test, deep-link
-                // регистрация, и т.д.), а также на некоторых системах
-                // app-id наследуется от parent.
-                push_if_exists(exe.clone());
-                // helper.exe — не нужен для outbound, но добавим на
-                // случай future telemetry.
-                push_if_exists(exe_dir.join("kwik-helper.exe"));
-            }
-        }
-        // Resolve-функция тоже подключим (на случай если выше что-то
-        // упустили). Дедупликация ниже не нужна — WFP ОК с дубликатами.
-        if let Some(p) = resolve_sidecar_path(&app, "mihomo") {
-            push_if_exists(p);
-        }
-        // Дедупликация по string чтобы не плодить identical filters.
-        allow_app_paths.sort();
-        allow_app_paths.dedup();
-
         // Гарантируем что helper-сервис запущен (если не активен TUN-режим
         // — у нас не было ensure_running).
         if !tun_mode {
@@ -654,7 +650,6 @@ pub async fn connect(
         if let Err(e) = platform::helper_client::kill_switch_enable(
             server_ips.clone(),
             lan,
-            allow_app_paths.clone(),
             block_dns,
             allow_dns_ips.clone(),
             strict,
@@ -678,7 +673,6 @@ pub async fn connect(
         *ks_ctx.0.lock().await = Some(KillSwitchContext {
             server_ips,
             allow_lan: lan,
-            allow_app_paths,
             block_dns,
             allow_dns_ips,
             strict_mode: strict,
@@ -689,6 +683,11 @@ pub async fn connect(
     }
 
     stamp("connect done");
+    mihomo.set_subscription_proxy_port(if mode == "proxy" && !lan {
+        Some(socks_port)
+    } else {
+        None
+    });
 
     // В UI возвращаем креды только в LAN-режиме — там клиенты должны
     // ввести их вручную. В TUN-режиме они нужны только внутри движка
@@ -859,7 +858,7 @@ pub async fn recover_network() -> RecoveryReport {
 ///   (`127.0.0.1:port` где port в нашем диапазоне);
 /// - `proxy_backup_present` — есть `proxy_backup.json` от прошлого
 ///   `set_system_proxy`, можно сделать restore;
-/// - `tun_orphan` — есть адаптер с префиксом `kwik-` (helper
+/// - `tun_orphan` — есть адаптер с префиксом `kwikproxy-secure-` (helper
 ///   обычно их сам чистит при старте, но если helper-сервис не
 ///   запущен — остаются).
 ///
@@ -928,26 +927,6 @@ pub async fn get_recovery_state() -> RecoveryState {
 #[tauri::command]
 pub fn get_routing_table() -> Vec<platform::network::RouteEntry> {
     platform::network::list_routing_table()
-}
-
-// ─── Helper self-shutdown (0.3.1 / installer file-lock fix) ────────────────
-
-/// Graceful self-shutdown helper-сервиса. Используется auto-updater'ом
-/// перед запуском NSIS installer'а: helper освобождает свой `.exe`-файл
-/// (закрывает image-handle через SCM `SERVICE_CONTROL_STOP` себе же),
-/// после чего installer может перезаписать `kwik-helper.exe` без
-/// admin-прав.
-///
-/// После этой команды helper недоступен до следующего connect (там
-/// `helper_bootstrap::ensure_running` поднимет его снова, в случае
-/// отсутствия — через UAC reinstall).
-///
-/// Идемпотентна: если helper уже не запущен, вернёт Ok.
-#[tauri::command]
-pub async fn shutdown_helper() -> Result<(), String> {
-    platform::helper_client::shutdown_helper()
-        .await
-        .map_err(|e| e.to_string())
 }
 
 // ─── Connection ping (Settings → пинг) ──────────────────────────────────────
@@ -1041,7 +1020,6 @@ pub async fn kill_switch_apply(
     platform::helper_client::kill_switch_enable(
         ctx.server_ips,
         ctx.allow_lan,
-        ctx.allow_app_paths,
         ctx.block_dns,
         ctx.allow_dns_ips,
         ctx.strict_mode,
@@ -1138,26 +1116,6 @@ pub fn secure_storage_delete(key: String) -> Result<(), String> {
     platform::secure_storage::delete(&key).map_err(|e| e.to_string())
 }
 
-/// One-time миграция ключей из legacy `nemefisto.*` namespace в `kwik.*`
-/// (ребрендинг 0.7.0). Фронт на старте передаёт список ключей, которые
-/// мог использовать (URL подписки, hwid-override и per-id варианты), и
-/// для каждого пытается перенести старую запись. Возвращает количество
-/// фактически перенесённых значений (для лога/диагностики).
-#[tauri::command]
-pub fn secure_storage_migrate_legacy(keys: Vec<String>) -> Result<u32, String> {
-    let mut migrated = 0u32;
-    for key in keys {
-        match platform::secure_storage::migrate_legacy(&key) {
-            Ok(true) => migrated += 1,
-            Ok(false) => {}
-            // Ошибка миграции одного ключа не должна валить остальные —
-            // логируем и продолжаем (best-effort).
-            Err(e) => eprintln!("миграция ключа {key} провалилась: {e}"),
-        }
-    }
-    Ok(migrated)
-}
-
 // ─── Autostart (6.B) ──────────────────────────────────────────────────────────
 
 /// Зарегистрирован ли task автозапуска в Windows Task Scheduler.
@@ -1181,16 +1139,19 @@ pub async fn autostart_disable() -> Result<(), String> {
     platform::autostart::disable().await.map_err(|e| e.to_string())
 }
 
-/// Вернуть HWID устройства (Windows MachineGuid либо локально сохранённый UUID).
-/// Используется UI для отображения и копирования.
+/// Return only the pseudonym for the supplied subscription origin.  The
+/// app-local master secret never crosses into the WebView.
 #[tauri::command]
-pub fn get_hwid(hwid: State<'_, HwidState>) -> String {
-    hwid.0.clone()
+pub fn get_hwid(url: Option<String>, hwid: State<'_, HwidState>) -> Result<String, String> {
+    let Some(url) = url.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
+        return Ok(String::new());
+    };
+    crate::config::hwid::for_subscription(&hwid.0, &url).map_err(|e| e.to_string())
 }
 
 /// Прочитать последние ~32 КБ логов VPN-движка из всех известных
 /// log-файлов (`mihomo-stderr.log`, плюс helper-side
-/// `C:\ProgramData\KwikVPN\mihomo.log` если он есть).
+/// `C:\ProgramData\KwikProxy Secure\mihomo.log` если он есть).
 ///
 /// Имя `read_xray_log` оставлено для совместимости с фронтом (UI
 /// `LogsBlock`). Содержимое — логи Mihomo.
@@ -1198,8 +1159,8 @@ pub fn get_hwid(hwid: State<'_, HwidState>) -> String {
 pub fn read_xray_log() -> Result<String, String> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let tmp_dir = std::env::temp_dir().join("KwikVPN");
-    let prog_dir = std::path::PathBuf::from(r"C:\ProgramData\KwikVPN");
+    let tmp_dir = std::env::temp_dir().join("KwikProxy Secure");
+    let prog_dir = std::path::PathBuf::from(r"C:\ProgramData\KwikProxy Secure");
 
     let candidates = [
         tmp_dir.join("mihomo-stderr.log"),
@@ -1248,10 +1209,7 @@ pub fn read_xray_log() -> Result<String, String> {
 pub async fn ping_servers(
     sub: State<'_, SubscriptionState>,
 ) -> Result<Vec<Option<u32>>, String> {
-    let entries: Vec<ProxyEntry> = {
-        let g = sub.servers.lock().map_err(|e| e.to_string())?;
-        g.clone()
-    };
+    let entries = sub.snapshot().0;
 
     let futures = entries.iter().map(ping_entry);
     let results = futures::future::join_all(futures).await;
@@ -1337,7 +1295,7 @@ async fn resolve_ipv4(host: &str, port: u16) -> Option<std::net::Ipv4Addr> {
 /// - `recovery-state.json` — текущее состояние orphan-ресурсов;
 /// - `proxy-backup.json` — сохранённый backup системного прокси (если есть).
 ///
-/// Сохраняется в `%USERPROFILE%\Documents\kwik-diagnostics-<timestamp>.zip`.
+/// Сохраняется в `%USERPROFILE%\Documents\kwikproxy-secure-diagnostics-<timestamp>.zip`.
 /// Возвращает абсолютный путь — UI показывает в toast с кнопкой
 /// «открыть папку» через `tauri-plugin-opener::reveal_item_in_dir`.
 #[tauri::command]
@@ -1357,7 +1315,7 @@ pub fn export_diagnostics() -> Result<String, String> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let zip_path = docs.join(format!("kwik-diagnostics-{ts}.zip"));
+    let zip_path = docs.join(format!("kwikproxy-secure-diagnostics-{ts}.zip"));
 
     let file = std::fs::File::create(&zip_path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipWriter::new(file);
@@ -1381,7 +1339,7 @@ pub fn export_diagnostics() -> Result<String, String> {
 
     // 2. xray-stderr.log (последние 32 КБ)
     let xray_log = std::env::temp_dir()
-        .join("KwikVPN")
+        .join("KwikProxy Secure")
         .join("xray-stderr.log");
     if xray_log.is_file() {
         if let Ok(mut f) = std::fs::File::open(&xray_log) {
@@ -1572,19 +1530,45 @@ pub async fn app_traffic_stats(
 
 // ─── 12.D — backup/restore настроек ─────────────────────────────────────────
 
-/// Записать backup-JSON в `%USERPROFILE%\Documents\kwik-backup-<ts>.json`.
+const MAX_SETTINGS_BACKUP_BYTES: usize = 1024 * 1024;
+
+fn validate_settings_backup_json(json: &str) -> Result<(), String> {
+    let byte_len = json.len();
+    if byte_len == 0 {
+        return Err("backup JSON is empty".to_string());
+    }
+    if byte_len > MAX_SETTINGS_BACKUP_BYTES {
+        return Err(format!(
+            "backup JSON exceeds the {} byte limit",
+            MAX_SETTINGS_BACKUP_BYTES
+        ));
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid backup JSON: {e}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "backup JSON must be an object".to_string())?;
+    if object.get("schema_version").and_then(|v| v.as_u64()) != Some(1) {
+        return Err("unsupported or missing backup schema_version".to_string());
+    }
+    Ok(())
+}
+
+/// Записать backup-JSON в `%USERPROFILE%\Documents\kwikproxy-secure-backup-<ts>.json`.
 ///
 /// Frontend сам собирает JSON (с whitelist'ом полей и `schema_version`),
-/// мы лишь сохраняем файл — нет смысла дублировать сериализацию настроек
-/// на Rust-стороне. Возвращаем абсолютный путь, который UI показывает
-/// в toast.
+/// а Rust-сторона проверяет максимальный размер, JSON-object и schema-v1
+/// перед записью. Возвращаем абсолютный путь, который UI показывает в toast.
 ///
-/// Безопасность: ничего opaque-нечитаемого (HWID, Credential Manager
-/// записи, токены) сюда не попадёт — это ответственность фронта,
-/// который собирает payload.
+/// Безопасность: frontend по умолчанию не включает URL/token
+/// подписки и никогда не включает HWID. После явного UI opt-in URL/token
+/// может присутствовать в JSON; Rust не логирует и не интерпретирует его.
 #[tauri::command]
 pub fn export_settings_to_documents(json: String) -> Result<String, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    validate_settings_backup_json(&json)?;
 
     let docs = std::env::var_os("USERPROFILE")
         .map(|h| std::path::PathBuf::from(h).join("Documents"))
@@ -1597,40 +1581,28 @@ pub fn export_settings_to_documents(json: String) -> Result<String, String> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let path = docs.join(format!("kwik-backup-{ts}.json"));
+    let path = docs.join(format!("kwikproxy-secure-backup-{ts}.json"));
     std::fs::write(&path, json.as_bytes()).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().into_owned())
 }
 
-/// 12.D: скачать backup-JSON по URL (нужен для deep-link
-/// `kwik://import-from-url/<url>`). Делается с no-proxy чтобы не
-/// зацикливаться через активный VPN. Размер ограничен 256 KB —
-/// настройки не должны весить больше, любой больший payload — подозрение
-/// на mistake/SSRF на large endpoint.
-#[tauri::command]
-pub async fn fetch_settings_backup(url: String) -> Result<String, String> {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        return Err("ожидается http(s):// URL".to_string());
+#[cfg(test)]
+mod backup_export_tests {
+    use super::*;
+
+    #[test]
+    fn backup_json_must_be_bounded_schema_v1_object() {
+        assert!(validate_settings_backup_json("").is_err());
+        assert!(validate_settings_backup_json("[]").is_err());
+        assert!(validate_settings_backup_json(r#"{"schema_version":2}"#).is_err());
+        assert!(validate_settings_backup_json(r#"{"schema_version":1}"#).is_ok());
+
+        let oversized = format!(
+            r#"{{"schema_version":1,"padding":"{}"}}"#,
+            "x".repeat(MAX_SETTINGS_BACKUP_BYTES)
+        );
+        assert!(validate_settings_backup_json(&oversized).is_err());
     }
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-    if let Some(len) = resp.content_length() {
-        if len > 256 * 1024 {
-            return Err(format!("файл слишком большой: {} байт (>256 КБ)", len));
-        }
-    }
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-    if bytes.len() > 256 * 1024 {
-        return Err(format!("файл слишком большой: {} байт (>256 КБ)", bytes.len()));
-    }
-    String::from_utf8(bytes.to_vec()).map_err(|e| format!("не UTF-8: {e}"))
 }
 
 // ─── 11.C/D/E — управление routing-профилями ──────────────────────────────────
@@ -1669,7 +1641,7 @@ pub fn routing_add_static(
 
 /// Скачать профиль по URL **один раз** и сохранить как статический
 /// (`Static`) — без авто-обновления и без autorouting-метки в UI.
-/// Для deep-link `kwik://routing/add/{url}`, где URL — разовый
+/// Для deep-link `kwikproxy-secure://routing/add/{url}`, где URL — разовый
 /// источник, а не подписка на обновления.
 #[tauri::command]
 pub async fn routing_add_static_from_url(
@@ -1703,7 +1675,7 @@ pub async fn routing_add_url(
             profile,
             ProfileSource::Autorouting {
                 url: canonical,
-                interval_hours: interval_hours.max(1),
+                interval_hours: interval_hours.clamp(1, 720),
             },
         )
         .map_err(|e| e.to_string())?

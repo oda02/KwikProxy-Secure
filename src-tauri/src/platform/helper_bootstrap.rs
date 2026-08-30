@@ -1,176 +1,55 @@
-//! Авто-обнаружение и авто-установка helper-сервиса.
+//! Проверка доступности привилегированного helper-сервиса.
 //!
-//! Цель: пользователь никогда не открывает PowerShell вручную чтобы
-//! установить сервис. При первом TUN-подключении мы:
-//!   1. Проверяем, отвечает ли уже helper по named pipe.
-//!   2. Если нет — находим `kwik-helper.exe`, запускаем его с
-//!      аргументом `install` через `ShellExecuteW` с verb `runas`
-//!      (UAC-запрос «разрешить от имени админа»).
-//!   3. Ждём пока сервис поднимется и начнёт отвечать на ping.
-//!
-//! Сервис ставится с типом `AutoStart` — после установки он переживает
-//! перезагрузку и больше UAC не требует.
-//!
-//! Если пользователь нажимает «Нет» в UAC — `ShellExecuteW` возвращает
-//! `SE_ERR_ACCESSDENIED` (5), мы возвращаем понятную ошибку.
+//! Установка, обновление и удаление сервиса являются исключительно
+//! обязанностью per-machine installer-а. User-mode приложение никогда не
+//! ищет helper рядом с собой, не запускает его через `runas` и не меняет SCM.
+//! Это не позволяет подменённому файлу из user-writable каталога стать
+//! SYSTEM-сервисом через обычный runtime-путь приложения.
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
-
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use super::helper_client;
 
-const HELPER_FILENAME: &str = "kwik-helper.exe";
-/// Имя helper'а в bundle Tauri. ExternalBin копирует sidecar с triplet-
-/// суффиксом, отделить который мы не контролируем (зависит от версии Tauri).
-const HELPER_FILENAME_TRIPLET: &str = "kwik-helper-x86_64-pc-windows-msvc.exe";
-const PING_TIMEOUT_AFTER_INSTALL: Duration = Duration::from_secs(20);
-const PING_POLL_INTERVAL: Duration = Duration::from_millis(300);
-
-/// Гарантирует что helper отвечает по pipe-у И умеет наш wire-протокол.
-/// Если уже отвечает с правильной версией — мгновенно возвращает Ok.
-/// Иначе — запускает auto-install через UAC и ждёт пока сервис начнёт
-/// отвечать.
+/// Проверить, что installer-managed helper доступен и совместим.
 ///
-/// Зачем version-check: при апгрейде клиента (v0.1.1 → 0.1.2) старый
-/// helper может всё ещё крутиться в системе и не понимать новые поля
-/// в TunStart (`extra_server_hosts`). Без проверки connect отрабатывал
-/// бы успешно, но bypass-route добавлялся бы только на primary host —
-/// для mihomo-passthrough это значит петля на остальных нодах.
-///
-/// Возможные исходы:
-/// - `Ok(())` — helper доступен с актуальным протоколом.
-/// - `Err(...)` — helper не найден в файловой системе, либо UAC отменён,
-///   либо сервис установился но не отвечает за 20 секунд.
+/// Эта функция намеренно read-only. Несовместимый или отсутствующий helper
+/// исправляется только повторным запуском подписанного per-machine installer-а.
 pub async fn ensure_running() -> Result<()> {
-    // 1. Быстрая проверка — может уже работает с правильной версией
-    if let Ok(()) = helper_client::ping().await {
-        match helper_client::version().await {
-            Ok((_, proto)) if proto >= helper_client::MIN_HELPER_PROTOCOL_VERSION => {
-                return Ok(());
-            }
-            Ok((ver, proto)) => {
-                eprintln!(
-                    "[helper-bootstrap] helper версии {ver} (protocol={proto}), \
-                     требуется ≥ {}, переустанавливаем",
-                    helper_client::MIN_HELPER_PROTOCOL_VERSION
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "[helper-bootstrap] не удалось получить версию helper: {e:#}, \
-                     переустанавливаем"
-                );
-            }
-        }
-        // Fall through к reinstall
+    helper_client::ping()
+        .await
+        .context("защищённый helper-сервис недоступен; восстановите установку KwikProxy Secure")?;
+
+    let (version, protocol) = helper_client::version()
+        .await
+        .context("helper-сервис не сообщил версию протокола")?;
+
+    if !is_compatible(protocol) {
+        bail!(
+            "helper версии {version} использует protocol={protocol}, требуется protocol={}; \
+             закройте приложение и восстановите установку KwikProxy Secure",
+            helper_client::HELPER_PROTOCOL_VERSION
+        );
     }
 
-    // 2. Найти helper.exe
-    let helper = resolve_helper_path()
-        .ok_or_else(|| anyhow::anyhow!(
-            "{HELPER_FILENAME} не найден ни рядом с приложением, ни в target/{{debug,release}}/"
-        ))?;
-
-    eprintln!(
-        "[helper-bootstrap] запускаю install через UAC: {}",
-        helper.display()
-    );
-
-    // 3. Запуск с UAC. install-команда helper'а идемпотентная —
-    // auto uninstall+install при наличии существующего сервиса.
-    spawn_elevated(&helper, "install")?;
-
-    // 4. Ждём пока сервис поднимется и начнёт отвечать с правильной версией
-    let deadline = Instant::now() + PING_TIMEOUT_AFTER_INSTALL;
-    while Instant::now() < deadline {
-        tokio::time::sleep(PING_POLL_INTERVAL).await;
-        if helper_client::ping().await.is_ok() {
-            // Новый сервис должен отвечать новым протоколом. Если нет —
-            // что-то пошло не так на стороне install.
-            if let Ok((_, proto)) = helper_client::version().await {
-                if proto >= helper_client::MIN_HELPER_PROTOCOL_VERSION {
-                    eprintln!("[helper-bootstrap] helper отвечает, установка успешна");
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    bail!(
-        "helper-сервис установился, но не отозвался с актуальным протоколом за {}с. \
-         Проверьте services.msc → KwikHelper",
-        PING_TIMEOUT_AFTER_INSTALL.as_secs()
-    )
+    Ok(())
 }
 
-/// Найти `kwik-helper.exe` в нескольких возможных локациях:
-/// 1. `<exe-dir>/kwik-helper.exe` — dev (target/debug, target/release)
-///    или prod если Tauri стрипает triplet;
-/// 2. `<exe-dir>/kwik-helper-<triplet>.exe` — prod если Tauri оставляет
-///    triplet после bundle;
-/// 3. `<exe-dir>/resources/...` — fallback на случай нестандартного
-///    расположения.
-fn resolve_helper_path() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let exe_dir = exe.parent()?;
-
-    let candidates = [
-        exe_dir.join(HELPER_FILENAME),
-        exe_dir.join(HELPER_FILENAME_TRIPLET),
-        exe_dir.join("resources").join(HELPER_FILENAME),
-        exe_dir.join("resources").join(HELPER_FILENAME_TRIPLET),
-    ];
-
-    candidates.into_iter().find(|c| c.is_file())
+fn is_compatible(protocol: u32) -> bool {
+    protocol == helper_client::HELPER_PROTOCOL_VERSION
 }
 
-/// Запустить процесс с правами администратора через ShellExecuteW + verb=runas.
-/// Не ждёт его завершения — UAC blocking управляется ОС, мы продолжаем
-/// после клика «Да» / «Нет».
-#[cfg(windows)]
-fn spawn_elevated(exe: &Path, arg: &str) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
-
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rejects_older_protocols() {
+        assert!(!super::is_compatible(
+            super::helper_client::HELPER_PROTOCOL_VERSION - 1
+        ));
+        assert!(super::is_compatible(
+            super::helper_client::HELPER_PROTOCOL_VERSION
+        ));
+        assert!(!super::is_compatible(
+            super::helper_client::HELPER_PROTOCOL_VERSION + 1
+        ));
     }
-    fn wide_path(p: &Path) -> Vec<u16> {
-        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
-    }
-
-    let verb = wide("runas");
-    let file = wide_path(exe);
-    let params = wide(arg);
-
-    // ShellExecuteW возвращает HINSTANCE — fake-handle, > 32 = успех,
-    // ≤ 32 = код ошибки.
-    let result = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            verb.as_ptr(),
-            file.as_ptr(),
-            params.as_ptr(),
-            std::ptr::null(),
-            SW_HIDE,
-        )
-    };
-
-    let code = result as isize;
-    if code > 32 {
-        Ok(())
-    } else if code == 5 {
-        // SE_ERR_ACCESSDENIED — пользователь нажал «Нет» в UAC
-        bail!("установка helper-сервиса отменена пользователем (UAC)")
-    } else {
-        bail!("ShellExecuteW вернул код {code}")
-    }
-}
-
-#[cfg(not(windows))]
-fn spawn_elevated(_exe: &Path, _arg: &str) -> Result<()> {
-    bail!("auto-install helper поддерживается только на Windows")
 }

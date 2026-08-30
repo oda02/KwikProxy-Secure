@@ -1,0 +1,75 @@
+name: Rust security check (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-security-check:
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout requested revision with system Git
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'kwikproxy-secure-source'
+
+          New-Item -ItemType Directory -Path $sourceRoot -ErrorAction Stop | Out-Null
+
+          & git init $sourceRoot
+          if ($LASTEXITCODE -ne 0) { throw "git init failed with exit code $LASTEXITCODE" }
+
+          & git -C $sourceRoot remote add origin 'https://github.com/oda02/KwikProxy-Secure.git'
+          if ($LASTEXITCODE -ne 0) { throw "git remote add failed with exit code $LASTEXITCODE" }
+
+          & git -C $sourceRoot fetch --no-tags --depth=1 origin $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "git fetch failed with exit code $LASTEXITCODE" }
+
+          & git -C $sourceRoot checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
+
+      - name: Create test-only helper resource placeholder
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'kwikproxy-secure-source'
+          $placeholder = Join-Path $sourceRoot 'src-tauri\binaries\kwik-helper-x86_64-pc-windows-msvc.exe'
+
+          if (Test-Path -LiteralPath $placeholder) {
+            throw "helper placeholder path unexpectedly exists in the clean checkout"
+          }
+          New-Item -ItemType File -Path $placeholder -ErrorAction Stop | Out-Null
+
+      - name: Validate locked Rust dependency graph
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'kwikproxy-secure-source'
+          Set-Location (Join-Path $sourceRoot 'src-tauri')
+
+          & cargo metadata --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE" }
+
+      - name: Check all Rust targets
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'kwikproxy-secure-source'
+          Set-Location (Join-Path $sourceRoot 'src-tauri')
+
+          & cargo check --locked --all-targets
+          if ($LASTEXITCODE -ne 0) { throw "cargo check failed with exit code $LASTEXITCODE" }
+
+      - name: Test Rust libraries and binaries
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'kwikproxy-secure-source'
+          Set-Location (Join-Path $sourceRoot 'src-tauri')
+
+          & cargo test --locked --lib --bins
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" }

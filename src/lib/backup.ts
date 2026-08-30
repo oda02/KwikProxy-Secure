@@ -8,13 +8,17 @@ import { APP_VERSION } from "./constants";
 /**
  * 12.D — backup/restore настроек.
  *
- * Сериализуем подмножество Settings + URL подписки + appRules в JSON.
- * **Whitelist**: HWID-override, dismissed-set объявлений и localStorage
- * tutorial-флаги наружу не идут (machine-specific / UX-state, не должны
- * переноситься между устройствами).
+ * Сериализуем подмножество Settings + appRules в JSON. URL подписки
+ * часто содержит bearer-token, поэтому по умолчанию поле в backup
+ * вообще не попадает. Его можно добавить только явным opt-in в UI.
  *
- * Импорт защищён через `validate()` — отсев невалидных enum-значений
- * и неожиданных типов.
+ * Whitelist намеренно не включает HWID-override, opt-in отправки
+ * HWID, dismissed-set объявлений и localStorage tutorial-флаги: это
+ * machine-specific / consent / UX-state, которые нельзя незаметно
+ * переносить между устройствами.
+ *
+ * Импорт проходит `parseBackup()` и `sanitizeImportedSettings()`:
+ * неожиданные типы и не-whitelist поля отбрасываются.
  */
 
 export type BackupSchema = {
@@ -22,22 +26,39 @@ export type BackupSchema = {
   app_version: string;
   exported_at: number; // unix-ms
   settings: Partial<Settings>;
-  subscription_url: string;
+  /** Secret-bearing field, absent from normal exports. Kept optional so
+   *  schema-v1 backups made by older releases remain importable. */
+  subscription_url?: string;
   app_rules: AppRule[];
+};
+
+/** Shared frontend bound for local files, deep-link payloads and IPC export. */
+export const MAX_BACKUP_BYTES = 1024 * 1024;
+const MAX_BACKUP_STRING_BYTES = 4096;
+const MAX_BACKUP_ARRAY_ITEMS = 256;
+const MAX_BACKUP_APP_RULES = 4096;
+
+const backupByteLength = (value: string): number =>
+  new TextEncoder().encode(value).byteLength;
+
+const assertBackupSize = (value: string): void => {
+  if (backupByteLength(value) > MAX_BACKUP_BYTES) {
+    throw new Error(i18n.t("backup.tooLarge", { maxMiB: 1 }));
+  }
 };
 
 /** Поля Settings которые мы сохраняем при экспорте/импорте.
  *
  *  Не вошли:
  *   - все touched-флаги (восстанавливаем из значений сами);
- *   - nothing else — основные поля все попадают сюда. */
+ *   - `sendHwid` (это consent-state, на новом устройстве нужен новый opt-in);
+ *   - machine-specific, updater и dismissed UX-state. */
 const SETTINGS_WHITELIST: Array<keyof Settings> = [
   "autoRefresh",
   "autoRefreshHours",
   "refreshOnOpen",
   "pingOnOpen",
   "connectOnOpen",
-  "sendHwid",
   "userAgent",
   "sort",
   "allowLan",
@@ -80,8 +101,11 @@ const SETTINGS_WHITELIST: Array<keyof Settings> = [
   "autoConnectOnLeave",
 ];
 
-/** Собрать backup-объект из текущих store'ов. */
-export function collectBackup(): BackupSchema {
+/** Собрать backup-объект из текущих store'ов.
+ *
+ * `includeSubscriptionSecret` намеренно явный и default-false:
+ * callsite не может случайно выгрузить URL/token. */
+export function collectBackup(includeSubscriptionSecret = false): BackupSchema {
   const s = useSettingsStore.getState();
   const sub = useSubscriptionStore.getState();
   const settings: Partial<Settings> = {};
@@ -90,41 +114,53 @@ export function collectBackup(): BackupSchema {
     // через цикл по разнотипным ключам.
     (settings as Record<string, unknown>)[key as string] = s[key];
   }
-  return {
+  const backup: BackupSchema = {
     schema_version: 1,
     app_version: APP_VERSION,
     exported_at: Date.now(),
     settings,
-    subscription_url: sub.url,
     app_rules: s.appRules,
   };
+  if (includeSubscriptionSecret && sub.url.trim()) {
+    backup.subscription_url = sub.url.trim();
+  }
+  return backup;
 }
 
 /** Сохранить backup-файл в `~/Documents/`. Возвращает путь. */
-export async function exportBackupToDocuments(): Promise<string> {
-  const backup = collectBackup();
+export async function exportBackupToDocuments(
+  includeSubscriptionSecret = false
+): Promise<string> {
+  const backup = collectBackup(includeSubscriptionSecret);
   const json = JSON.stringify(backup, null, 2);
+  assertBackupSize(json);
   return await invoke<string>("export_settings_to_documents", { json });
-}
-
-/** Скачать backup по URL (для deep-link import-from-url). */
-export async function fetchBackupFromUrl(url: string): Promise<string> {
-  return await invoke<string>("fetch_settings_backup", { url });
 }
 
 /** Прочитать локальный File через FileReader (для file-input). */
 export function readBackupFile(file: File): Promise<string> {
+  if (file.size > MAX_BACKUP_BYTES) {
+    return Promise.reject(new Error(i18n.t("backup.tooLarge", { maxMiB: 1 })));
+  }
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(reader.error ?? new Error("FileReader error"));
-    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onload = () => {
+      const value = String(reader.result ?? "");
+      try {
+        assertBackupSize(value);
+        resolve(value);
+      } catch (error) {
+        reject(error);
+      }
+    };
     reader.readAsText(file);
   });
 }
 
 /** Отфильтровать импортируемые настройки по типам.
  *
- *  Backup приходит в т.ч. из deep-link (`kwik://import-settings`) —
+ *  Backup приходит в т.ч. из deep-link (`kwikproxy-secure://import-settings`) —
  *  недоверенный источник. Принимаем только значения whitelist-полей,
  *  тип которых совпадает с текущим в сторе (boolean/number/string или
  *  массив строк). Это перекрывает класс «инъекция чужого типа» (объект
@@ -142,21 +178,58 @@ function sanitizeImportedSettings(raw: unknown): Partial<Settings> {
     const ref = cur[key];
     if (Array.isArray(ref)) {
       // Все массивы в whitelist — string[] (trustedSsids).
-      if (Array.isArray(v) && v.every((x) => typeof x === "string")) {
+      if (
+        Array.isArray(v) &&
+        v.length <= MAX_BACKUP_ARRAY_ITEMS &&
+        v.every(
+          (x) =>
+            typeof x === "string" &&
+            backupByteLength(x) <= MAX_BACKUP_STRING_BYTES
+        )
+      ) {
         out[key as string] = v;
       }
     } else if (typeof v === "number") {
       if (typeof ref === "number" && Number.isFinite(v)) out[key as string] = v;
     } else if (typeof v === "boolean" || typeof v === "string") {
-      if (typeof ref === typeof v) out[key as string] = v;
+      if (
+        typeof ref === typeof v &&
+        (typeof v !== "string" || backupByteLength(v) <= MAX_BACKUP_STRING_BYTES)
+      ) {
+        out[key as string] = v;
+      }
     }
     // объекты/функции/null — молча отбрасываем.
   }
   return out as Partial<Settings>;
 }
 
+const isSafeImportedAppRule = (
+  raw: unknown
+): raw is { exe: string; action: AppRule["action"]; comment?: string } => {
+  if (!raw || typeof raw !== "object") return false;
+  const rule = raw as Record<string, unknown>;
+  if (typeof rule.exe !== "string") return false;
+  const exe = rule.exe.trim();
+  if (
+    exe.length === 0 ||
+    backupByteLength(exe) > 1024 ||
+    exe.split("").some(
+      (char) => char === "," || /\p{Cc}/u.test(char)
+    )
+  ) {
+    return false;
+  }
+  return (
+    rule.action === "proxy" ||
+    rule.action === "direct" ||
+    rule.action === "block"
+  );
+};
+
 /** Безопасный парсер JSON-payload в `BackupSchema` или ошибка. */
 export function parseBackup(raw: string): BackupSchema {
+  assertBackupSize(raw);
   let obj: unknown;
   try {
     obj = JSON.parse(raw);
@@ -173,35 +246,57 @@ export function parseBackup(raw: string): BackupSchema {
     );
   }
   const settings = o.settings;
-  const sub = typeof o.subscription_url === "string" ? o.subscription_url : "";
+  const sub = typeof o.subscription_url === "string" ? o.subscription_url.trim() : "";
+  if (sub) {
+    if (backupByteLength(sub) > MAX_BACKUP_STRING_BYTES) {
+      throw new Error(i18n.t("backup.expectedJson"));
+    }
+    let parsedSubscription: URL;
+    try {
+      parsedSubscription = new URL(sub);
+    } catch {
+      throw new Error(i18n.t("backup.expectedJson"));
+    }
+    if (
+      parsedSubscription.protocol !== "https:" ||
+      parsedSubscription.username !== "" ||
+      parsedSubscription.password !== ""
+    ) {
+      throw new Error(i18n.t("backup.expectedJson"));
+    }
+  }
   const rulesRaw = Array.isArray(o.app_rules) ? o.app_rules : [];
+  if (rulesRaw.length > MAX_BACKUP_APP_RULES) {
+    throw new Error(i18n.t("backup.expectedJson"));
+  }
   const rules: AppRule[] = rulesRaw
-    .filter(
-      (r): r is { exe: string; action: AppRule["action"]; comment?: string } =>
-        !!r &&
-        typeof r === "object" &&
-        typeof (r as Record<string, unknown>).exe === "string" &&
-        ((r as Record<string, unknown>).action === "proxy" ||
-          (r as Record<string, unknown>).action === "direct" ||
-          (r as Record<string, unknown>).action === "block")
-    )
+    .filter(isSafeImportedAppRule)
     .map((r) => ({
       exe: r.exe.trim(),
       action: r.action,
-      comment: typeof r.comment === "string" ? r.comment : undefined,
+      comment:
+        typeof r.comment === "string" &&
+        backupByteLength(r.comment) <= MAX_BACKUP_STRING_BYTES
+          ? r.comment
+          : undefined,
     }));
 
-  return {
+  const backup: BackupSchema = {
     schema_version: 1,
-    app_version: typeof o.app_version === "string" ? o.app_version : "?",
+    app_version:
+      typeof o.app_version === "string" &&
+      backupByteLength(o.app_version) <= 256
+        ? o.app_version
+        : "?",
     exported_at:
       typeof o.exported_at === "number" && Number.isFinite(o.exported_at)
         ? o.exported_at
         : 0,
     settings: sanitizeImportedSettings(settings),
-    subscription_url: sub,
     app_rules: rules,
   };
+  if (sub) backup.subscription_url = sub;
+  return backup;
 }
 
 /** Применить backup к store'ам. Touched-флаги выставляем там где должно
@@ -220,7 +315,7 @@ export function applyBackup(backup: BackupSchema): void {
   // appRules — отдельный setter (не один из ключей выше).
   useSettingsStore.getState().set("appRules", backup.app_rules);
 
-  if (backup.subscription_url.trim()) {
+  if (backup.subscription_url?.trim()) {
     useSubscriptionStore.getState().setUrl(backup.subscription_url.trim());
   }
 }
@@ -260,17 +355,17 @@ export function diffBackup(backup: BackupSchema): BackupDiffEntry[] {
   }
 
   if (
-    backup.subscription_url.trim() &&
+    backup.subscription_url?.trim() &&
     backup.subscription_url.trim() !== sub.url.trim()
   ) {
     out.push({
       key: i18n.t("backup.fieldLabels.subscriptionUrl"),
+      // Never echo token-bearing URLs into the preview (screenshots and
+      // support recordings are much easier to leak than the backup itself).
       current: sub.url
-        ? sub.url.slice(0, 60) + (sub.url.length > 60 ? "…" : "")
+        ? i18n.t("backup.values.secretPresent")
         : i18n.t("backup.values.dash"),
-      incoming:
-        backup.subscription_url.slice(0, 60) +
-        (backup.subscription_url.length > 60 ? "…" : ""),
+      incoming: i18n.t("backup.values.secretPresent"),
     });
   }
 

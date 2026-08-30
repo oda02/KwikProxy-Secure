@@ -10,13 +10,11 @@ import { useSettingsStore } from "./stores/settingsStore";
 import { useApplyTheme } from "./lib/hooks/useApplyTheme";
 import { useGlobalShortcuts } from "./lib/hooks/useGlobalShortcuts";
 import { useTrustedWifi } from "./lib/hooks/useTrustedWifi";
-import { useAutoUpdateCheck } from "./lib/hooks/useAutoUpdateCheck";
 import { useNativeStatusNotify } from "./lib/hooks/useNativeStatusNotify";
 import { initDeepLinks } from "./lib/deepLinks";
 
 import { CrashRecoveryDialog } from "./components/CrashRecoveryDialog";
 import { BackupPreviewModal } from "./components/BackupPreviewModal";
-import { UpdateModal } from "./components/UpdateModal";
 import {
   OnboardingTour,
   isOnboardingCompleted,
@@ -31,7 +29,7 @@ import { SettingsPage } from "./components/SettingsPage";
 /**
  * Корневой компонент. Координирует:
  * - инициализацию stores при mount (refresh status, кеш, hwid, on-open actions);
- * - подписку на deep-links (kwik://...);
+ * - подписку на deep-links (kwikproxy-secure://...);
  * - авто-подключение к последнему серверу при старте (если включено);
  * - фоновый авто-refresh подписки.
  *
@@ -83,10 +81,6 @@ function App() {
   // event'ы из бэка. Хук сам читает settings.trustedSsids и
   // autoDisconnectedBySsid runtime-флаг.
   useTrustedWifi();
-  // 14.A: периодическая проверка обновлений приложения. Endpoint —
-  // GitHub Releases latest.json (см. tauri.conf.json). При найденном
-  // апдейте UpdateModal сам всплывает.
-  useAutoUpdateCheck();
   // Native Windows toast'ы при connect/disconnect/error/update — только
   // когда главное окно невидимо (свёрнуто/в трее). Видимое окно — in-app
   // toaster справится сам. Решение visible vs hidden внутри nativeNotify.
@@ -113,19 +107,18 @@ function App() {
     // (с миграцией из localStorage при первом запуске). Делаем до
     // refreshOnOpen, чтобы fetchSubscription использовал актуальный URL.
     void loadSecureCreds().then(() => {
-      // 0.3.5: loadSecureCreds гидрирует серверы из localStorage-кеша.
       const st = useSubscriptionStore.getState();
+      // The displayed x-hwid pseudonym is derived from the actual primary
+      // subscription origin, so refresh it only after secure URL hydration.
+      void st.loadDeviceHwid();
       const hasServers = st.servers.length > 0;
       const hasSubscription =
         st.subscriptions.length > 0 || st.url.trim().length > 0;
       if (refreshOnOpen) {
-        // Явное обновление: UI уже показывает кеш, фетч обновит в фоне.
+        // Явное обновление: DPAPI-кеш уже доступен офлайн, fetch обновит его.
         void fetchSubscription();
       } else if (!hasServers && hasSubscription) {
-        // Кеша серверов нет (первый старт после апдейта, или cache-miss),
-        // но подписка есть — делаем один тихий фетч, чтобы юзеру НЕ
-        // приходилось вручную жать «загрузить». Дальше серверы кешируются
-        // и последующие старты — мгновенные без сети.
+        // Encrypted cache miss: fetch is required before the first connect.
         void fetchSubscription();
       } else if (pingOnOpen) {
         // Серверы из кеша уже на экране — просто пингуем.
@@ -133,7 +126,7 @@ function App() {
       }
     });
 
-    // Подписка на deep-link события (kwik://add | connect | ...)
+    // Подписка на deep-link события (kwikproxy-secure://...)
     let unlisten: (() => void) | undefined;
     initDeepLinks().then((u) => {
       unlisten = u;
@@ -363,7 +356,6 @@ function App() {
 
       <CrashRecoveryDialog />
       <BackupPreview />
-      <UpdateModal />
       <OnboardingHost />
       <Toaster />
     </>

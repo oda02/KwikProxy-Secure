@@ -5,7 +5,7 @@ import type { VpnStatus } from "../stores/vpnStore";
 declare const __APP_VERSION__: string;
 export const APP_VERSION = __APP_VERSION__;
 
-export const GITHUB_URL = "https://github.com/kanabicks/KwikProxy";
+export const GITHUB_URL = "https://github.com/oda02/KwikProxy-Secure";
 export const PRIVACY_URL = `${GITHUB_URL}/blob/main/PRIVACY.md`;
 export const LICENSE_URL = `${GITHUB_URL}/blob/main/LICENSE`;
 

@@ -1,73 +1,32 @@
-//! Cleanup orphan TUN-ресурсов (legacy от tun2proxy + mihomo built-in
-//! TUN, а также адаптеры старых версий со sing-box, если они упали
-//! kill -9 не убрав адаптер) и поиск активного нашего TUN-адаптера для
-//! kill-switch'а.
+//! Ownership-safe TUN discovery and orphan cleanup.
 //!
 //! TUN делает сам движок Mihomo через built-in inbound (tun2proxy spawn
 //! давно выпилен). Этот модуль остался только для:
 //!
-//! 1. **`cleanup_orphan_resources()`** — на старте helper-сервиса чистит
-//!    остатки от упавших сессий: kwik-* WinTUN-адаптеры и наши
-//!    half-default routes через `198.18.0.1` (старый tun2proxy-префикс).
+//! Only the reserved `kwikproxy-secure-*` alias is treated as ownership
+//! evidence. Generic descriptions, benchmark-range IPs and legacy prefixes
+//! are deliberately ignored because another VPN may legitimately use them.
 //!
-//! 2. **`current_tun_interface_index()`** — поиск активного TUN-адаптера
+//! `current_tun_interface_index()` finds the active adapter for the
 //!    нашего движка для kill-switch'а (13.D step A). Без TUN allow-фильтра
 //!    user-трафик идущий через TUN блокируется WFP block-all'ом — allow_app
 //!    покрывает только sing-box/mihomo.exe (их собственные шифрованные
 //!    пакеты к серверу, НЕ proxied user-трафик).
-//!
-//!    Детект многоступенчатый, потому что Wintun-адаптеры разных форков
-//!    отличаются по `Description`: WireGuard ставит `"Wintun Userspace
-//!    Tunnel"`, sing-box — `"sing-box"`, mihomo — `"Mihomo"`. Делаем:
-//!
-//!    1. **Alias prefix `kwik-`** — наш default-формат (`kwik-<pid>`).
-//!       Нужно матчить и для sing-box, и для mihomo если в YAML стоит
-//!       наш override.
-//!    2. **Description ∈ {sing-box, Mihomo, wintun, WireGuard}** —
-//!       case-insensitive substring. Покрывает 12.E маскированные имена
-//!       (`wlan99` etc) когда alias не помогает.
-//!    3. **IP-address в `198.18.0.0/15`** — финальная проверка, что
-//!       адаптер ИМЕННО НАШ (RFC 2544 benchmark range, оба движка тут).
-//!       Дисамбигуирует если у юзера параллельно WireGuard или другой VPN.
-//!
-//!    Если один кандидат — возвращаем сразу. Если несколько —
-//!    кросс-референс с IP-таблицей. Если ноль — вернёт `None` и kill-
-//!    switch встанет без TUN-allow → user-трафик блокируется (kill-switch
-//!    делает свою работу, просто слишком жёстко).
+//! kill-switch. If the owned alias is absent it returns `None`, so the kill
+//! switch fails safely without granting another product's adapter access.
 
 use std::ffi::OsString;
-use std::mem;
-use std::net::Ipv4Addr;
 use std::os::windows::ffi::OsStringExt;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use windows_sys::Win32::Foundation::NO_ERROR;
-use windows_sys::Win32::NetworkManagement::IpHelper::{
-    FreeMibTable, GetIfTable2, GetUnicastIpAddressTable, MIB_IF_TABLE2,
-    MIB_UNICASTIPADDRESS_TABLE,
-};
-use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN};
+use windows_sys::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
 
 use super::helper_log::log as hlog;
 use super::routing;
 
-/// Префикс имени TUN-адаптера. По умолчанию sing-box стартует с
-/// `kwik-<pid>`. Mihomo built-in TUN использует имя из YAML
-/// (typically `Meta`, но мы не переопределяем — для mihomo детект
-/// идёт по description либо IP).
-const TUN_NAME_PREFIX: &str = "kwik-";
-/// Legacy-префикс TUN-имени до ребрендинга 0.7.0 (Nemefisto → Kwik).
-/// Используется только в `cleanup_orphan_resources` чтобы подобрать
-/// осиротевшие `nemefisto-*` адаптеры от установок до апгрейда.
-const LEGACY_TUN_NAME_PREFIX: &str = "nemefisto-";
-/// Адрес TUN-интерфейса от tun2proxy-эпохи (0.1.1 и ранее). Сейчас
-/// sing-box создаёт TUN с другим IP по умолчанию, но half-routes на этот
-/// IP могут остаться от старых сессий — чистим.
-const TUN_GATEWAY: &str = "198.18.0.1";
-const HALF_LOW_DST: &str = "0.0.0.0";
-const HALF_HIGH_DST: &str = "128.0.0.0";
-const HALF_MASK: &str = "128.0.0.0";
+const TUN_NAME_PREFIX: &str = "kwikproxy-secure-";
 
 /// Опер-статус «адаптер поднят и работает». MIB_IF_ROW2.OperStatus
 /// принимает значения IfOperStatusUp=1, Down=2, Testing=3, ... — нам
@@ -79,10 +38,13 @@ const IF_OPER_STATUS_UP: i32 = 1;
 /// Если `expect_tun=false` (proxy-режим) — single-shot, мгновенный None.
 /// Если `expect_tun=true` (TUN-режим) — retry до 5с (адаптер появляется
 /// ~500ms-2s после спавна sing-box/mihomo через helper).
-pub async fn current_tun_interface_index(expect_tun: bool) -> Option<u32> {
+pub async fn current_tun_interface_index(
+    expect_tun: bool,
+    expected_alias: Option<String>,
+) -> Option<u32> {
     if !expect_tun {
         // Proxy-режим: TUN-адаптера быть не должно. Если от прошлой
-        // TUN-сессии остался stale `kwik-*` адаптер (sing-box умер
+        // TUN-сессии остался stale owned adapter (Mihomo умер
         // не успев его почистить, OperStatus всё ещё Up), мы НЕ должны
         // добавлять allow-фильтр для него — kill-switch получится с
         // мёртвым LUID, FwpmFilterAdd0 валит транзакцию целиком.
@@ -90,10 +52,15 @@ pub async fn current_tun_interface_index(expect_tun: bool) -> Option<u32> {
         hlog("[helper-tun] current_tun_interface_index: proxy-режим, TUN-поиск пропущен");
         return None;
     }
+    let expected_alias = expected_alias?;
+    if !expected_alias.starts_with(TUN_NAME_PREFIX) {
+        return None;
+    }
     hlog("[helper-tun] current_tun_interface_index: TUN-режим, ищем активный адаптер");
     let max_attempts = 50;
     for attempt in 0..max_attempts {
-        let res = tokio::task::spawn_blocking(find_our_tun_interface_index_blocking).await;
+        let alias = expected_alias.clone();
+        let res = tokio::task::spawn_blocking(move || find_owned_tun_interface_index(&alias)).await;
         if let Ok(Some(idx)) = res {
             hlog(&format!(
                 "[helper-tun] TUN-адаптер найден после {}мс retry, ifIndex={idx}",
@@ -117,90 +84,22 @@ struct TunCandidate {
     description: String,
 }
 
-/// Многокритериальный синхронный поиск нашего TUN-адаптера.
-///
-/// **Доверенные критерии** (только эти возвращают Some):
-/// 1. IP в `198.18.0.0/15` — RFC 2544 benchmark range, оба наших движка
-///    (sing-box default 198.18.0.1/15, mihomo default 198.18.0.1/16)
-///    сидят там. WireGuard / OpenVPN / других VPN тут НЕ бывает —
-///    диапазон практически зарезервирован.
-/// 2. Alias начинается с `kwik-` — наша явная подпись TUN-имени.
-///
-/// **Description-match** (sing-tun / wintun / WireGuard Tunnel / Mihomo)
-/// — НЕ доверенный, потому что у юзера может быть параллельно работающий
-/// WireGuard или другой VPN с тем же `Description`. Используется только
-/// для логов («увидели но не взяли»).
-///
-/// Если ничего доверенного не найдено — возвращаем None, helper делает
-/// retry. За 5с движок успеет создать адаптер и назначить IP.
-fn find_our_tun_interface_index_blocking() -> Option<u32> {
-    let scan = scan_interfaces();
-
-    // 1. IP-таблица — самый надёжный признак.
-    if let Some(ip_idx) = find_interface_with_ip_in_our_range() {
-        if let Some(c) = scan.kwik_aliased.iter().find(|c| c.if_index == ip_idx) {
-            hlog(&format!(
-                "[helper-tun] выбран по IP 198.18.0.0/15 + alias `kwik-`: ifIndex={} alias={:?} desc={:?}",
-                c.if_index, c.alias, c.description
-            ));
-        } else {
-            // 12.E маскированное имя (`wlan99` / `Local Area Connection N`)
-            // — alias не kwik-, но IP наш → точно наш TUN.
-            hlog(&format!(
-                "[helper-tun] выбран по IP 198.18.0.0/15 (без kwik-alias, маскировка 12.E?): ifIndex={ip_idx}"
-            ));
-        }
-        return Some(ip_idx);
-    }
-
-    // 2. Без IP-match — пробуем alias prefix. Это случай когда движок
-    //    создал адаптер, но IP ещё не назначен (race на старте sing-box).
-    //    На следующих retry будет IP — но если адаптер уже kwik-
-    //    то и так наш.
-    if !scan.kwik_aliased.is_empty() {
-        let c = &scan.kwik_aliased[0];
-        if scan.kwik_aliased.len() > 1 {
-            hlog(&format!(
-                "[helper-tun] {} kwik-кандидатов без IP-match — берём первого: ifIndex={} alias={:?}",
-                scan.kwik_aliased.len(),
-                c.if_index,
-                c.alias
-            ));
-        } else {
-            hlog(&format!(
-                "[helper-tun] выбран по alias `kwik-` (IP ещё не назначен): ifIndex={} alias={:?} desc={:?}",
-                c.if_index, c.alias, c.description
-            ));
-        }
-        return Some(c.if_index);
-    }
-
-    // 3. Только description-кандидаты (WireGuard, sing-tun-clones и т.п.) —
-    //    НЕ доверяем. Логируем для диагностики и возвращаем None
-    //    (helper сделает retry, движок успеет создать настоящий TUN).
-    if !scan.description_only.is_empty() {
-        hlog(&format!(
-            "[helper-tun] {} description-only кандидатов (вероятно чужой VPN), пропускаем — ждём наш TUN",
-            scan.description_only.len()
-        ));
-    }
-    None
+/// Synchronous lookup based only on the reserved product alias.
+fn find_owned_tun_interface_index(expected_alias: &str) -> Option<u32> {
+    let candidates = scan_owned_interfaces();
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.alias == expected_alias)?;
+    hlog(&format!(
+        "[helper-tun] exact owned adapter found: ifIndex={} alias={:?} desc={:?}",
+        candidate.if_index, candidate.alias, candidate.description
+    ));
+    Some(candidate.if_index)
 }
 
-#[derive(Debug, Default)]
-struct ScanResult {
-    /// Адаптеры с alias начинающимся на `kwik-` — точно наши.
-    kwik_aliased: Vec<TunCandidate>,
-    /// Адаптеры с подозрительным description (WireGuard / sing-tun /
-    /// wintun / Mihomo), но БЕЗ нашего alias-prefix. Не доверяем.
-    description_only: Vec<TunCandidate>,
-}
-
-/// Перебор всех интерфейсов через `GetIfTable2`. Разделяет результат
-/// на две группы: `kwik-`-aliased (доверяем) и description-only
-/// (логируем, не выбираем).
-fn scan_interfaces() -> ScanResult {
-    let mut result = ScanResult::default();
+/// Enumerate only adapters bearing this fork's reserved alias prefix.
+fn scan_owned_interfaces() -> Vec<TunCandidate> {
+    let mut result = Vec::new();
     let mut table_ptr: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
     let ret = unsafe { GetIfTable2(&mut table_ptr) };
     if ret != NO_ERROR || table_ptr.is_null() {
@@ -209,9 +108,8 @@ fn scan_interfaces() -> ScanResult {
     }
 
     let table = unsafe { &*table_ptr };
-    let entries = unsafe {
-        std::slice::from_raw_parts(table.Table.as_ptr(), table.NumEntries as usize)
-    };
+    let entries =
+        unsafe { std::slice::from_raw_parts(table.Table.as_ptr(), table.NumEntries as usize) };
 
     for entry in entries {
         if entry.OperStatus != IF_OPER_STATUS_UP {
@@ -221,16 +119,8 @@ fn scan_interfaces() -> ScanResult {
         let description = wide_z_to_string(&entry.Description);
 
         let alias_match = alias.starts_with(TUN_NAME_PREFIX);
-        let desc_match = description_looks_like_our_tun(&description);
-
         if alias_match {
-            result.kwik_aliased.push(TunCandidate {
-                if_index: entry.InterfaceIndex,
-                alias,
-                description,
-            });
-        } else if desc_match {
-            result.description_only.push(TunCandidate {
+            result.push(TunCandidate {
                 if_index: entry.InterfaceIndex,
                 alias,
                 description,
@@ -239,84 +129,18 @@ fn scan_interfaces() -> ScanResult {
     }
 
     hlog(&format!(
-        "[helper-tun] scan: kwik-aliased={} description-only={} (всего {} интерфейсов)",
-        result.kwik_aliased.len(),
-        result.description_only.len(),
+        "[helper-tun] scan: owned={} (total interfaces={})",
+        result.len(),
         table.NumEntries
     ));
-    for c in &result.kwik_aliased {
+    for c in &result {
         hlog(&format!(
-            "  [TRUSTED kwik-] ifIndex={} alias={:?} desc={:?}",
-            c.if_index, c.alias, c.description
-        ));
-    }
-    for c in &result.description_only {
-        hlog(&format!(
-            "  [skip — desc-only, чужой VPN?] ifIndex={} alias={:?} desc={:?}",
+            "  [OWNED kwikproxy-secure-] ifIndex={} alias={:?} desc={:?}",
             c.if_index, c.alias, c.description
         ));
     }
 
     unsafe { FreeMibTable(table_ptr as *mut _) };
-    result
-}
-
-/// Проверка description адаптера на принадлежность к нашему TUN.
-/// sing-box ставит description="sing-box", mihomo — "Mihomo",
-/// generic Wintun-форки — "Wintun ...". Любой match — наш.
-fn description_looks_like_our_tun(description: &str) -> bool {
-    let lower = description.to_lowercase();
-    lower.contains("sing-box")
-        || lower.contains("mihomo")
-        || lower.contains("wintun")
-        || lower.contains("wireguard tunnel")
-}
-
-/// Найти индекс интерфейса с IPv4 адресом в `198.18.0.0/15` диапазоне.
-/// Это RFC 2544 benchmark range — оба наших движка (sing-box default
-/// 198.18.0.1/15, mihomo default 198.18.0.1/16) сидят тут.
-///
-/// `GetUnicastIpAddressTable(AF_INET)` — синхронный системный вызов
-/// (~2мс), возвращает все unicast IP всех интерфейсов.
-fn find_interface_with_ip_in_our_range() -> Option<u32> {
-    let mut table_ptr: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
-    // AF_INET — только IPv4 (наш TUN range — v4). AF_UNSPEC вернёт
-    // и v6, не нужно.
-    let ret = unsafe { GetUnicastIpAddressTable(AF_INET, &mut table_ptr) };
-    if ret != NO_ERROR || table_ptr.is_null() {
-        hlog(&format!("[helper-tun] GetUnicastIpAddressTable → код {ret}"));
-        return None;
-    }
-
-    let table = unsafe { &*table_ptr };
-    let entries = unsafe {
-        std::slice::from_raw_parts(table.Table.as_ptr(), table.NumEntries as usize)
-    };
-
-    let mut result: Option<u32> = None;
-    for entry in entries {
-        // Address — SOCKADDR_INET. Берём sin_family.
-        let family = unsafe { entry.Address.si_family };
-        if family != AF_INET {
-            continue;
-        }
-        let v4: &SOCKADDR_IN = unsafe { mem::transmute(&entry.Address) };
-        let raw = unsafe { v4.sin_addr.S_un.S_addr };
-        let octets = raw.to_ne_bytes();
-        // 198.18.0.0/15 — первый октет 198, второй 18 или 19.
-        if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
-            let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
-            hlog(&format!(
-                "[helper-tun] IP {} на ifIndex={} (наш TUN-диапазон)",
-                ip, entry.InterfaceIndex
-            ));
-            result = Some(entry.InterfaceIndex);
-            break;
-        }
-    }
-
-    unsafe { FreeMibTable(table_ptr as *mut _) };
-    let _ = AF_UNSPEC; // silence import warning if compiler complains
     result
 }
 
@@ -329,40 +153,28 @@ fn wide_z_to_string(buf: &[u16]) -> String {
         .into_owned()
 }
 
-/// 9.E — Cleanup orphan TUN-ресурсов на старте helper-сервиса.
-///
-/// После аварийного завершения (kernel panic, kill -9, hardware crash)
-/// в системе могут остаться:
-///   1. WinTUN-адаптеры с префиксом `kwik-` от sing-box / mihomo /
-///      legacy tun2proxy.
-///   2. Half-default routes (`0.0.0.0/1` и `128.0.0.0/1` через
-///      `198.18.0.1`) от legacy tun2proxy-эпохи (sing-box/mihomo
-///      используют auto_route и сами чистят при graceful exit).
-///
-/// Best-effort: каждая операция игнорирует свои ошибки.
+/// Best-effort cleanup of adapters carrying this fork's exact ownership
+/// marker. Legacy aliases and route-only heuristics are intentionally not
+/// touched: neither proves that a resource belongs to this installation.
 pub async fn cleanup_orphan_resources() {
-    // 1. kwik-* адаптеры (+ legacy nemefisto-* от установок до ребрендинга
-    // 0.7.0). PowerShell wildcard на каждый префикс.
-    for prefix in [TUN_NAME_PREFIX, LEGACY_TUN_NAME_PREFIX] {
-        let wildcard = format!("{prefix}*");
-        if let Err(e) = routing::cleanup_orphan_tun(&wildcard).await {
-            eprintln!("[helper-tun] cleanup_orphan_tun({wildcard}) → {e}");
-        }
+    let wildcard = format!("{TUN_NAME_PREFIX}*");
+    if let Err(error) = routing::cleanup_orphan_tun(&wildcard).await {
+        eprintln!("[helper-tun] cleanup_orphan_tun({wildcard}) -> {error}");
     }
+}
 
-    // 2. Legacy half-default routes от tun2proxy-эпохи. Только с нашим
-    // nexthop=198.18.0.1 (другой VPN с теми же префиксами не тронем).
-    if let Err(e) =
-        routing::delete_route_with_nexthop(HALF_LOW_DST, HALF_MASK, TUN_GATEWAY).await
+/// Remove only the exact adapter name recorded from the accepted Mihomo
+/// configuration for the active session. Wildcards are forbidden here.
+pub async fn cleanup_owned_device(name: &str) -> Result<()> {
+    if !name.starts_with(TUN_NAME_PREFIX)
+        || name.len() > 96
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     {
-        eprintln!("[helper-tun] cleanup orphan {HALF_LOW_DST}/1 → {e}");
+        bail!("invalid exact owned TUN device identity");
     }
-    if let Err(e) =
-        routing::delete_route_with_nexthop(HALF_HIGH_DST, HALF_MASK, TUN_GATEWAY).await
-    {
-        eprintln!("[helper-tun] cleanup orphan {HALF_HIGH_DST}/1 → {e}");
-    }
-    let _: Result<()> = Ok(());
+    routing::cleanup_orphan_tun(name).await
 }
 
 #[cfg(test)]
@@ -370,47 +182,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn description_looks_like_our_tun_matches() {
-        let cases = [
-            "sing-box",
-            "Sing-Box",
-            "Mihomo",
-            "MIHOMO",
-            "Wintun Userspace Tunnel",
-            "WireGuard Tunnel via Wintun",
-        ];
-        for s in cases {
-            assert!(
-                description_looks_like_our_tun(s),
-                "ожидаем match для: {s}"
-            );
-        }
-    }
-
-    #[test]
-    fn description_looks_like_our_tun_rejects_unrelated() {
-        let cases = [
-            "Realtek PCIe GbE Family Controller",
-            "Intel(R) Wi-Fi 6 AX201 160MHz",
-            "Microsoft Wi-Fi Direct Virtual Adapter",
-            "TAP-Windows Adapter V9",
-            "Hyper-V Virtual Ethernet Adapter",
-        ];
-        for s in cases {
-            assert!(
-                !description_looks_like_our_tun(s),
-                "не должны матчить: {s}"
-            );
-        }
-    }
-
-    #[test]
     fn wide_z_to_string_handles_null_terminator() {
-        let mut buf: Vec<u16> = "kwik-1234".encode_utf16().collect();
+        let mut buf: Vec<u16> = "kwikproxy-secure-1234".encode_utf16().collect();
         buf.push(0);
         // Дополняем мусором после null — должны его проигнорировать.
         buf.extend_from_slice(&[0xDEAD, 0xBEEF, 0]);
-        assert_eq!(wide_z_to_string(&buf), "kwik-1234");
+        assert_eq!(wide_z_to_string(&buf), "kwikproxy-secure-1234");
     }
 
     #[test]
@@ -421,10 +198,19 @@ mod tests {
 
     #[test]
     fn alias_prefix_const_is_lowercase_safe() {
-        // Sanity: в коде сравниваем `alias.starts_with(TUN_NAME_PREFIX)`
-        // case-sensitive — конфиги используют именно "kwik-" в
-        // нижнем регистре, не "Kwik-". Если когда-нибудь поменяется —
-        // тест поймает.
-        assert_eq!(TUN_NAME_PREFIX, "kwik-");
+        assert_eq!(TUN_NAME_PREFIX, "kwikproxy-secure-");
+        assert!(!"kwik-1234".starts_with(TUN_NAME_PREFIX));
+        assert!(!"nemefisto-1234".starts_with(TUN_NAME_PREFIX));
+    }
+
+    #[test]
+    fn exact_cleanup_identity_rejects_wildcards_and_legacy_names() {
+        assert!("kwikproxy-secure-owned"
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
+        assert!(!"kwikproxy-secure-*"
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
+        assert!(!"kwik-old".starts_with(TUN_NAME_PREFIX));
     }
 }

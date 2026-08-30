@@ -2,7 +2,7 @@
 //!
 //! Использует Windows Credential Manager через `keyring-rs`. Каждое
 //! значение хранится как отдельный credential под уникальным именем
-//! `kwik.<key>`. На macOS — Keychain, на Linux — Secret Service
+//! `kwikproxy-secure.<key>`. На macOS — Keychain, на Linux — Secret Service
 //! (kwallet/gnome-keyring); кросс-платформенно работает «out of the box».
 //!
 //! Хранится:
@@ -12,18 +12,16 @@
 //! НЕ хранится:
 //! - Сгенерированный SOCKS5 password — он создаётся при connect и не
 //!   переживает перезапуск.
-//! - Кеш серверов, настройки UI — это не секреты, лежат в localStorage.
+//! - Настройки UI — не секреты и лежат в localStorage.
+//! - Кеш серверов/полного профиля хранится отдельно, в current-user DPAPI
+//!   контейнере; plaintext в WebView storage не записывается.
 
 use anyhow::{Context, Result};
 use keyring::Entry;
 
 /// Префикс для всех keys в Credential Manager — чтобы наши значения
 /// не путались с другими приложениями.
-const SERVICE_PREFIX: &str = "kwik";
-/// Префикс до ребрендинга 0.7.0 (Nemefisto → Kwik). Используется только
-/// для one-time миграции существующих записей в Credential Manager
-/// (см. `migrate_legacy`). Новые записи всегда пишутся с `SERVICE_PREFIX`.
-const LEGACY_SERVICE_PREFIX: &str = "nemefisto";
+const SERVICE_PREFIX: &str = "kwikproxy-secure";
 /// Username в credential — в Credential Manager у каждой записи есть
 /// service+user пара. Нам user не нужен, ставим единый.
 const USERNAME: &str = "default";
@@ -35,7 +33,6 @@ fn entry(key: &str) -> Result<Entry> {
 }
 
 /// Создать `Entry` с произвольным service-префиксом. Вынесено отдельно
-/// чтобы `migrate_legacy` могло читать старый `nemefisto.*` namespace.
 fn entry_with_prefix(prefix: &str, key: &str) -> Result<Entry> {
     let service = format!("{prefix}.{key}");
     Entry::new(&service, USERNAME)
@@ -84,31 +81,5 @@ pub fn delete(key: &str) -> Result<()> {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(err) => Err(anyhow::anyhow!("keyring delete({key}): {err}")),
-    }
-}
-
-/// One-time миграция записи из старого `nemefisto.*` namespace в новый
-/// `kwik.*` (ребрендинг 0.7.0). Для каждого `key`:
-///   - если в новом namespace значение уже есть — ничего не делаем;
-///   - иначе читаем `nemefisto.{key}`, и если оно есть — копируем в
-///     `kwik.{key}` (старую запись НЕ удаляем — на случай отката
-///     версии; Credential Manager переживёт пару осиротевших записей).
-///
-/// Возвращает `true` если хоть одно значение было перенесено. Ошибки
-/// чтения старой записи не фатальны (best-effort) — это миграция, а не
-/// критический путь.
-pub fn migrate_legacy(key: &str) -> Result<bool> {
-    // Новое значение уже есть → миграция не нужна.
-    if get(key)?.is_some() {
-        return Ok(false);
-    }
-    let legacy = entry_with_prefix(LEGACY_SERVICE_PREFIX, key)?;
-    match legacy.get_password() {
-        Ok(value) => {
-            set(key, &value)?;
-            Ok(true)
-        }
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(err) => Err(anyhow::anyhow!("keyring migrate({key}): {err}")),
     }
 }

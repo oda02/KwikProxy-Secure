@@ -1,69 +1,105 @@
-; 0.3.1 / installer file-lock fix.
+; KwikProxy Secure privileged installation contract.
 ;
-; При обновлении (через auto-updater или вручную скачанный installer)
-; `kwik-helper.exe` залочен потому что зарегистрирован как
-; Windows-service `KwikHelper` под SYSTEM. NSIS не может
-; перезаписать файл запущенного процесса.
+; The per-machine installer is the only lifecycle owner. The helper validates
+; its exact Program Files location, provisions ProgramData through no-follow
+; Windows handle APIs, writes the protected HKLM manifest, and performs bounded
+; SCM polling. No user-writable path, recursive ACL command, fixed sleep, or
+; image-name process kill is used here.
 ;
-; Auto-updater сначала вызывает Tauri-команду `shutdown_helper` (см.
-; src/lib/updater.ts), которая просит helper выйти грациозно через SCM
-; SERVICE_CONTROL_STOP. После ~1.5с файл уже свободен, и эти хуки
-; работают как defensive-резерв.
-;
-; Для **manual install** (юзер скачал installer и запустил вручную):
-; - если запущен как админ → `sc stop` срабатывает, файл освобождается;
-; - если без админа → `sc stop` тихо фейлится, и юзер увидит тот же
-;   диалог "невозможно открыть файл" что раньше. Не регрессия, но
-;   улучшение для самого частого пути (auto-update).
-;
-; Ребрендинг 0.7.0 (Nemefisto → Kwik): когда новый Kwik-installer ставится
-; ПОВЕРХ старой Nemefisto-установки, надо остановить и удалить ещё и legacy
-; сервис `NemefistoHelper` + убить старый `nemefisto-helper-*.exe` — иначе
-; на машине останется висеть SYSTEM-сервис под старым именем.
+; Upstream/legacy services and data are deliberately untouched. Migration is a
+; separate, explicit operation after the secure installation succeeds.
+
+!define KWIK_SECURE_SERVICE "KwikProxySecureHelper"
+!define KWIK_SECURE_INSTALL_ROOT "$PROGRAMFILES64\KwikProxy Secure"
+!define KWIK_SECURE_HELPER "$INSTDIR\kwik-helper-x86_64-pc-windows-msvc.exe"
+
+!macro KWIK_SECURE_REQUIRE_FIXED_INSTALL_ROOT
+  ${If} "$INSTDIR" != "${KWIK_SECURE_INSTALL_ROOT}"
+    MessageBox MB_ICONSTOP "KwikProxy Secure must be installed at ${KWIK_SECURE_INSTALL_ROOT}. Custom install paths are disabled because the SYSTEM helper trusts this protected location."
+    Abort
+  ${EndIf}
+!macroend
 
 !macro NSIS_HOOK_PREINSTALL
-  DetailPrint "Stopping Kwik Helper service before update..."
-  ; sc stop требует SERVICE_STOP rights на сервис. По умолчанию это
-  ; только Administrators/SYSTEM. Без админа просто silently fails —
-  ; не падаем на error.
-  nsExec::ExecToLog 'sc stop KwikHelper'
-  ; Ребрендинг 0.7.0: останавливаем и legacy-сервис от Nemefisto-установки.
-  nsExec::ExecToLog 'sc stop NemefistoHelper'
-  ; Ждём чтобы SCM успел маршрутизировать STOP-сигнал и helper-процесс
-  ; завершился (закрыл свой image-handle).
-  Sleep 1500
-  ; Defensive: если sc stop не помог (например, helper висит и не
-  ; реагирует на SERVICE_CONTROL_STOP), пробуем kill. Тоже требует
-  ; админа на SYSTEM-процесс.
-  nsExec::ExecToLog 'taskkill /F /T /IM kwik-helper-x86_64-pc-windows-msvc.exe'
-  ; Ребрендинг 0.7.0: legacy helper-бинарь старой установки.
-  nsExec::ExecToLog 'taskkill /F /T /IM nemefisto-helper-x86_64-pc-windows-msvc.exe'
-  ; 0.3.2: движок Mihomo может остаться orphan'ом после helper-shutdown —
-  ; kill'им его тоже. Tauri-sidecar запущен под user'ом (taskkill работает
-  ; без админа), SYSTEM-spawned требует админ-прав. Frontend disconnect
-  ; должен был остановить движок нормально, это backup.
-  ; sing-box-* — legacy cleanup orphan'ов от старых версий клиента.
-  nsExec::ExecToLog 'taskkill /F /T /IM sing-box-x86_64-pc-windows-msvc.exe'
-  nsExec::ExecToLog 'taskkill /F /T /IM mihomo-x86_64-pc-windows-msvc.exe'
-  Sleep 500
-  ; Ребрендинг 0.7.0: удаляем legacy-сервис из SCM (новый KwikHelper
-  ; зарегистрируется при первом запуске app).
-  nsExec::ExecToLog 'sc delete NemefistoHelper'
+  !insertmacro KWIK_SECURE_REQUIRE_FIXED_INSTALL_ROOT
+
+  ; In-place upgrade is intentionally disabled until a transactional updater
+  ; can stage, verify, replace and roll back every protected binary as one unit.
+  ; Never remove a known-good service before NSIS has safely committed files.
+  ${If} ${FileExists} "${KWIK_SECURE_HELPER}"
+    MessageBox MB_ICONSTOP "In-place upgrade is disabled for this security preview. The existing protected service was left untouched. Uninstall KwikProxy Secure explicitly, then run this installer as a clean install."
+    Abort
+  ${EndIf}
+
+  ClearErrors
+  ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Services\${KWIK_SECURE_SERVICE}" "ImagePath"
+  ${IfNot} ${Errors}
+    MessageBox MB_ICONSTOP "A KwikProxy Secure SYSTEM service already exists. In-place upgrade/repair is disabled, so installation is aborted without changing it."
+    Abort
+  ${EndIf}
+
+  ClearErrors
+  ReadRegStr $0 HKLM "SOFTWARE\KwikProxySecure" "ManifestV1"
+  ${IfNot} ${Errors}
+    MessageBox MB_ICONSTOP "A KwikProxy Secure machine manifest already exists. In-place upgrade/repair is disabled; uninstall the prior installation explicitly first."
+    Abort
+  ${EndIf}
+!macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  !insertmacro KWIK_SECURE_REQUIRE_FIXED_INSTALL_ROOT
+
+  DetailPrint "Provisioning the protected KwikProxy Secure helper service..."
+  nsExec::ExecToLog '"${KWIK_SECURE_HELPER}" install'
+  Pop $0
+  ${If} $0 != 0
+    ; Best-effort rollback uses the same canonical helper and bounded SCM path.
+    ; The rollback result is checked and reported; nothing is silently ignored.
+    nsExec::ExecToLog '"${KWIK_SECURE_HELPER}" uninstall'
+    Pop $1
+    DeleteRegKey HKLM "SOFTWARE\KwikProxySecure"
+    ${If} $1 != 0
+      MessageBox MB_ICONSTOP "Helper provisioning failed (exit $0), and rollback also failed (exit $1). Do not use this installation; inspect the service in an isolated test VM."
+    ${Else}
+      MessageBox MB_ICONSTOP "Helper provisioning failed safely (exit $0). The partial service registration was removed."
+    ${EndIf}
+    Abort
+  ${EndIf}
+
+  ; Restrict SCM control/reconfiguration to SYSTEM and local Administrators.
+  nsExec::ExecToLog '"$SYSDIR\sc.exe" sdset ${KWIK_SECURE_SERVICE} "D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)"'
+  Pop $0
+  ${If} $0 != 0
+    nsExec::ExecToLog '"${KWIK_SECURE_HELPER}" uninstall'
+    Pop $1
+    DeleteRegKey HKLM "SOFTWARE\KwikProxySecure"
+    ${If} $1 != 0
+      MessageBox MB_ICONSTOP "Service ACL protection failed (exit $0), and rollback also failed (exit $1). Do not use this installation; inspect the service in an isolated test VM."
+    ${Else}
+      MessageBox MB_ICONSTOP "Service ACL protection failed safely (exit $0). The service was removed."
+    ${EndIf}
+    Abort
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
-  DetailPrint "Removing Kwik Helper service..."
-  nsExec::ExecToLog 'sc stop KwikHelper'
-  nsExec::ExecToLog 'sc stop NemefistoHelper'
-  Sleep 1500
-  nsExec::ExecToLog 'taskkill /F /T /IM kwik-helper-x86_64-pc-windows-msvc.exe'
-  nsExec::ExecToLog 'taskkill /F /T /IM nemefisto-helper-x86_64-pc-windows-msvc.exe'
-  ; 0.3.2: kill движок Mihomo если ещё жив (+ legacy sing-box orphans)
-  nsExec::ExecToLog 'taskkill /F /T /IM sing-box-x86_64-pc-windows-msvc.exe'
-  nsExec::ExecToLog 'taskkill /F /T /IM mihomo-x86_64-pc-windows-msvc.exe'
-  Sleep 500
-  ; После stop сервис всё ещё зарегистрирован в SCM. При полной
-  ; деинсталляции удаляем чтобы не оставлять "висящую" запись.
-  nsExec::ExecToLog 'sc delete KwikHelper'
-  nsExec::ExecToLog 'sc delete NemefistoHelper'
+  !insertmacro KWIK_SECURE_REQUIRE_FIXED_INSTALL_ROOT
+
+  ${If} ${FileExists} "${KWIK_SECURE_HELPER}"
+    DetailPrint "Removing the installer-managed KwikProxy Secure helper..."
+    nsExec::ExecToLog '"${KWIK_SECURE_HELPER}" uninstall'
+    Pop $0
+    ${If} $0 != 0
+      MessageBox MB_ICONSTOP "The KwikProxy Secure helper could not be removed safely (exit $0). Uninstall is aborted before deleting privileged files."
+      Abort
+    ${EndIf}
+  ${Else}
+    ClearErrors
+    ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Services\${KWIK_SECURE_SERVICE}" "ImagePath"
+    ${IfNot} ${Errors}
+      MessageBox MB_ICONSTOP "The KwikProxy Secure SYSTEM service still exists, but its protected helper binary is missing. Uninstall is aborted before deleting any remaining privileged files."
+      Abort
+    ${EndIf}
+  ${EndIf}
+  DeleteRegKey HKLM "SOFTWARE\KwikProxySecure"
 !macroend

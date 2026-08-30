@@ -1,13 +1,8 @@
 import { onOpenUrl, getCurrent } from "@tauri-apps/plugin-deep-link";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { invoke } from "@tauri-apps/api/core";
 import i18n from "../i18n";
-import { useSubscriptionStore } from "../stores/subscriptionStore";
-import { useVpnStore } from "../stores/vpnStore";
 import { showToast } from "../stores/toastStore";
 import {
-  exportBackupToDocuments,
-  fetchBackupFromUrl,
   parseBackup,
   useBackupModalStore,
 } from "./backup";
@@ -16,17 +11,12 @@ import {
  * Поддерживаемые deep-link-ссылки:
  *
  *  Управление VPN:
- *   kwik://connect | open                подключить выбранный сервер
- *   kwik://disconnect | close            отключиться
- *   kwik://toggle                        переключить состояние
- *   kwik://status                        вынести окно вперёд
+ *   kwikproxy-secure://connect | open     запросить действие в UI
+ *   kwikproxy-secure://status             вынести окно вперёд
  *
  *  Импорт подписки (поддерживается оба синтаксиса):
- *   kwik://add?url=<encoded-url>         query-форма
- *   kwik://add/<encoded-url-or-base64>   path-форма
- *   kwik://import/<...>                  alias
- *   kwik://onadd/<url>                   импорт + сразу подключение
- *   kwik://import?data=<base64>          альтернативный query-параметр
+ *   kwikproxy-secure://add?url=<encoded-url> — только показывает
+ *   предупреждение; импорт не сохраняется и не запускается автоматически.
  *
  *  Auto-detect для path-формы import: если значение начинается с
  *  http(s):// — это URL подписки. Иначе пробуем base64-декод и
@@ -37,7 +27,7 @@ import {
  *  пробуем base64. Возвращает первое валидное http(s):// или null. */
 function detectSubscriptionUrl(input: string): string | null {
   const trimmed = input.trim();
-  if (!trimmed) return null;
+  if (!trimmed || trimmed.length > 8192) return null;
   // 1. Уже URL (после URL-decode)
   let candidate = trimmed;
   try {
@@ -45,11 +35,11 @@ function detectSubscriptionUrl(input: string): string | null {
   } catch {
     // не получилось декодировать — пробуем как есть
   }
-  if (/^https?:\/\//i.test(candidate)) return candidate;
+  if (/^https:\/\//i.test(candidate)) return candidate;
   // 2. base64 → URL
   try {
     const decoded = atob(candidate.replace(/-/g, "+").replace(/_/g, "/"));
-    if (/^https?:\/\//i.test(decoded)) return decoded.trim();
+    if (/^https:\/\//i.test(decoded)) return decoded.trim();
   } catch {
     // не base64 — игнорируем
   }
@@ -68,20 +58,24 @@ async function focusMainWindow() {
 }
 
 export function handleDeepLink(rawUrl: string) {
+  if (rawUrl.length > 1024 * 1024) {
+    console.warn("[deep-link] payload too large");
+    return;
+  }
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
   } catch {
-    console.warn("[deep-link] невалидный URL:", rawUrl);
+    console.warn("[deep-link] невалидный URL");
     return;
   }
 
-  if (parsed.protocol !== "kwik:") {
+  if (parsed.protocol !== "kwikproxy-secure:") {
     console.warn("[deep-link] чужая схема:", parsed.protocol);
     return;
   }
 
-  // host у kwik://action — пустой на одних платформах, заполнен на
+  // host у kwikproxy-secure://action — пустой на одних платформах, заполнен на
   // других. Action всегда первый сегмент: либо host, либо первая часть
   // pathname. payload (если есть) — остальное pathname (для path-формы)
   // или ?url=/?data= параметры.
@@ -102,40 +96,32 @@ export function handleDeepLink(rawUrl: string) {
       }
       const url = detectSubscriptionUrl(raw);
       if (!url) {
-        console.warn("[deep-link] не удалось извлечь URL подписки из:", raw);
+        console.warn("[deep-link] не удалось извлечь безопасный URL подписки");
         return;
       }
-      const sub = useSubscriptionStore.getState();
-      sub.setUrl(url);
-      void sub.fetchSubscription().then(() => {
-        // onadd → сразу пробуем подключение если выбран сервер
-        if (action === "onadd") {
-          const vpn = useVpnStore.getState();
-          if (vpn.status === "stopped" && vpn.selectedIndex !== null) {
-            void vpn.connect();
-          }
-        }
+      // Do not persist even the URL: cold-start logic must not mistake an
+      // attacker-controlled deep-link for a user-confirmed subscription.
+      void url;
+      showToast({
+        kind: "warning",
+        title: i18n.t("deepLink.pending.title"),
+        message: i18n.t("deepLink.pending.subscription"),
+        durationMs: 8000,
       });
       void focusMainWindow();
       break;
     }
     case "connect":
-    case "open": {
-      const vpn = useVpnStore.getState();
-      if (vpn.status === "stopped") void vpn.connect();
-      void focusMainWindow();
-      break;
-    }
+    case "open":
     case "disconnect":
-    case "close": {
-      const vpn = useVpnStore.getState();
-      if (vpn.status === "running") void vpn.disconnect();
-      break;
-    }
+    case "close":
     case "toggle": {
-      const vpn = useVpnStore.getState();
-      if (vpn.status === "running") void vpn.disconnect();
-      else if (vpn.status === "stopped") void vpn.connect();
+      showToast({
+        kind: "warning",
+        title: i18n.t("deepLink.pending.title"),
+        message: i18n.t("deepLink.pending.vpnAction"),
+        durationMs: 8000,
+      });
       void focusMainWindow();
       break;
     }
@@ -146,34 +132,22 @@ export function handleDeepLink(rawUrl: string) {
       break;
     }
     case "export": {
-      // 12.D — `kwik://export` сохраняет backup в Documents и
-      // показывает toast с путём.
-      void exportBackupToDocuments()
-        .then((path) => {
-          showToast({
-            kind: "success",
-            title: i18n.t("deepLink.exported.title"),
-            message: path,
-            durationMs: 8000,
-          });
-        })
-        .catch((e) => {
-          showToast({
-            kind: "error",
-            title: i18n.t("deepLink.exported.failedTitle"),
-            message: String(e),
-          });
-        });
+      showToast({
+        kind: "warning",
+        title: i18n.t("deepLink.pending.title"),
+        message: i18n.t("deepLink.pending.export"),
+        durationMs: 8000,
+      });
       void focusMainWindow();
       break;
     }
     case "import-from-url": {
-      // 12.D — `kwik://import-from-url/<url>` — скачать backup и
+      // `kwikproxy-secure://import-from-url/<url>` is intentionally disabled.
       // открыть preview-модалку. payload — URL, может быть в pathPayload
       // или ?url=.
       const raw = pathPayload || queryUrl || "";
       const url = decodeUriOrPassthrough(raw);
-      if (!/^https?:\/\//i.test(url)) {
+      if (!/^https:\/\//i.test(url)) {
         showToast({
           kind: "error",
           title: i18n.t("deepLink.importFromUrl.title"),
@@ -181,27 +155,29 @@ export function handleDeepLink(rawUrl: string) {
         });
         return;
       }
-      void fetchBackupFromUrl(url)
-        .then((json) => {
-          const backup = parseBackup(json);
-          useBackupModalStore.getState().show(backup);
-        })
-        .catch((e) => {
-          showToast({
-            kind: "error",
-            title: i18n.t("deepLink.importFromUrl.title"),
-            message: String(e),
-          });
-        });
+      showToast({
+        kind: "warning",
+        title: i18n.t("deepLink.pending.title"),
+        message: i18n.t("deepLink.pending.remoteImport"),
+        durationMs: 8000,
+      });
       void focusMainWindow();
       break;
     }
     case "import-settings": {
-      // 12.D — `kwik://import-settings?data=<base64-or-json>` или
-      // `kwik://import-settings/<base64>` — открыть preview-modal
+      // `kwikproxy-secure://import-settings?...` parses only into an in-memory
+      // preview modal; applying still requires an explicit UI action.
       // из inline payload. Имя выбрано чтобы не конфликтовать с
       // существующим `import` который импортирует подписку.
       const raw = pathPayload || queryData || queryUrl || "";
+      if (raw.length > 1024 * 1024) {
+        showToast({
+          kind: "error",
+          title: i18n.t("deepLink.importSettings.title"),
+          message: i18n.t("deepLink.importSettings.notBase64OrJson"),
+        });
+        return;
+      }
       let json = "";
       try {
         json = decodeURIComponent(raw);
@@ -237,8 +213,8 @@ export function handleDeepLink(rawUrl: string) {
     case "routing":
     case "autorouting": {
       // 11.D расширенные deep-links для routing-профилей. Формат:
-      //   kwik://routing/{add|onadd}/{base64|url}
-      //   kwik://autorouting/{add|onadd}/{url}
+      //   kwikproxy-secure://routing/{add|onadd}/{base64|url}
+      //   kwikproxy-secure://autorouting/{add|onadd}/{url}
       // segments тут — [verb, ...payload]. queryUrl/queryData как
       // альтернативные источники payload (для длинных base64).
       const verb = (segments.shift() || "").toLowerCase();
@@ -248,7 +224,16 @@ export function handleDeepLink(rawUrl: string) {
       }
       const raw = segments.join("/") || queryData || queryUrl || "";
       const decodedRaw = decodeUriOrPassthrough(raw);
-      handleRoutingDeepLink(action, verb, decodedRaw);
+      // Parsing establishes that this is a well-formed request, but applying
+      // or downloading a routing profile remains a manual Settings action.
+      if (decodedRaw) {
+        showToast({
+          kind: "warning",
+          title: i18n.t("deepLink.pending.title"),
+          message: i18n.t("deepLink.pending.routing"),
+          durationMs: 8000,
+        });
+      }
       void focusMainWindow();
       break;
     }
@@ -276,73 +261,9 @@ function decodeUriOrPassthrough(s: string): string {
  *   (default 24ч). Без активации.
  * - `autorouting/onadd/{url}` — то же + активируем.
  */
-async function handleRoutingDeepLink(
-  kind: "routing" | "autorouting",
-  verb: "add" | "onadd",
-  raw: string
-) {
-  if (!raw) {
-    showToast({
-      kind: "warning",
-      title: i18n.t("deepLink.routing.title"),
-      message: i18n.t("deepLink.routing.emptyPayload"),
-    });
-    return;
-  }
-
-  try {
-    let id: string;
-    if (kind === "autorouting") {
-      // payload должен быть URL
-      if (!/^https?:\/\//i.test(raw)) {
-        showToast({
-          kind: "error",
-          title: i18n.t("deepLink.routing.autoroutingTitle"),
-          message: i18n.t("deepLink.routing.expectedUrl", {
-            raw: raw.slice(0, 80),
-          }),
-        });
-        return;
-      }
-      id = await invoke<string>("routing_add_url", {
-        url: raw,
-        intervalHours: 24,
-      });
-    } else {
-      // routing: либо base64/JSON-профиль, либо URL для разового
-      // скачивания. URL качаем один раз и сохраняем как Static (без
-      // autorouting-метки и авто-обновления).
-      if (/^https?:\/\//i.test(raw)) {
-        id = await invoke<string>("routing_add_static_from_url", { url: raw });
-      } else {
-        // base64 / JSON
-        id = await invoke<string>("routing_add_static", { payload: raw });
-      }
-    }
-
-    if (verb === "onadd") {
-      await invoke("routing_set_active", { id });
-    }
-    showToast({
-      kind: "success",
-      title: i18n.t("deepLink.routing.profileTitle"),
-      message:
-        verb === "onadd"
-          ? i18n.t("deepLink.routing.activated")
-          : i18n.t("deepLink.routing.addedNotActive"),
-    });
-  } catch (e) {
-    showToast({
-      kind: "error",
-      title: i18n.t("deepLink.routing.title"),
-      message: String(e),
-    });
-  }
-}
-
 /**
  * Регистрирует подписку на deep-link события и обрабатывает «холодный»
- * запуск (когда приложение запустили кликом по kwik://...).
+ * запуск (когда приложение запустили кликом по kwikproxy-secure://...).
  */
 export async function initDeepLinks(): Promise<() => void> {
   // Cold start: процесс был запущен с deep-link-ом в args

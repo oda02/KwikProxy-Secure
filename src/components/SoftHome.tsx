@@ -173,14 +173,37 @@ export function SoftHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     else if (selectedIndex !== null) void connect();
   };
 
-  // Переключение активной подписки: подменяем legacy servers/meta/pings
-  // и заливаем серверы в Rust (set_servers) для connect-by-index.
+  // Переключение активной подписки: store атомарно меняет legacy state и
+  // публикует Rust snapshot с monotonic generation для connect-by-index.
   // Серверы берутся из кеша подписки (sub.servers) — сетевой fetch при
   // переключении НЕ нужен; он делается один раз при добавлении и далее
   // только по кнопке «обновить» / авто-обновлению.
-  const activate = (id: string) => {
+  const activate = async (id: string) => {
     if (id !== primaryId) {
-      setPrimaryId(id);
+      const targetBeforeCommit = useSubscriptionStore
+        .getState()
+        .subscriptions.find((subscription) => subscription.id === id);
+      if (
+        useVpnStore.getState().status === "running" &&
+        targetBeforeCommit?.servers.length === 0
+      ) {
+        showToast({
+          kind: "warning",
+          title: "Подписка ещё не загружена",
+          message: "Сначала отключите VPN и обновите эту подписку.",
+          durationMs: 6000,
+        });
+        return;
+      }
+      const runtimeReady = await setPrimaryId(id);
+      if (!runtimeReady) {
+        showToast({
+          kind: "error",
+          title: "Подписка",
+          message: "Не удалось безопасно активировать выбранную подписку",
+        });
+        return;
+      }
       const sub = useSubscriptionStore.getState().subscriptions.find((s) => s.id === id);
       if (sub) {
         if (sub.servers.length === 0) {
@@ -188,23 +211,26 @@ export function SoftHome({ onOpenSettings }: { onOpenSettings: () => void }) {
           // кеш потёрт) — единственный случай, когда нужен fetch. Дальше
           // серверы лягут в sub.servers + localStorage и переключение
           // станет мгновенным.
-          void useSubscriptionStore.getState().fetchSubscriptionById(id);
+          await useSubscriptionStore.getState().fetchSubscriptionById(id);
         } else {
-          useSubscriptionStore.setState({
-            servers: sub.servers,
-            meta: sub.meta,
-            pings: sub.pings ?? [],
-          });
-          void invoke("set_servers", { servers: sub.servers });
           // Восстановление выбора: по имени; если имя из другой подписки
           // не нашлось, а запись одна (full-mihomo «профиль») — авто-выбор,
           // иначе сетка локаций не отрисуется и список выглядит «пустым»
           // (раньше это и заставляло жать «обновить» при каждой смене).
           const idx = findSelectedIndexByName(sub.servers);
-          useVpnStore.setState({
-            selectedIndex:
-              idx >= 0 ? idx : sub.servers.length === 1 ? 0 : null,
-          });
+          const nextIndex = idx >= 0 ? idx : sub.servers.length === 1 ? 0 : null;
+          // The running engine still owns the old subscription. Disconnect
+          // before publishing the new index, then reconnect only after the
+          // awaited primary snapshot commit above. This also covers equal
+          // numeric indexes across two different subscriptions.
+          const wasRunning = useVpnStore.getState().status === "running";
+          if (wasRunning) await disconnect();
+          if (nextIndex !== null) selectServer(nextIndex);
+          else useVpnStore.setState({ selectedIndex: null });
+          if (wasRunning && nextIndex !== null) {
+            await new Promise((resolve) => window.setTimeout(resolve, 200));
+            await connect();
+          }
           void useSubscriptionStore.getState().pingAll();
         }
       }
@@ -217,7 +243,8 @@ export function SoftHome({ onOpenSettings }: { onOpenSettings: () => void }) {
     const leftGb = Math.max(0, (meta.total - meta.used) / 1024 ** 3);
     metaTop = `${leftGb.toFixed(1)} ГБ`;
   }
-  const subName = activeSub?.meta?.title?.trim() || meta?.title?.trim() || "Kwik VPN";
+  const subName =
+    activeSub?.meta?.title?.trim() || meta?.title?.trim() || "KwikProxy Secure";
   const word = isBusy ? "…" : isRunning ? "Включён" : "Выключен";
 
   if (servers.length === 0) {

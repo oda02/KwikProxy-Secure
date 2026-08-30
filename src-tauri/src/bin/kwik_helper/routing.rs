@@ -8,6 +8,7 @@
 //! - `ConvertInterfaceIndexToLuid` — резолв LUID интерфейса;
 //! - PowerShell `Remove-NetAdapter` — снос orphan WinTUN-адаптера по имени.
 
+use std::ffi::c_void;
 use std::mem;
 use std::net::Ipv4Addr;
 use std::process::Stdio;
@@ -15,12 +16,51 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command as AsyncCommand;
-use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, NO_ERROR};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NOT_FOUND, HANDLE, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     DeleteIpForwardEntry2, FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN, SOCKADDR_INET};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+
+use super::security;
+
+struct CleanupJob(HANDLE);
+
+unsafe impl Send for CleanupJob {}
+
+impl Drop for CleanupJob {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn create_cleanup_job() -> Result<CleanupJob> {
+    let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if handle.is_null() {
+        bail!("CreateJobObjectW(cleanup) failed");
+    }
+    let job = CleanupJob(handle);
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { mem::zeroed() };
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if unsafe {
+        SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const c_void,
+            mem::size_of_val(&info) as u32,
+        )
+    } == 0
+    {
+        bail!("SetInformationJobObject(cleanup) failed");
+    }
+    Ok(job)
+}
 
 // ── Утилиты ────────────────────────────────────────────────────────────────
 
@@ -39,7 +79,9 @@ fn ipv4_from_addr(addr: &SOCKADDR_INET) -> Option<Ipv4Addr> {
 pub fn luid_from_index(if_index: u32) -> Result<u64> {
     let mut luid: NET_LUID_LH = unsafe { mem::zeroed() };
     let ret = unsafe {
-        windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceIndexToLuid(if_index, &mut luid)
+        windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceIndexToLuid(
+            if_index, &mut luid,
+        )
     };
     if ret != NO_ERROR {
         bail!("ConvertInterfaceIndexToLuid({if_index}) → код {ret}");
@@ -62,11 +104,7 @@ fn mask_to_prefix_len(mask: Ipv4Addr) -> u8 {
 /// Используется в 9.E на старте helper-сервиса для подчистки наших
 /// half-default routes (`0.0.0.0/1` и `128.0.0.0/1`) с NextHop
 /// `198.18.0.1`, оставшихся после краша предыдущей сессии.
-pub async fn delete_route_with_nexthop(
-    destination: &str,
-    mask: &str,
-    nexthop: &str,
-) -> Result<()> {
+pub async fn delete_route_with_nexthop(destination: &str, mask: &str, nexthop: &str) -> Result<()> {
     let dst: Ipv4Addr = match destination.parse() {
         Ok(d) => d,
         Err(_) => return Ok(()),
@@ -136,7 +174,7 @@ pub async fn delete_route_with_nexthop(
 /// с указанным именем — чужие TUN-адаптеры (Happ, Outline, etc.) не трогаем.
 pub async fn cleanup_orphan_tun(name: &str) -> Result<()> {
     // Защита от инъекции: имя адаптера должно быть только из ASCII-букв/цифр/
-    // дефисов/подчёркиваний/звёздочки (для wildcard `kwik-*`).
+    // дефисов/подчёркиваний/звёздочки (для product-owned wildcard).
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '*')
@@ -146,12 +184,33 @@ pub async fn cleanup_orphan_tun(name: &str) -> Result<()> {
     let script = format!(
         "Get-NetAdapter -Name '{name}' -ErrorAction SilentlyContinue | Remove-NetAdapter -Confirm:$false -ErrorAction SilentlyContinue"
     );
-    let mut child = AsyncCommand::new("powershell.exe")
+    let windows_dir = security::known_windows_directory()?;
+    let powershell = security::known_system_directory()?
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    if !powershell.is_file() {
+        bail!("trusted system PowerShell executable is missing");
+    }
+    let job = create_cleanup_job()?;
+    let mut child = AsyncCommand::new(&powershell)
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .env_clear()
+        .env("SystemRoot", &windows_dir)
+        .env("WINDIR", &windows_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .context("powershell для cleanup_orphan_tun не запустился")?;
+    let process = child
+        .raw_handle()
+        .ok_or_else(|| anyhow::anyhow!("cleanup PowerShell has no process handle"))?
+        as HANDLE;
+    if unsafe { AssignProcessToJobObject(job.0, process) } == 0 {
+        let _ = child.start_kill();
+        bail!("AssignProcessToJobObject(cleanup) failed");
+    }
 
     // Жёсткий потолок: PowerShell cold-start ~2с + Remove-NetAdapter
     // обычно <1с. Если процесс «тонет» (драйвер залип, антивирус блокирует) —
@@ -160,9 +219,7 @@ pub async fn cleanup_orphan_tun(name: &str) -> Result<()> {
         Ok(_) => Ok(()),
         Err(_) => {
             let _ = child.start_kill();
-            eprintln!(
-                "[routing] cleanup_orphan_tun({name}) timeout 5с — kill, продолжаем"
-            );
+            eprintln!("[routing] cleanup_orphan_tun({name}) timeout 5с — kill, продолжаем");
             Ok(())
         }
     }

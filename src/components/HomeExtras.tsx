@@ -33,7 +33,7 @@ function httpUrl(u: string | null | undefined): string | null {
 // хешу текста: каждое уникальное объявление закрывается один раз,
 // новое (другой текст) появится снова.
 
-const DISMISSED_KEY = "kwik.dismissed-announces";
+const DISMISSED_KEY = "kwikproxy-secure.dismissed-announces";
 const DISMISSED_MAX = 32;
 
 /** Дешёвый стабильный хеш строки (FNV-1a). 8 hex-символов достаточно. */

@@ -2,7 +2,7 @@
 //!
 //! При панике (которая в проде шла бы в `/dev/null` без логов tracing) мы
 //! пишем структурированный дамп в
-//! `%LOCALAPPDATA%\KwikVPN\crashes\<unix_ts>-<component>.txt`:
+//! `%LOCALAPPDATA%\KwikProxy Secure\crashes\<unix_ts>-<component>.txt`:
 //!
 //!  - сообщение паники + локация (file:line:col);
 //!  - полный backtrace (`std::backtrace::Backtrace::force_capture`);
@@ -21,13 +21,17 @@ use std::panic;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Каталог `%LOCALAPPDATA%\KwikVPN\crashes\`. Возвращает `None`
+/// Каталог `%LOCALAPPDATA%\KwikProxy Secure\crashes\`. Возвращает `None`
 /// если переменной `LOCALAPPDATA` нет (запуск из неинтерактивной
 /// сессии без user-profile, что у нас в принципе не должно случаться,
 /// но лучше деградировать gracefully чем падать в самом hook'е).
 pub fn crashes_dir() -> Option<PathBuf> {
     let appdata = std::env::var_os("LOCALAPPDATA")?;
-    Some(PathBuf::from(appdata).join("KwikVPN").join("crashes"))
+    Some(
+        PathBuf::from(appdata)
+            .join("KwikProxy Secure")
+            .join("crashes"),
+    )
 }
 
 /// Установить глобальный panic-hook. Сохраняет предыдущий хук

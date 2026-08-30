@@ -5,11 +5,12 @@
 //! `service_main` — точка входа, которую SCM вызывает при старте сервиса.
 
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use windows_service::{
     define_windows_service,
     service::{
@@ -21,79 +22,326 @@ use windows_service::{
     service_dispatcher,
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
+use winreg::enums::HKEY_LOCAL_MACHINE;
+use winreg::RegKey;
 
 use super::pipe;
-use super::protocol::{
-    LEGACY_SERVICE_NAME, SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME, SERVICE_NAME,
-};
+use super::protocol::{SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME, SERVICE_NAME};
+use super::security;
 
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+const PRODUCT_DIRECTORY: &str = "KwikProxy Secure";
+const HELPER_FILENAME: &str = "kwik-helper-x86_64-pc-windows-msvc.exe";
+const UI_FILENAME: &str = "vpn-client.exe";
+// Tauri 2 resolves the target-suffixed externalBin source at build time and
+// deliberately strips the target triple when it copies the installed sidecar.
+const MIHOMO_FILENAME: &str = "mihomo.exe";
+const WINTUN_FILENAME: &str = "wintun.dll";
+const GEOIP_RELATIVE_PATH: &str = r"resources\geoip.dat";
+const GEOSITE_RELATIVE_PATH: &str = r"resources\geosite.dat";
+const SERVICES_KEY: &str = r"SYSTEM\CurrentControlSet\Services";
+const SERVICE_STATE_TIMEOUT: Duration = Duration::from_secs(40);
+const SERVICE_DELETE_TIMEOUT: Duration = Duration::from_secs(15);
+const STARTUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(25);
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(35);
+const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 
-// ─── install / uninstall ──────────────────────────────────────────────────────
+#[derive(Debug)]
+struct InstalledPaths {
+    install_dir: PathBuf,
+    ui_path: PathBuf,
+    helper_path: PathBuf,
+    mihomo_path: PathBuf,
+    wintun_path: PathBuf,
+    geoip_path: PathBuf,
+    geosite_path: PathBuf,
+}
 
-/// Остановить (если запущен) и удалить сервис по имени. Идемпотентно:
-/// если сервиса нет — тихо выходит. Используется и для переустановки
-/// текущего сервиса, и для сноса legacy-имени при ребрендинге.
-fn stop_and_delete_service(reuse_mgr: &ServiceManager, name: &str) {
-    let Ok(existing) = reuse_mgr.open_service(
-        name,
-        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
-    ) else {
-        return;
-    };
-    // Stop, если запущен.
-    if let Ok(status) = existing.query_status() {
-        if status.current_state != ServiceState::Stopped {
-            let _ = existing.stop();
-            for _ in 0..40 {
-                std::thread::sleep(Duration::from_millis(250));
-                if let Ok(s) = existing.query_status() {
-                    if s.current_state == ServiceState::Stopped {
-                        break;
-                    }
-                }
-            }
+fn normalized(path: &Path) -> String {
+    path.as_os_str()
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_lowercase()
+}
+
+fn require_regular_file(path: &Path, label: &str) -> Result<PathBuf> {
+    if !path.is_file() {
+        bail!(
+            "{label} is missing from protected install layout: {}",
+            path.display()
+        );
+    }
+    std::fs::canonicalize(path).with_context(|| format!("canonicalize {label}"))
+}
+
+fn protected_install_dir() -> Result<PathBuf> {
+    let program_files = std::fs::canonicalize(security::known_program_files()?)
+        .context("canonicalize Program Files")?;
+    let expected_dir = program_files.join(PRODUCT_DIRECTORY);
+    std::fs::canonicalize(&expected_dir).with_context(|| {
+        format!(
+            "KwikProxy Secure must be installed per-machine at {}",
+            expected_dir.display()
+        )
+    })
+}
+
+/// Validate just the helper's fixed protected location. Uninstall/repair must
+/// remain possible when other product files are damaged or missing.
+fn validate_helper_location() -> Result<(PathBuf, PathBuf)> {
+    let install_dir = protected_install_dir()?;
+    let helper_path = require_regular_file(&std::env::current_exe()?, "helper")?;
+    if normalized(&helper_path) != normalized(&install_dir.join(HELPER_FILENAME)) {
+        bail!(
+            "service registration is installer-only; helper must be {}",
+            install_dir.join(HELPER_FILENAME).display()
+        );
+    }
+    Ok((install_dir, helper_path))
+}
+
+/// Accept service installation only from the complete per-machine bundle.
+/// Canonicalization rejects helper/UI/Mihomo junctions that escape Program Files.
+fn validate_installed_layout() -> Result<InstalledPaths> {
+    let (install_dir, helper_path) = validate_helper_location()?;
+
+    let ui_path = require_regular_file(&install_dir.join(UI_FILENAME), "desktop executable")?;
+    let mihomo_path = require_regular_file(&install_dir.join(MIHOMO_FILENAME), "Mihomo")?;
+    let wintun_path = require_regular_file(&install_dir.join(WINTUN_FILENAME), "WinTUN")?;
+    let geoip_path = require_regular_file(&install_dir.join(GEOIP_RELATIVE_PATH), "GeoIP")?;
+    let geosite_path = require_regular_file(&install_dir.join(GEOSITE_RELATIVE_PATH), "GeoSite")?;
+    let install_dir_normalized = normalized(&install_dir);
+    for (label, path) in [
+        ("desktop executable", &ui_path),
+        ("Mihomo", &mihomo_path),
+        ("WinTUN", &wintun_path),
+    ] {
+        if path.parent().map(normalized).as_deref() != Some(install_dir_normalized.as_str()) {
+            bail!("{label} resolves outside the protected install directory");
         }
     }
-    // Помечаем для удаления — physical removal произойдёт когда
-    // last handle закроется.
-    let _ = existing.delete();
-    drop(existing);
-    // SCM иногда задерживает удаление: ждём пока имя освободится.
-    for _ in 0..20 {
-        std::thread::sleep(Duration::from_millis(150));
-        let busy = reuse_mgr
-            .open_service(name, ServiceAccess::QUERY_STATUS)
-            .is_ok();
-        if !busy {
-            break;
+    let resource_dir = normalized(&install_dir.join("resources"));
+    for (label, path) in [("GeoIP", &geoip_path), ("GeoSite", &geosite_path)] {
+        if path.parent().map(normalized).as_deref() != Some(resource_dir.as_str()) {
+            bail!("{label} resolves outside the protected resources directory");
         }
+    }
+
+    Ok(InstalledPaths {
+        install_dir,
+        ui_path,
+        helper_path,
+        mihomo_path,
+        wintun_path,
+        geoip_path,
+        geosite_path,
+    })
+}
+
+fn valid_sid_text(value: &str) -> bool {
+    value.len() >= 5
+        && value.len() <= 184
+        && value.starts_with("S-1-")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-' || byte == b'S')
+}
+
+/// Installer-owned HKLM manifest consumed by the service at startup.
+/// Every clean install enrolls the Explorer shell owner in the same interactive
+/// session and creates a fresh generation UUID. Neither value is inherited from
+/// stale state, and the elevated token is never treated as the initiating user.
+fn write_install_manifest(paths: &InstalledPaths) -> Result<()> {
+    let owner_sid = security::interactive_shell_user_sid()
+        .context("enroll the initiating interactive desktop SID")?;
+    if !valid_sid_text(&owner_sid) {
+        bail!("initiating interactive desktop returned an invalid SID");
+    }
+    security::provision_install_manifest(
+        &owner_sid,
+        &paths.install_dir,
+        &paths.ui_path,
+        &paths.helper_path,
+        &paths.mihomo_path,
+        &paths.wintun_path,
+        &paths.geoip_path,
+        &paths.geosite_path,
+    )
+    .context("write and verify protected atomic install manifest")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalized, valid_sid_text, GEOIP_RELATIVE_PATH, GEOSITE_RELATIVE_PATH,
+        HELPER_FILENAME, MIHOMO_FILENAME, UI_FILENAME, WINTUN_FILENAME,
+    };
+    use std::path::Path;
+    use windows_service::service::ServiceState;
+
+    #[test]
+    fn validates_owner_sid_shape() {
+        assert!(valid_sid_text("S-1-5-21-123-456-789-1001"));
+        assert!(!valid_sid_text("S-1-5-21-123\\..\\evil"));
+        assert!(!valid_sid_text("BA"));
+    }
+
+    #[test]
+    fn normalizes_windows_paths_for_canonical_comparison() {
+        assert_eq!(
+            normalized(Path::new(r"C:\Program Files\KwikProxy Secure")),
+            normalized(Path::new(r"c:/program files/kwikproxy secure"))
+        );
+    }
+
+    #[test]
+    fn installed_bundle_names_match_tauri_two_layout() {
+        assert_eq!(UI_FILENAME, "vpn-client.exe");
+        assert_eq!(HELPER_FILENAME, "kwik-helper-x86_64-pc-windows-msvc.exe");
+        assert_eq!(MIHOMO_FILENAME, "mihomo.exe");
+        assert_eq!(WINTUN_FILENAME, "wintun.dll");
+        assert_eq!(GEOIP_RELATIVE_PATH, r"resources\geoip.dat");
+        assert_eq!(GEOSITE_RELATIVE_PATH, r"resources\geosite.dat");
+    }
+
+    #[test]
+    fn waits_out_uncontrollable_pending_states() {
+        assert!(super::is_uncontrollable_pending(ServiceState::StartPending));
+        assert!(super::is_uncontrollable_pending(
+            ServiceState::ContinuePending
+        ));
+        assert!(super::is_uncontrollable_pending(ServiceState::PausePending));
+        assert!(!super::is_uncontrollable_pending(ServiceState::Running));
+        assert!(!super::is_uncontrollable_pending(ServiceState::StopPending));
+    }
+
+    #[test]
+    fn stop_timeout_covers_rpc_drain_and_cleanup() {
+        assert!(
+            super::SERVICE_STOP_TIMEOUT
+                >= super::pipe::RPC_DRAIN_TIMEOUT + super::SHUTDOWN_CLEANUP_TIMEOUT
+        );
+        assert!(super::SERVICE_STATE_TIMEOUT >= super::SERVICE_STOP_TIMEOUT);
     }
 }
 
+// ─── install / uninstall ──────────────────────────────────────────────────────
+
+fn service_registry_exists(name: &str) -> bool {
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(format!(r"{SERVICES_KEY}\{name}"))
+        .is_ok()
+}
+
+fn wait_for_service_deletion(reuse_mgr: &ServiceManager, name: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + SERVICE_DELETE_TIMEOUT;
+    loop {
+        let scm_visible = reuse_mgr
+            .open_service(name, ServiceAccess::QUERY_STATUS)
+            .is_ok();
+        let registry_visible = service_registry_exists(name);
+        if !scm_visible && !registry_visible {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "protected service deletion did not settle within {SERVICE_DELETE_TIMEOUT:?} \
+                 (scm_visible={scm_visible}, registry_visible={registry_visible})"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn is_uncontrollable_pending(state: ServiceState) -> bool {
+    matches!(
+        state,
+        ServiceState::StartPending | ServiceState::ContinuePending | ServiceState::PausePending
+    )
+}
+
+/// Stop and remove only this product's service, with bounded state polling.
+/// Absence is idempotent; access errors and stuck states fail closed.
+fn stop_and_delete_service(reuse_mgr: &ServiceManager, name: &str) -> Result<()> {
+    let existing = match reuse_mgr.open_service(
+        name,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+    ) {
+        Ok(service) => service,
+        Err(_error) if !service_registry_exists(name) => return Ok(()),
+        // A service already marked for deletion can reject OpenService while
+        // its SCM/database entry still exists. Poll that state to completion;
+        // access-denied/corrupt states remain visible and time out fail-closed.
+        Err(_error) => return wait_for_service_deletion(reuse_mgr, name),
+    };
+
+    let deadline = std::time::Instant::now() + SERVICE_STATE_TIMEOUT;
+    let status = loop {
+        let status = existing
+            .query_status()
+            .context("query protected service state")?;
+        match status.current_state {
+            state if is_uncontrollable_pending(state) => {
+                if std::time::Instant::now() >= deadline {
+                    bail!("protected service remained pending for {SERVICE_STATE_TIMEOUT:?}");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            _ => break status,
+        }
+    };
+    if status.current_state != ServiceState::Stopped
+        && status.current_state != ServiceState::StopPending
+    {
+        existing.stop().context("request protected service stop")?;
+    }
+    if status.current_state != ServiceState::Stopped {
+        let deadline = std::time::Instant::now() + SERVICE_STATE_TIMEOUT;
+        loop {
+            let state = existing
+                .query_status()
+                .context("poll protected service stop")?
+                .current_state;
+            if state == ServiceState::Stopped {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("protected service did not stop within {SERVICE_STATE_TIMEOUT:?}");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    existing.delete().context("delete protected service")?;
+    drop(existing);
+
+    wait_for_service_deletion(reuse_mgr, name)
+}
+
 pub fn install() -> Result<()> {
+    let installed_paths = validate_installed_layout()?;
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)
         .context("не удалось открыть Service Control Manager (нужны admin-права)")?;
 
-    let exe_path = std::env::current_exe()
-        .context("не удалось получить путь к собственному exe")?;
-
-    // Идемпотентность: если сервис уже установлен — uninstall перед
-    // install. Без этого после dev-rebuild новый helper.exe не попадёт
-    // в SCM (старый сервис ссылается на старый путь / вообще на тот
-    // же путь, но загруженный байт-код в running процессе не обновляется).
-    // Получаем "переустановить" автоматически когда пользователь
-    // запускает app — без вмешательства руками.
-    //
-    // Дополнительно (ребрендинг 0.7.0): сносим сервис под legacy-именем
-    // `NemefistoHelper` — иначе после апгрейда на машине висел бы старый
-    // SYSTEM-сервис со своим pipe, конкурируя с новым `KwikHelper`.
-    let recreate_access = ServiceManagerAccess::CONNECT;
-    if let Ok(reuse_mgr) = ServiceManager::local_computer(None::<&str>, recreate_access) {
-        stop_and_delete_service(&reuse_mgr, SERVICE_NAME);
-        stop_and_delete_service(&reuse_mgr, LEGACY_SERVICE_NAME);
+    // Clean-install-only security preview: never tear down a known-good
+    // service from the install path. Transactional staging/rollback must be
+    // implemented before in-place upgrades are enabled.
+    if service_registry_exists(SERVICE_NAME)
+        || service_manager
+            .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+            .is_ok()
+    {
+        bail!("in-place helper upgrade is disabled; uninstall the existing service first");
     }
+    write_install_manifest(&installed_paths)?;
+    let installation = security::Installation::load()
+        .context("validate the completed protected installation manifest")?;
+    security::provision_runtime_dir(&installation)
+        .context("provision protected per-owner runtime directory")?;
+
+    let exe_path = installed_paths.helper_path;
 
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
@@ -112,7 +360,11 @@ pub fn install() -> Result<()> {
     let service = service_manager
         .create_service(
             &service_info,
-            ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
+            ServiceAccess::CHANGE_CONFIG
+                | ServiceAccess::START
+                | ServiceAccess::STOP
+                | ServiceAccess::DELETE
+                | ServiceAccess::QUERY_STATUS,
         )
         .context("не удалось создать сервис")?;
 
@@ -125,8 +377,6 @@ pub fn install() -> Result<()> {
     // запуска счётчик неудач сбрасывается через сутки. Без этого, если
     // helper упал, пользователю пришлось бы вручную его перезапускать.
     //
-    // Не критично если установка failure-actions упала: обычная
-    // регистрация сервиса всё равно состоялась. Просто eprintln.
     let failure_actions = ServiceFailureActions {
         reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
         reboot_msg: None,
@@ -146,72 +396,59 @@ pub fn install() -> Result<()> {
             },
         ]),
     };
-    if let Err(e) = service.update_failure_actions(failure_actions) {
-        eprintln!(
-            "[install] не удалось задать failure actions (не критично): {e}"
-        );
-    }
+    service
+        .update_failure_actions(failure_actions)
+        .context("не удалось задать failure actions")?;
 
-    service.start(&[] as &[&str]).context("не удалось запустить сервис")?;
+    service
+        .start(&[] as &[&str])
+        .context("не удалось запустить сервис")?;
+
+    let deadline = std::time::Instant::now() + SERVICE_START_TIMEOUT;
+    loop {
+        let state = service
+            .query_status()
+            .context("poll protected service start")?
+            .current_state;
+        if state == ServiceState::Running {
+            break;
+        }
+        if state == ServiceState::Stopped || std::time::Instant::now() >= deadline {
+            bail!("protected service did not reach Running within {SERVICE_START_TIMEOUT:?}");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 
     println!("сервис «{SERVICE_NAME}» установлен и запущен");
     Ok(())
 }
 
-/// Graceful self-stop через SCM (0.3.1 / installer file-lock fix).
-///
-/// Используется обработчиком `Request::ShutdownHelper`: helper открывает
-/// собственный сервис через SCM с `SERVICE_STOP` access (он работает под
-/// SYSTEM, права у него есть) и шлёт `service.stop()` себе же. SCM
-/// маршрутизирует это в наш `event_handler` в `service_loop`, который
-/// выставляет `shutdown` атомик-флаг → pipe-сервер выходит из accept-loop
-/// → `my_service_main` возвращает `SERVICE_STOPPED` обратно в SCM
-/// → процесс терминируется штатно, `.exe`-handle освобождается.
-///
-/// Этот путь предпочтительнее `process::exit(0)` потому что:
-/// - SCM получает корректный SERVICE_STOPPED статус (а не «крах»);
-/// - Failure-actions (auto-restart на 1с/3с/5с) не срабатывают —
-///   они только для unexpected crashes;
-/// - Все pending pipe-операции получают clean disconnect.
-pub fn stop_self() -> Result<()> {
-    let manager_access = ServiceManagerAccess::CONNECT;
-    let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)
-        .context("SCM open для self-stop")?;
-    let service = service_manager
-        .open_service(SERVICE_NAME, ServiceAccess::STOP)
-        .context("open собственного сервиса для self-stop")?;
-    service.stop().context("self-stop service.stop()")?;
-    Ok(())
-}
-
 pub fn uninstall() -> Result<()> {
+    validate_helper_location()?;
+    // Load before service removal while the protected manifest still exists.
+    // A damaged/missing manifest must not prevent repair/uninstall of SCM state.
+    let installation = security::Installation::load().ok();
     let manager_access = ServiceManagerAccess::CONNECT;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)
         .context("не удалось открыть Service Control Manager (нужны admin-права)")?;
-
-    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
-    let service = service_manager
-        .open_service(SERVICE_NAME, service_access)
-        .context("сервис не найден")?;
-
-    // Пытаемся остановить, если запущен — игнорируем ошибки stopped→stopped
-    let status = service.query_status();
-    if let Ok(status) = status {
-        if status.current_state != ServiceState::Stopped {
-            let _ = service.stop();
-            // Ждём остановку до 10 секунд
-            for _ in 0..40 {
-                std::thread::sleep(Duration::from_millis(250));
-                if let Ok(s) = service.query_status() {
-                    if s.current_state == ServiceState::Stopped {
-                        break;
-                    }
-                }
+    stop_and_delete_service(&service_manager, SERVICE_NAME)?;
+    let mut exact_cleanup_succeeded = false;
+    if let Some(installation) = installation.as_ref() {
+        // SCM deletion is the authoritative uninstall result. Runtime cleanup
+        // remains tightly scoped and no-follow, but a missing/corrupt marker
+        // or damaged data file must not resurrect/brick the deleted service.
+        match security::cleanup_runtime_after_uninstall(installation) {
+            Ok(()) => exact_cleanup_succeeded = true,
+            Err(error) => {
+                eprintln!("[uninstall] exact protected runtime cleanup incomplete: {error:#}")
             }
         }
     }
-
-    service.delete().context("не удалось удалить сервис")?;
+    if !exact_cleanup_succeeded {
+        if let Err(error) = security::cleanup_product_runtime_after_uninstall() {
+            eprintln!("[uninstall] bounded corrupt-manifest cleanup incomplete: {error:#}");
+        }
+    }
     println!("сервис «{SERVICE_NAME}» удалён");
     Ok(())
 }
@@ -237,12 +474,28 @@ fn my_service_main(_arguments: Vec<OsString>) {
 fn service_loop() -> Result<()> {
     // Флаг shutdown, который выставит SCM при ServiceControl::Stop
     let shutdown = Arc::new(AtomicBool::new(false));
+    let status_slot: Arc<StdMutex<Option<service_control_handler::ServiceStatusHandle>>> =
+        Arc::new(StdMutex::new(None));
 
     let shutdown_for_handler = shutdown.clone();
+    let status_for_handler = status_slot.clone();
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
                 shutdown_for_handler.store(true, Ordering::SeqCst);
+                if let Ok(slot) = status_for_handler.lock() {
+                    if let Some(handle) = *slot {
+                        let _ = handle.set_service_status(ServiceStatus {
+                            service_type: SERVICE_TYPE,
+                            current_state: ServiceState::StopPending,
+                            controls_accepted: ServiceControlAccept::empty(),
+                            exit_code: ServiceExitCode::Win32(0),
+                            checkpoint: 1,
+                            wait_hint: SERVICE_STOP_TIMEOUT,
+                            process_id: None,
+                        });
+                    }
+                }
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -251,45 +504,101 @@ fn service_loop() -> Result<()> {
     };
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
+    *status_slot
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(status_handle);
 
-    // Сообщаем SCM что мы стартанули
     status_handle.set_service_status(ServiceStatus {
         service_type: SERVICE_TYPE,
-        current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        current_state: ServiceState::StartPending,
+        controls_accepted: ServiceControlAccept::empty(),
         exit_code: ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: Duration::default(),
+        checkpoint: 1,
+        wait_hint: SERVICE_START_TIMEOUT,
         process_id: None,
     })?;
 
-    // Запускаем tokio runtime + pipe сервер
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("не удалось создать tokio runtime")?;
+    let service_result = (|| -> Result<()> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("не удалось создать tokio runtime")?;
 
-    let pipe_result = rt.block_on(async move {
-        // Cleanup orphan-ресурсов запускаем в **фоновой задаче** чтобы
-        // не задерживать открытие pipe-сервера. PowerShell cold-start
-        // (~2-5 сек) + Remove-NetAdapter могли блокировать helper на
-        // 20+ секунд — main app таймаутил `ensure_running`.
-        //
-        // Безопасность: cleanup_orphan_resources проверяет STATE — если
-        // первый клиент уже сделал TunStart, cleanup не трогает живой
-        // TUN-адаптер. Cleanup_on_startup для firewall использует тот
-        // же глобальный engine-mutex что и `firewall::enable`, гонок нет.
-        tokio::spawn(async {
-            if let Err(err) = super::firewall::cleanup_on_startup().await {
-                eprintln!("[service] startup firewall cleanup error: {err}");
-            }
-            super::tun::cleanup_orphan_resources().await;
+        let cleanup_result = rt.block_on(async {
+            tokio::time::timeout(STARTUP_CLEANUP_TIMEOUT, async {
+                super::firewall::cleanup_on_startup()
+                    .await
+                    .context("startup WFP cleanup")?;
+                super::tun::cleanup_orphan_resources().await;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .context("bounded startup network cleanup timed out")??;
+            Ok::<(), anyhow::Error>(())
         });
-        pipe::run_pipe_server(shutdown.clone()).await
-    });
+        if let Err(error) = cleanup_result {
+            // A timed-out spawn_blocking cleanup is never allowed to race a
+            // live tunnel. Stop the runtime promptly and fail startup before
+            // pipe publication instead of proceeding in the background.
+            rt.shutdown_timeout(Duration::from_secs(2));
+            return Err(error);
+        }
+        if shutdown.load(Ordering::SeqCst) {
+            return Err(anyhow!("service stop requested during startup cleanup"));
+        }
+
+        status_handle.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state: ServiceState::StartPending,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 2,
+            wait_hint: SERVICE_START_TIMEOUT,
+            process_id: None,
+        })?;
+        let prepared =
+            pipe::prepare_pipe_server().context("manifest/runtime/pipe readiness checks failed")?;
+        if shutdown.load(Ordering::SeqCst) {
+            return Err(anyhow!("service stop requested before pipe publication"));
+        }
+
+        status_handle.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state: ServiceState::Running,
+            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        })?;
+
+        let pipe_result =
+            rt.block_on(async { pipe::run_prepared_pipe_server(prepared, shutdown.clone()).await });
+
+        status_handle.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state: ServiceState::StopPending,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 2,
+            wait_hint: SHUTDOWN_CLEANUP_TIMEOUT,
+            process_id: None,
+        })?;
+        let cleanup_result = rt.block_on(async {
+            tokio::time::timeout(
+                SHUTDOWN_CLEANUP_TIMEOUT,
+                super::dispatch::shutdown_cleanup(),
+            )
+            .await
+            .context("service shutdown cleanup timed out")?
+        });
+        rt.shutdown_timeout(Duration::from_secs(2));
+        pipe_result.context("pipe accept/drain failed")?;
+        cleanup_result.context("privileged shutdown transaction failed")
+    })();
 
     // Сообщаем SCM что мы остановились (любой исход)
-    let exit_code = if pipe_result.is_ok() { 0 } else { 1 };
+    let exit_code = if service_result.is_ok() { 0 } else { 1 };
     let _ = status_handle.set_service_status(ServiceStatus {
         service_type: SERVICE_TYPE,
         current_state: ServiceState::Stopped,
@@ -300,5 +609,5 @@ fn service_loop() -> Result<()> {
         process_id: None,
     });
 
-    pipe_result
+    service_result
 }

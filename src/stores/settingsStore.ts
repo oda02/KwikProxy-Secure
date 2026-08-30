@@ -109,7 +109,7 @@ export type Settings = {
   /** Маскировка имени TUN-адаптера (этап 12.E). Если on — каждое
    *  подключение в TUN-режиме создаёт адаптер с нейтральным именем
    *  (wlan99 / Local Area Connection N / Ethernet N) вместо
-   *  `kwik-<pid>`. Защита от детекта VPN приложениями типа
+   *  product-prefixed имени. Защита от детекта VPN приложениями типа
    *  МАХ/ВК/Госуслуг по `GetAdaptersAddresses`. */
   tunMasking: boolean;
 
@@ -340,7 +340,7 @@ const DEFAULTS: Settings = {
   refreshOnOpen: false,
   pingOnOpen: true,
   connectOnOpen: false,
-  sendHwid: true,
+  sendHwid: false,
   userAgent: DEFAULT_USER_AGENT,
   sort: "none",
   allowLan: false,
@@ -396,7 +396,8 @@ const DEFAULTS: Settings = {
   nativeNotifications: true,
 };
 
-const KEY = "kwik.settings.v1";
+const KEY = "kwikproxy-secure.settings.v1";
+const HWID_OPT_IN_KEY = "kwikproxy-secure.privacy.hwid-opt-in.v1";
 
 const load = (): Settings => {
   try {
@@ -404,6 +405,12 @@ const load = (): Settings => {
     if (!raw) return DEFAULTS;
     const parsed = JSON.parse(raw) as Partial<Settings>;
     const merged: Settings = { ...DEFAULTS, ...parsed };
+    // Older builds silently defaulted x-hwid to on.  That persisted value is
+    // not informed consent, so migrate it to off until the user explicitly
+    // enables the toggle in this hardened build.
+    if (localStorage.getItem(HWID_OPT_IN_KEY) !== "1") {
+      merged.sendHwid = false;
+    }
     // Mihomo-only миграция: любое legacy-значение движка ("xray" /
     // "sing-box") из старых конфигов принудительно переезжает на "mihomo"
     // — единственный поддерживаемый движок.
@@ -444,6 +451,14 @@ export const useSettingsStore = create<Store>((setState, get) => ({
   ...load(),
   set: (key, value) => {
     const next: Settings = { ...get(), [key]: value };
+    if (key === "sendHwid") {
+      try {
+        if (value === true) localStorage.setItem(HWID_OPT_IN_KEY, "1");
+        else localStorage.removeItem(HWID_OPT_IN_KEY);
+      } catch {
+        // Storage unavailable: remain opt-out on next launch.
+      }
+    }
     // Override-флаги: пользователь явно поменял настройку → перестаём
     // подхватывать значение из заголовка подписки. См. 8.C override-логику.
     if (key === "autoRefreshHours") next.autoRefreshHoursTouched = true;
@@ -471,6 +486,11 @@ export const useSettingsStore = create<Store>((setState, get) => ({
     setState(next);
   },
   reset: () => {
+    try {
+      localStorage.removeItem(HWID_OPT_IN_KEY);
+    } catch {
+      // Storage unavailable: DEFAULTS is still opt-out in memory.
+    }
     save(DEFAULTS);
     setState(DEFAULTS);
   },

@@ -1,37 +1,14 @@
 //! 14.C — crash-dump hook для helper-сервиса.
 //!
-//! Дублирует `platform::crash_dumps` из main-приложения (чтобы helper
-//! как отдельный `bin` не тащил библиотеку клиента целиком). Файлы
-//! пишутся в тот же каталог `%LOCALAPPDATA%\KwikVPN\crashes\`,
-//! но с суффиксом `kwik-helper` чтобы не путать с main-крашами.
-//!
-//! ВАЖНО: при запуске под SCM (Local System) `LOCALAPPDATA` указывает
-//! на `C:\Windows\System32\config\systemprofile\AppData\Local\` — туда
-//! crash-dump'ы и попадут. Это нормально: файлы доступны админу,
-//! `export_diagnostics` со стороны main-app достанет их через
-//! `is_helper_crash`-эвристику или общую папку.
-//!
-//! TODO когда-нибудь: helper-крах писать в общий `%PROGRAMDATA%\KwikVPN\`
-//! доступный обоим SYSTEM и user-mode.
+//! Dumps are written only below the installer-protected runtime directory;
+//! environment-controlled/user-writable paths are never used by SYSTEM.
 
 use std::backtrace::Backtrace;
-use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::panic;
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn crashes_dir() -> Option<PathBuf> {
-    // Порядок: LOCALAPPDATA (user-session helper) → PROGRAMDATA
-    // (SYSTEM-session). Так main-app точно найдёт хотя бы один.
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        return Some(PathBuf::from(local).join("KwikVPN").join("crashes"));
-    }
-    if let Some(program) = std::env::var_os("PROGRAMDATA") {
-        return Some(PathBuf::from(program).join("KwikVPN").join("crashes"));
-    }
-    None
-}
+use super::security::Installation;
 
 pub fn install_panic_hook() {
     let prev = panic::take_hook();
@@ -44,21 +21,14 @@ pub fn install_panic_hook() {
 }
 
 fn write_crash_dump(info: &panic::PanicHookInfo<'_>) -> std::io::Result<()> {
-    let dir = crashes_dir()
-        .ok_or_else(|| std::io::Error::other("LOCALAPPDATA/PROGRAMDATA не установлен"))?;
-    create_dir_all(&dir)?;
-
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let path = dir.join(format!("{ts}-kwik-helper.txt"));
-
-    let mut f = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)?;
+    let installation = Installation::load().map_err(std::io::Error::other)?;
+    let mut f = installation
+        .replace_runtime_file(&format!("crash-{ts}-kwik-helper.txt"))
+        .map_err(std::io::Error::other)?;
 
     writeln!(f, "Kwik helper crash dump")?;
     writeln!(f, "----------------------")?;

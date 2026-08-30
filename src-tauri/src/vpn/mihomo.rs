@@ -1,9 +1,9 @@
 //! Управление процессом Mihomo (Clash Meta) sidecar — этап 8.B.
 //!
 //! Симметричен `xray.rs`: принимает готовый YAML-конфиг, пишет в файл
-//! `%TEMP%\KwikVPN\mihomo-config.yaml` и запускает sidecar
-//! `mihomo` (binary `mihomo-x86_64-pc-windows-msvc.exe`). Логи stderr —
-//! в `%TEMP%\KwikVPN\mihomo-stderr.log`.
+//! `%TEMP%\KwikProxy Secure\mihomo-config.yaml` и запускает sidecar
+//! `mihomo` (target-suffixed source installed by Tauri as `mihomo.exe`). Логи stderr —
+//! в `%TEMP%\KwikProxy Secure\mihomo-stderr.log`.
 //!
 //! Один движок на сессию (Xray ИЛИ Mihomo), что выбран — определяется в
 //! `commands.rs::connect()`. Mihomo используется когда сервер из подписки
@@ -38,6 +38,9 @@ pub struct MihomoState {
     /// `mixed-port` Mihomo: один сокет на SOCKS5 и HTTP одновременно
     /// (стандартная фича clash-style ядра, не требует двух inbound'ов).
     pub mixed_port: Mutex<u16>,
+    /// Explicitly trusted no-auth loopback SOCKS port for subscription
+    /// refreshes. Set only after a successful proxy-mode/non-LAN connect.
+    subscription_proxy_port: Mutex<Option<u16>>,
     /// 13.L: mihomo запущен helper'ом (built-in TUN). Set/cleared в
     /// connect/disconnect, влияет только на `is_running()`.
     helper_spawned: AtomicBool,
@@ -49,6 +52,7 @@ impl MihomoState {
             child: Mutex::new(None),
             current_pid: Mutex::new(None),
             mixed_port: Mutex::new(7890),
+            subscription_proxy_port: Mutex::new(None),
             helper_spawned: AtomicBool::new(false),
         }
     }
@@ -60,10 +64,23 @@ impl MihomoState {
         self.helper_spawned.store(on, Ordering::SeqCst);
     }
 
+    pub fn set_subscription_proxy_port(&self, port: Option<u16>) {
+        if let Ok(mut current) = self.subscription_proxy_port.lock() {
+            *current = port.filter(|value| (30_000..60_000).contains(value));
+        }
+    }
+
+    pub fn trusted_subscription_proxy_port(&self) -> Option<u16> {
+        if !self.is_running() {
+            return None;
+        }
+        self.subscription_proxy_port.lock().ok().and_then(|port| *port)
+    }
+
     /// Запустить Mihomo с указанным YAML-конфигом.
     ///
     /// Если уже запущен — останавливает перед перезапуском. Конфиг
-    /// сохраняется в `%TEMP%\KwikVPN\mihomo-config.yaml`.
+    /// сохраняется в `%TEMP%\KwikProxy Secure\mihomo-config.yaml`.
     pub fn start_with_config(
         &self,
         app: &AppHandle,
@@ -72,9 +89,9 @@ impl MihomoState {
     ) -> Result<(), String> {
         self.stop()?;
 
-        let tmp_dir = std::env::temp_dir().join("KwikVPN");
+        let tmp_dir = std::env::temp_dir().join("KwikProxy Secure");
         std::fs::create_dir_all(&tmp_dir)
-            .map_err(|e| format!("не удалось создать %TEMP%\\KwikVPN: {e}"))?;
+            .map_err(|e| format!("не удалось создать %TEMP%\\KwikProxy Secure: {e}"))?;
         let config_path = tmp_dir.join("mihomo-config.yaml");
         std::fs::write(&config_path, config_yaml)
             .map_err(|e| format!("запись mihomo-конфига: {e}"))?;
@@ -84,7 +101,7 @@ impl MihomoState {
             .ok_or_else(|| "путь к mihomo-конфигу содержит не-UTF-8 символы".to_string())?;
 
         // Mihomo требует «директорию данных» где хранятся geoip/geosite и cache.db.
-        // Используем тот же %TEMP%\KwikVPN — Mihomo сам создаст при необходимости.
+        // Используем тот же %TEMP%\KwikProxy Secure — Mihomo создаст при необходимости.
         // 11.B: кладём geo `.dat` (user-скачанные приоритетнее бандла) в data-dir,
         // иначе правила GEOSITE:/GEOIP: профиля ломают старт mihomo.
         crate::config::geofiles::provision_into(&tmp_dir);
@@ -194,6 +211,7 @@ impl MihomoState {
 
     /// Остановить Mihomo. Если не запущен — no-op.
     pub fn stop(&self) -> Result<(), String> {
+        self.set_subscription_proxy_port(None);
         let mut g = self.child.lock().map_err(|e| format!("mutex: {e}"))?;
         if let Some(child) = g.take() {
             let pid = child.pid();

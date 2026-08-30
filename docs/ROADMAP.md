@@ -114,13 +114,11 @@ x-device-locale: <язык>
 x-client: Kwik
 ```
 
-Если включена отправка HWID:
+Если пользователь явно включил отправку HWID (default off), для каждой
+HTTPS-подписки выводится отдельный псевдоним; Windows MachineGuid не читается:
 
 ```
-x-hwid: <hwid>
-x-device-os: Windows | macOS | Linux | iOS | Android
-x-ver-os: <версия ОС>
-x-device-model: <модель устройства>
+x-hwid: <per-subscription pseudonym>
 ```
 
 #### Override-логика
@@ -282,19 +280,20 @@ bail с сообщением «отключите другой VPN». Опцио
 ### 9.D — System proxy backup/restore
 При connect (mode=proxy) сохранять предыдущие значения registry-keys
 `ProxyEnable` / `ProxyServer` / `ProxyOverride` в
-`%LOCALAPPDATA%\KwikVPN\proxy_backup.json`. При disconnect —
+`%LOCALAPPDATA%\KwikProxy Secure\proxy_backup.json`. При disconnect —
 восстанавливать. На случай краша — детект backup-файла на старте app
 с предложением восстановить.
 
 ### 9.E — Cleanup orphan-ресурсов на старте
-- Helper-сервис при старте: удалить все WinTUN-адаптеры с префиксом
-  `kwik-` (best-effort через `Remove-NetAdapter`); вычистить
-  routing-rules с нашим NextHop=198.18.0.1.
+- Helper-сервис при старте удаляет только WinTUN-адаптеры с уникальным
+  ownership-префиксом `kwikproxy-secure-`; legacy и heuristic-only
+  маршруты/адаптеры не затрагиваются.
 - Main app при старте: detect proxy_backup.json и предложить restore.
 
 ### 9.F — Уникальное имя TUN (готово)
-Каждая сессия создаёт `kwik-<pid>` — двойной запуск приложения
-не конфликтует.
+Каждая сессия создаёт уникальное имя с точным ownership-префиксом
+`kwikproxy-secure-`. Helper не считает принадлежащими проекту `kwik-*`,
+`nemefisto-*` или нейтральные имена сетевых адаптеров.
 
 ### 9.G — SOCKS5 inbound authentication
 
@@ -429,7 +428,7 @@ JSON-документ, совместимый с типовыми панелям
 ### 11.B — Geofiles с оптимизацией через .sha256
 
 Скачиваем `geoip.dat` и `geosite.dat` с GitHub (Loyalsoldier/v2ray-rules-dat).
-Кладём в `%LOCALAPPDATA%\KwikVPN\geofiles\`.
+Кладём в `%LOCALAPPDATA%\KwikProxy Secure\geofiles\`.
 
 **Алгоритм обновления:**
 1. Скачиваем `geoip.dat.sha256` (64 hex-символа).
@@ -444,7 +443,7 @@ JSON-документ, совместимый с типовыми панелям
 ### 11.C — Autorouting vs Routing (два режима)
 
 - **Routing** — статический профиль. Передаётся как base64 в заголовке
-  `routing` или ссылка `kwik://routing/onadd/{base64}`. Обновляется
+  `routing` или ссылка `kwikproxy-secure://routing/onadd/{base64}`. Обновляется
   только при ручном перезапросе подписки.
 - **Autorouting** — URL-источник, профиль скачивается отдельно и
   обновляется автоматически по интервалу. В UI помечается иконкой облака.
@@ -466,31 +465,31 @@ JSON-документ, совместимый с типовыми панелям
 
 ### 11.D — Расширенные deep-links
 
-Расширяем обработчик `kwik://` командами:
+Расширяем обработчик `kwikproxy-secure://` командами (security-first реализация требует подтверждения в UI):
 
 #### Управление VPN
 | Команда | Действие |
 |---|---|
-| `kwik://connect` или `kwik://open` | Подключить VPN |
-| `kwik://disconnect` или `kwik://close` | Отключить VPN |
-| `kwik://toggle` | Переключить состояние |
-| `kwik://status` | Открыть приложение, показать статус |
+| `kwikproxy-secure://connect` или `kwikproxy-secure://open` | Запросить действие в UI |
+| `kwikproxy-secure://disconnect` или `kwikproxy-secure://close` | Запросить действие в UI |
+| `kwikproxy-secure://toggle` | Запросить действие в UI |
+| `kwikproxy-secure://status` | Открыть приложение, показать статус |
 
 #### Импорт конфигураций
 | Команда | Что делает |
 |---|---|
-| `kwik://import/{data}` | Auto-detect: URL подписки или одиночная ссылка |
-| `kwik://add/{url}` | Добавить подписку напрямую |
-| `kwik://onadd/{url}` | Сокращённая форма (без автообновления) |
+| `kwikproxy-secure://import/{data}` | Показать запрос импорта без сохранения |
+| `kwikproxy-secure://add/{url}` | Показать запрос импорта без сохранения |
+| `kwikproxy-secure://onadd/{url}` | Показать запрос импорта без сохранения |
 
 #### Маршрутизация
 | Команда | Действие |
 |---|---|
-| `kwik://routing/add/{base64}` | Добавить routing-профиль |
-| `kwik://routing/onadd/{base64}` | Добавить и сразу активировать |
-| `kwik://routing/onadd/{url}` | Скачать одноразово (без автообновления) |
-| `kwik://autorouting/add/{url}` | Скачать с автообновлением (не активирует) |
-| `kwik://autorouting/onadd/{url}` | Скачать, активировать, включить автообновление |
+| `kwikproxy-secure://routing/add/{base64}` | Запросить импорт routing-профиля |
+| `kwikproxy-secure://routing/onadd/{base64}` | Запросить импорт routing-профиля |
+| `kwikproxy-secure://routing/onadd/{url}` | Запросить импорт routing-профиля |
+| `kwikproxy-secure://autorouting/add/{url}` | Запросить импорт routing-профиля |
+| `kwikproxy-secure://autorouting/onadd/{url}` | Запросить импорт routing-профиля |
 
 **Query-параметр `?data={base64}`** поддерживается как альтернатива
 path-сегменту. **GitHub-конвертация**: `https://github.com/.../blob/main/...`
@@ -549,18 +548,22 @@ path-сегменту. **GitHub-конвертация**: `https://github.com/..
 Search-input + чипы протоколов. Фильтрация на клиенте.
 
 ### 12.D — Backup/restore настроек через deep-link
-- `kwik://export` — file-save диалог, JSON с settings + URL
-  подписки + appRules (без кеша серверов и HWID).
-- `kwik://import-from-url/{url}` — скачать JSON по ссылке.
-- `kwik://import/{base64}` — импорт из inline base64.
+- `kwikproxy-secure://export` — не выполняется без ручного действия в UI.
+- Обычный export содержит settings + appRules без кеша серверов,
+  HWID и `subscription_url`. URL/token можно добавить только явным
+  `includeSubscriptionSecret=true` с warning и confirm-step; лимит JSON 1 МиБ
+  проверяется в frontend и Rust IPC.
+- `kwikproxy-secure://import-from-url/{url}` — только запрос ручного импорта.
+- `kwikproxy-secure://import/{base64}` — in-memory preview с явным подтверждением.
 - Перед применением — модалка с превью изменений.
 - Whitelist полей: тема, фон, пресет, button-style, autoRefresh*,
   refresh/ping/connectOnOpen, sort, allowLan, anti-DPI группы,
-  app-rules, URL подписки. **Без HWID, без localStorage-флагов.**
+  app-rules. URL подписки импортируется только если он уже явно присутствует
+  в файле. **Без HWID, без localStorage-флагов.**
 
-### 12.E — Маскировка имени TUN-адаптера (готово)
-Toggle «маскировка TUN». Имя выбирается случайно из набора:
-`wlan{99..199}` / `Local Area Connection {N}` / `Ethernet {N}`.
+### 12.E — Безопасная ownership-метка TUN-адаптера (готово)
+Маскировка под чужие/нейтральные имена отключена. Все адаптеры проекта имеют
+префикс `kwikproxy-secure-`, необходимый для fail-closed privileged cleanup.
 
 ---
 
@@ -591,7 +594,7 @@ ServiceFailureActions. + live-toggle через `kill_switch_apply`.
 
 ### 13.E — История сессий
 Локальный лог connect/disconnect: timestamp, сервер, режим, длительность,
-причина. SQLite `%LOCALAPPDATA%\KwikVPN\history.db` (через `rusqlite`).
+причина. SQLite `%LOCALAPPDATA%\KwikProxy Secure\history.db` (через `rusqlite`).
 UI: вкладка «история» в Settings.
 
 ### 13.F — Speed-test встроенный
@@ -660,10 +663,11 @@ ru.site блокируется WFP. Отдельный toggle: классиче�
 
 ## Этап 14 — Production-readiness
 
-### 14.A — Auto-updater (готово)
-`tauri-plugin-updater` + `tauri-plugin-process` для relaunch. Endpoint —
-GitHub Releases `latest.json` (генерится в CI). ed25519-подпись (Tauri
-signing key). installMode: passive.
+### 14.A — Auto-updater (отключён, fail-closed)
+In-app check/download/install не делают сетевых запросов. In-place upgrade
+в installer также отключён, пока не реализованы подписанная транзакционная
+замена и rollback всех защищённых бинарников. Обновление — только ручная
+чистая установка.
 
 ### 14.B — Code signing ⚠️ НЕ СДЕЛАНО
 Без подписи Windows SmartScreen ругается «Unknown publisher».
@@ -674,7 +678,7 @@ signing key). installMode: passive.
 `docs/RELEASE.md`, приватный ключ в HSM для EV.
 
 ### 14.C — Crash dump + диагностика
-`std::panic::set_hook` → stacktrace в `%LOCALAPPDATA%\KwikVPN\crashes\`.
+`std::panic::set_hook` → stacktrace в `%LOCALAPPDATA%\KwikProxy Secure\crashes\`.
 `tracing-rolling-file`. Опционально minidump через `minidump-writer`.
 Без отправки на сервер.
 

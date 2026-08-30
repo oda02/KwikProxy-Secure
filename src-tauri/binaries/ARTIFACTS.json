@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "policy": "Every third-party byte embedded in an installer must match this immutable SHA-256 list. Replace an artifact only in a separately reviewed change that records its authoritative source and verification evidence.",
+  "artifacts": [
+    {
+      "file": "mihomo-x86_64-pc-windows-msvc.exe",
+      "component": "Mihomo",
+      "version": "1.19.24",
+      "source": "https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.24",
+      "provenance": "Matched against the official v1.19.24 Windows amd64 release archive during the initial fork audit.",
+      "sha256": "fcc641d58094f3129c2fc3be411c506946d3a5ddbb459ff42d34dd9bfa0864fd"
+    },
+    {
+      "file": "wintun.dll",
+      "component": "Wintun",
+      "version": "0.14.1",
+      "source": "https://www.wintun.net/builds/wintun-0.14.1.zip",
+      "provenance": "Matched against the official Wintun 0.14.1 archive during the initial fork audit.",
+      "sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+    },
+    {
+      "file": "geoip.dat",
+      "component": "GeoIP rules",
+      "version": "upstream repository snapshot",
+      "source": "inherited from kanabicks/KwikProxy commit af49d2639746f1d9f28f25c0a4bf7fe496ece067",
+      "provenance": "Content-pinned for reproducibility; authoritative upstream release provenance still requires independent verification before public release.",
+      "sha256": "744c97b74c52bae2ac8664fef6ac481d7765cb8432a0df54f0368a88b9b4a354"
+    },
+    {
+      "file": "geosite.dat",
+      "component": "GeoSite rules",
+      "version": "upstream repository snapshot",
+      "source": "inherited from kanabicks/KwikProxy commit af49d2639746f1d9f28f25c0a4bf7fe496ece067",
+      "provenance": "Content-pinned for reproducibility; authoritative upstream release provenance still requires independent verification before public release.",
+      "sha256": "adf92de0cfc70e458b399f04c5f912bf42d115ed7e37281b30e2f1c68605e4e9"
+    }
+  ]
+}

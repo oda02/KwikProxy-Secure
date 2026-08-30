@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Kwik",
+  "productName": "KwikProxy Secure",
   "version": "0.7.2",
-  "identifier": "com.kwik.vpn-client",
+  "identifier": "io.github.oda02.kwikproxy-secure",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Kwik",
+        "title": "KwikProxy Secure",
         "width": 460,
         "height": 920,
         "minWidth": 420,
@@ -23,33 +23,23 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data: blob:; font-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'; media-src 'none'; worker-src 'none'",
+      "devCsp": "default-src 'self' http://localhost:1420; script-src 'self' 'unsafe-eval' http://localhost:1420; style-src 'self' 'unsafe-inline' http://localhost:1420; img-src 'self' asset: http://asset.localhost data: blob:; font-src 'self' data:; connect-src ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1421; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'"
     }
   },
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["kwik"]
-      }
-    },
-    "updater": {
-      "active": true,
-      "dialog": false,
-      "endpoints": [
-        "https://github.com/kanabicks/KwikProxy/releases/latest/download/latest.json"
-      ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZGQTJCMDc0QUI2NjA1QUMKUldTc0JXYXJkTENpLzYvMnZDUUZqeHBlVHZ0TjNIb2d3aHJtdjBIUEpQNWZiZnQ1UTJ5b1IwTVAK",
-      "windows": {
-        "installMode": "passive"
+        "schemes": ["kwikproxy-secure"]
       }
     }
   },
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "category": "Utility",
-    "publisher": "Kwik",
+    "publisher": "oda02 / KwikProxy Secure contributors",
     "shortDescription": "VPN-клиент на Mihomo",
     "longDescription": "Лёгкий VPN-клиент для Windows на базе Mihomo. Поддержка VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, WireGuard, AnyTLS. Подключение в один клик через системный прокси или TUN.",
     "icon": [
@@ -70,10 +60,10 @@
     },
     "windows": {
       "webviewInstallMode": {
-        "type": "downloadBootstrapper"
+        "type": "skip"
       },
       "nsis": {
-        "installMode": "currentUser",
+        "installMode": "perMachine",
         "languages": ["English", "Russian"],
         "displayLanguageSelector": false,
         "installerHooks": "installer-hooks.nsh"

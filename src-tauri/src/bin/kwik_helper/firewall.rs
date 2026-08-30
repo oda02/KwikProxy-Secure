@@ -31,8 +31,7 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
 
 use super::helper_log::log as hlog;
 use super::wfp::{
-    cleanup_provider as wfp_cleanup_provider, WfpEngine, KWIK_PROVIDER_GUID,
-    KWIK_SUBLAYER_GUID,
+    cleanup_provider as wfp_cleanup_provider, WfpEngine, KWIK_PROVIDER_GUID, KWIK_SUBLAYER_GUID,
 };
 
 // Веса фильтров. Higher = проверяется первым. Block-all — без weight
@@ -200,11 +199,11 @@ fn enable_blocking(
     let engine = WfpEngine::open_dynamic().context("open WFP engine")?;
 
     engine.transaction(|e| {
-        e.add_provider(KWIK_PROVIDER_GUID, "Kwik VPN KillSwitch")?;
+        e.add_provider(KWIK_PROVIDER_GUID, "KwikProxy Secure KillSwitch")?;
         e.add_sublayer(
             KWIK_SUBLAYER_GUID,
             KWIK_PROVIDER_GUID,
-            "Kwik KillSwitch",
+            "KwikProxy Secure KillSwitch",
             0xFFFF,
         )?;
 
@@ -574,8 +573,7 @@ fn disable_blocking() -> Result<()> {
 }
 
 /// Cleanup orphan-фильтров с прошлых инкарнаций helper'а.
-/// Вызывается при старте сервиса как страховка. Бежит в фоновой
-/// задаче (см. service.rs) — чтобы не блокировать pipe-сервер.
+/// Вызывается при старте сервиса до публикации pipe/Running readiness.
 ///
 /// Берёт engine_lock на время операции — гарантия что параллельный
 /// `enable_blocking` от только что подключившегося клиента не пересечётся

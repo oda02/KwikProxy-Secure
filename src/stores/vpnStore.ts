@@ -128,8 +128,8 @@ type VpnState = {
  *    мы бы выбирали не тот)
  *  Сохраняется при `selectServer()`. Восстанавливается через
  *  findSelectedIndexByName в subscriptionStore (loadCached / fetchSubscription). */
-const SELECTED_NAME_KEY = "kwik.selectedServerName.v1";
-const SELECTED_SUB_KEY = "kwik.selectedSubscriptionId.v1";
+const SELECTED_NAME_KEY = "kwikproxy-secure.selectedServerName.v1";
+const SELECTED_SUB_KEY = "kwikproxy-secure.selectedSubscriptionId.v1";
 
 /** Нормализация имени для сравнения: trim + collapse повторных пробелов
  *  + lowercase. Нужно потому что разные парсеры формируют одно и то же
@@ -355,10 +355,27 @@ export const useVpnStore = create<VpnState>((set, get) => ({
     const engine = sourceId
       ? subStore.getEffectiveEngine(sourceId)
       : "mihomo";
+    // Obtain an exact backend commit receipt immediately before connect.
+    // Rust validates epoch + primary id + generation atomically when reading
+    // the indexed server, so a renderer reload or overtaking primary change
+    // cannot connect a server from another subscription.
+    const runtimeReceipt = await subStore.ensurePrimaryRuntimeReady();
+    const currentSubscriptions = useSubscriptionStore.getState();
+    if (
+      !runtimeReceipt ||
+      currentSubscriptions.primaryId !== runtimeReceipt.primaryId ||
+      get().selectedIndex !== selectedIndex
+    ) {
+      set({ status: "error", errorMessage: "Subscription selection changed before connect" });
+      return;
+    }
     set({ status: "starting", errorMessage: null });
     try {
       const result = await invoke<ConnectResult>("connect", {
         serverIndex: selectedIndex,
+        subscriptionEpoch: runtimeReceipt.sessionEpoch,
+        subscriptionId: runtimeReceipt.primaryId,
+        subscriptionGeneration: runtimeReceipt.generation,
         mode,
         engine,
         allowLan,

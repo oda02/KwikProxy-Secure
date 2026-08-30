@@ -225,7 +225,7 @@ pub fn detect_routing_conflicts() -> Vec<String> {
     Vec::new()
 }
 
-/// 14.E — есть ли в системе orphan TUN-адаптер с префиксом `kwik-`.
+/// 14.E — есть ли orphan TUN-адаптер с уникальным префиксом этого fork.
 ///
 /// Используется при показе recovery dialog'а: если адаптер от прошлой
 /// упавшей сессии не убран — пользователь видит галку «orphan TUN-адаптер»
@@ -257,7 +257,10 @@ pub fn has_orphan_tun_adapters() -> bool {
                 .position(|&c| c == 0)
                 .unwrap_or(row.Alias.len());
             let alias = String::from_utf16_lossy(&row.Alias[..alias_len]);
-            if alias.to_lowercase().starts_with("kwik-") {
+            if alias
+                .to_ascii_lowercase()
+                .starts_with("kwikproxy-secure-")
+            {
                 found = true;
                 break;
             }
@@ -283,7 +286,7 @@ pub struct RouteEntry {
     pub destination: String,
     /// Next-hop IP или `"on-link"` если шлюза нет.
     pub next_hop: String,
-    /// Friendly-имя интерфейса (`"Wi-Fi"`, `"kwik-1234"`, и т.д.).
+    /// Friendly-имя интерфейса (`"Wi-Fi"`, `"kwikproxy-secure-1234"`, и т.д.).
     /// Если резолвер упал — fallback на `"if{index}"`.
     pub interface: String,
     /// `InterfaceIndex` — для группировки/фильтрации в UI.

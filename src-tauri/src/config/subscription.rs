@@ -3,6 +3,7 @@
 //! Основной формат — base64-список URI (vless://, ss://, vmess://, trojan://).
 //! Fallback — Clash YAML (если сервер вернул его вместо base64).
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
@@ -17,7 +18,7 @@ use super::server::ProxyEntry;
 /// Формат заголовка: `upload=X;download=Y;total=Z;expire=T`,
 /// где X/Y/Z — байты (Z=0 → безлимит), T — unix-timestamp срока
 /// истечения (T=0 → бессрочно).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionMeta {
     /// upload + download в байтах.
     pub used: u64,
@@ -90,20 +91,205 @@ pub struct SubscriptionMeta {
     pub routing_static: Option<(String, bool)>,
 }
 
-/// Кешированный список серверов и метаданных из последней успешной
-/// загрузки подписки. Живёт в памяти процесса, не персистится между
-/// запусками (для этого есть localStorage на фронте).
+/// Primary subscription snapshot used by index-based connect/ping commands.
+/// Network fetches never mutate it directly. The frontend commits a snapshot
+/// only after its primary-id/request-generation checks pass.
 pub struct SubscriptionState {
-    pub servers: Mutex<Vec<ProxyEntry>>,
-    pub meta: Mutex<Option<SubscriptionMeta>>,
+    inner: Mutex<RuntimeSubscription>,
+}
+
+#[derive(Default)]
+struct RuntimeSubscription {
+    epoch: String,
+    generation: u64,
+    primary_id: Option<String>,
+    servers: Vec<ProxyEntry>,
+    meta: Option<SubscriptionMeta>,
+    cache_generations: HashMap<String, u64>,
 }
 
 impl SubscriptionState {
     pub fn new() -> Self {
         Self {
-            servers: Mutex::new(Vec::new()),
-            meta: Mutex::new(None),
+            inner: Mutex::new(RuntimeSubscription::default()),
         }
+    }
+
+    pub fn snapshot(&self) -> (Vec<ProxyEntry>, Option<SubscriptionMeta>) {
+        self.inner
+            .lock()
+            .map(|state| (state.servers.clone(), state.meta.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Start a renderer-owned epoch. A renderer reload cannot accidentally
+    /// reuse sequence numbers that the still-running Rust process has already
+    /// observed, and delayed commands from the previous renderer fail closed.
+    pub fn begin_epoch(&self) -> Result<String> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("subscription state lock poisoned"))?;
+        let epoch = uuid::Uuid::new_v4().simple().to_string();
+        state.epoch = epoch.clone();
+        state.generation = 0;
+        state.primary_id = None;
+        state.servers.clear();
+        state.meta = None;
+        state.cache_generations.clear();
+        Ok(epoch)
+    }
+
+    pub fn validate_epoch(&self, epoch: &str) -> Result<()> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("subscription state lock poisoned"))?;
+        if epoch.is_empty() || state.epoch != epoch {
+            bail!("stale subscription renderer epoch");
+        }
+        Ok(())
+    }
+
+    /// Commit only a strictly newer frontend generation. This closes the
+    /// invoke ordering race where an older primary update finishes after a
+    /// newer primary was already selected.
+    pub fn commit(
+        &self,
+        epoch: &str,
+        primary_id: &str,
+        generation: u64,
+        servers: Vec<ProxyEntry>,
+        meta: Option<SubscriptionMeta>,
+    ) -> Result<bool> {
+        if primary_id.len() < 8
+            || primary_id.len() > 80
+            || !primary_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            bail!("invalid primary subscription id");
+        }
+        if generation == 0 {
+            bail!("invalid runtime subscription generation");
+        }
+        if servers.len() > 4096 {
+            bail!("too many runtime subscription entries");
+        }
+        let serialized_len = serde_json::to_vec(&servers)
+            .context("serialize runtime subscription entries")?
+            .len();
+        if serialized_len > 2 * 1024 * 1024 {
+            bail!("runtime subscription snapshot is too large");
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("subscription state lock poisoned"))?;
+        if epoch.is_empty() || state.epoch != epoch {
+            bail!("stale subscription renderer epoch");
+        }
+        if generation <= state.generation {
+            return Ok(false);
+        }
+        state.generation = generation;
+        state.primary_id = Some(primary_id.to_string());
+        state.servers = servers;
+        state.meta = meta;
+        Ok(true)
+    }
+
+    /// Return the exact snapshot named by the frontend commit receipt. The
+    /// connect command cannot silently consume another subscription if a
+    /// selection change overtakes it.
+    pub fn snapshot_for_connect(
+        &self,
+        epoch: &str,
+        primary_id: &str,
+        generation: u64,
+    ) -> Result<Vec<ProxyEntry>> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("subscription state lock poisoned"))?;
+        if state.epoch != epoch
+            || state.primary_id.as_deref() != Some(primary_id)
+            || state.generation != generation
+        {
+            bail!("subscription selection changed before connect");
+        }
+        Ok(state.servers.clone())
+    }
+
+    /// Serialize a cache mutation with epoch rotation and reject stale
+    /// per-subscription sequences. The generation advances only after the
+    /// filesystem operation succeeds, so a failed write can be retried.
+    pub fn with_cache_generation<T>(
+        &self,
+        epoch: &str,
+        subscription_id: &str,
+        generation: u64,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        if generation == 0 {
+            bail!("invalid subscription cache generation");
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("subscription state lock poisoned"))?;
+        if state.epoch != epoch {
+            bail!("stale subscription renderer epoch");
+        }
+        if generation
+            <= state
+                .cache_generations
+                .get(subscription_id)
+                .copied()
+                .unwrap_or(0)
+        {
+            return Ok(None);
+        }
+        let result = operation()?;
+        state
+            .cache_generations
+            .insert(subscription_id.to_string(), generation);
+        Ok(Some(result))
+    }
+
+    /// Deletion is a tombstone: once its sequence is accepted, older saves
+    /// stay rejected even if filesystem removal reports an error. Otherwise a
+    /// delayed fetch could resurrect credentials after the UI removed a sub.
+    pub fn with_cache_delete_generation<T>(
+        &self,
+        epoch: &str,
+        subscription_id: &str,
+        generation: u64,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        if generation == 0 {
+            bail!("invalid subscription cache generation");
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("subscription state lock poisoned"))?;
+        if state.epoch != epoch {
+            bail!("stale subscription renderer epoch");
+        }
+        if generation
+            <= state
+                .cache_generations
+                .get(subscription_id)
+                .copied()
+                .unwrap_or(0)
+        {
+            return Ok(None);
+        }
+        state
+            .cache_generations
+            .insert(subscription_id.to_string(), generation);
+        operation().map(Some)
     }
 }
 
@@ -180,7 +366,7 @@ fn validate_enum(value: &str, allowed: &[&str]) -> Option<String> {
 /// типа кириллических заголовков подписки).
 fn decode_header_value(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.len() > 16 * 1024 {
         return None;
     }
     if let Some(b64) = trimmed.strip_prefix("base64:") {
@@ -192,12 +378,39 @@ fn decode_header_value(raw: &str) -> Option<String> {
             .ok()?;
         let s = String::from_utf8(bytes).ok()?;
         let s = s.trim().to_string();
-        if s.is_empty() {
+        if s.is_empty() || s.len() > 16 * 1024 {
             return None;
         }
         return Some(s);
     }
     Some(trimmed.to_string())
+}
+
+/// Provider-supplied links are displayed/opened by the desktop app.  Keep
+/// them HTTPS-only and reject credentials/local targets to avoid turning a
+/// subscription into a browser/localhost command channel.
+fn safe_metadata_url(raw: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(raw.trim()).ok()?;
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    let host = parsed.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
+        return None;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if !super::routing_profile::is_public_ip(ip) {
+            return None;
+        }
+    }
+    Some(parsed.to_string())
 }
 
 /// Скачать подписку по URL и вернуть список серверов.
@@ -213,7 +426,13 @@ pub async fn fetch_and_parse(
     hwid: &str,
     user_agent: &str,
     send_hwid: bool,
+    trusted_socks_port: Option<u16>,
 ) -> Result<(Vec<ProxyEntry>, Option<SubscriptionMeta>)> {
+    let safe_url = safe_metadata_url(url)
+        .ok_or_else(|| anyhow::anyhow!("подписка должна использовать публичный HTTPS URL"))?;
+    let subscription_url = reqwest::Url::parse(&safe_url).context("некорректный URL подписки")?;
+    let origin_host = subscription_url.host_str().unwrap_or("").to_ascii_lowercase();
+    let origin_port = subscription_url.port_or_known_default();
     let ua = if user_agent.trim().is_empty() {
         "clash-verge/v2.0.0"
     } else {
@@ -222,14 +441,46 @@ pub async fn fetch_and_parse(
 
     // Таймауты обязательны: без них недоступный/завис(ший|нувший) сервер
     // подписки повесил бы UI-команду навсегда (нет фонового отвала).
-    let client = reqwest::Client::builder()
+    let mut client_builder = reqwest::Client::builder()
         .user_agent(ua)
+        // Never inherit WinINet/HTTP(S)_PROXY state. An explicit app-owned
+        // SOCKS route is added below only while a trusted proxy-mode Mihomo
+        // instance is active.
+        .no_proxy()
+        // Subscription URLs commonly contain bearer tokens.  Never forward
+        // them, custom headers, or x-hwid to a different redirect origin.
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("too many subscription redirects");
+            }
+            let next = attempt.url();
+            let same_origin = next.scheme() == "https"
+                && next
+                    .host_str()
+                    .is_some_and(|h| h.eq_ignore_ascii_case(&origin_host))
+                && next.port_or_known_default() == origin_port;
+            if same_origin {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
         .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(45))
+        .timeout(std::time::Duration::from_secs(45));
+    if let Some(port) = trusted_socks_port {
+        if !(30_000..60_000).contains(&port) {
+            bail!("trusted SOCKS port is outside the app-owned range");
+        }
+        client_builder = client_builder.proxy(
+            reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))
+                .context("invalid trusted SOCKS proxy")?,
+        );
+    }
+    let client = client_builder
         .build()
         .context("не удалось создать HTTP-клиент")?;
 
-    let mut req = client.get(url);
+    let mut req = client.get(subscription_url);
     if send_hwid && !hwid.is_empty() {
         req = req.header("x-hwid", hwid);
     }
@@ -237,14 +488,17 @@ pub async fn fetch_and_parse(
     let response = req
         .send()
         .await
-        .context("ошибка HTTP-запроса")?
+        .map_err(|error| anyhow::anyhow!("ошибка HTTP-запроса: {}", error.without_url()))?
         .error_for_status()
-        .context("сервер вернул ошибку")?;
+        .map_err(|error| anyhow::anyhow!("сервер вернул ошибку: {}", error.without_url()))?;
+    if response.status().is_redirection() {
+        bail!("междоменный или небезопасный redirect подписки запрещён");
+    }
 
     // Защита от исчерпания памяти: подписка — это текстовый список/YAML,
     // реально она десятки-сотни КБ. Если сервер заявляет гигантское тело
     // (битый/враждебный) — отказываемся до чтения в память.
-    const MAX_SUBSCRIPTION_BYTES: u64 = 16 * 1024 * 1024; // 16 МБ с запасом
+    const MAX_SUBSCRIPTION_BYTES: u64 = 1536 * 1024;
     if let Some(len) = response.content_length() {
         if len > MAX_SUBSCRIPTION_BYTES {
             bail!("тело подписки подозрительно большое ({len} байт) — отказ");
@@ -258,10 +512,10 @@ pub async fn fetch_and_parse(
     let headers = response.headers().clone();
     let meta = build_subscription_meta(&headers);
 
-    let body = response
-        .text()
-        .await
-        .context("не удалось прочитать тело ответа")?;
+    let body_bytes = read_response_limited(response, MAX_SUBSCRIPTION_BYTES).await?;
+    let body = std::str::from_utf8(&body_bytes)
+        .context("тело подписки не является UTF-8")?
+        .to_string();
 
     // 11.E: до парсинга серверов вытащим спец-строки (`://routing/...`,
     // `#announce:`, и т.п.) — они могут затрагивать meta даже если
@@ -271,7 +525,25 @@ pub async fn fetch_and_parse(
     apply_inline_directives(&body, &mut effective_meta);
 
     let servers = parse_subscription_body(&body)?;
+    if servers.len() > 4096 {
+        bail!("подписка содержит слишком много серверов");
+    }
     Ok((servers, effective_meta))
+}
+
+async fn read_response_limited(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("read response chunk")? {
+        let next_len = body.len().saturating_add(chunk.len());
+        if next_len as u64 > max_bytes {
+            bail!("response body exceeds {max_bytes} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// 11.E — Вытащить из тела подписки спец-строки и применить к meta.
@@ -306,17 +578,16 @@ fn apply_inline_directives(body: &str, meta_opt: &mut Option<SubscriptionMeta>) 
             continue;
         }
         // Routing-директивы. Префикс может быть как `://...`, так и
-        // `kwik://...` (для совместимости с deep-link форматом).
+        // `kwikproxy-secure://...` (для совместимости с deep-link форматом).
         let routing_payload = line
-            .strip_prefix("kwik://")
+            .strip_prefix("kwikproxy-secure://")
             .or_else(|| line.strip_prefix("://"));
         if let Some(rest) = routing_payload {
             let parts: Vec<&str> = rest.splitn(3, '/').collect();
             if parts.len() == 3 {
                 match (parts[0], parts[1]) {
                     ("autorouting", verb @ ("add" | "onadd")) => {
-                        let url = parts[2].trim().to_string();
-                        if !url.is_empty() {
+                        if let Some(url) = safe_metadata_url(parts[2]) {
                             found_routing_auto = Some((url, verb == "onadd"));
                         }
                     }
@@ -347,20 +618,17 @@ fn apply_inline_directives(body: &str, meta_opt: &mut Option<SubscriptionMeta>) 
             "announce" => {
                 found_announce = decode_header_value(value);
             }
-            "announce-url"
-                if (value.starts_with("http://") || value.starts_with("https://")) => {
-                    found_announce_url = Some(value.to_string());
+            "announce-url" => {
+                found_announce_url = safe_metadata_url(value);
                 }
             "profile-title" => {
                 found_title = decode_header_value(value);
             }
-            "support-url"
-                if (value.starts_with("http://") || value.starts_with("https://")) => {
-                    found_support = Some(value.to_string());
+            "support-url" => {
+                found_support = safe_metadata_url(value);
                 }
-            "profile-web-page-url"
-                if (value.starts_with("http://") || value.starts_with("https://")) => {
-                    found_web = Some(value.to_string());
+            "profile-web-page-url" => {
+                found_web = safe_metadata_url(value);
                 }
             "profile-update-interval" => {
                 if let Ok(n) = value.parse::<u32>() {
@@ -489,8 +757,9 @@ fn build_subscription_meta(headers: &reqwest::header::HeaderMap) -> Option<Subsc
 
     // Стандартные заголовки (8.C, шаг 2)
     meta.title = header_str("profile-title");
-    meta.web_page_url = header_str("profile-web-page-url");
-    meta.support_url = header_str("support-url");
+    meta.web_page_url = header_str("profile-web-page-url")
+        .and_then(|value| safe_metadata_url(&value));
+    meta.support_url = header_str("support-url").and_then(|value| safe_metadata_url(&value));
     meta.update_interval_hours = headers
         .get("profile-update-interval")
         .and_then(|h| h.to_str().ok())
@@ -499,8 +768,8 @@ fn build_subscription_meta(headers: &reqwest::header::HeaderMap) -> Option<Subsc
 
     // Стандартные заголовки (8.C, шаг 3 — объявления и премиум)
     meta.announce = header_str("announce");
-    meta.announce_url = header_str("announce-url");
-    meta.premium_url = header_str("premium-url");
+    meta.announce_url = header_str("announce-url").and_then(|value| safe_metadata_url(&value));
+    meta.premium_url = header_str("premium-url").and_then(|value| safe_metadata_url(&value));
 
     // Заголовки X-Kwik-* (наше расширение). Все enum-значения
     // валидируются по whitelist; неизвестные → None.
@@ -533,7 +802,8 @@ fn build_subscription_meta(headers: &reqwest::header::HeaderMap) -> Option<Subsc
     meta.noises_packet = header_str("noises-packet");
     meta.noises_delay = header_str("noises-delay");
     meta.server_resolve_enable = header_bool("server-address-resolve-enable");
-    meta.server_resolve_doh = header_str("server-address-resolve-dns-domain");
+    meta.server_resolve_doh = header_str("server-address-resolve-dns-domain")
+        .and_then(|value| safe_metadata_url(&value));
     meta.server_resolve_bootstrap = header_str("server-address-resolve-dns-ip");
 
     // Если все поля пустые/нулевые — возвращаем None чтобы UI не рендерил
@@ -1817,6 +2087,21 @@ fn yaml_proxy_to_entry(v: serde_yaml::Value) -> Result<ProxyEntry> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn provider_metadata_links_are_https_and_non_local() {
+        assert!(safe_metadata_url("https://example.com/help").is_some());
+        assert!(safe_metadata_url("http://example.com/help").is_none());
+        assert!(safe_metadata_url("https://127.0.0.1/admin").is_none());
+        assert!(safe_metadata_url("https://user:pass@example.com/").is_none());
+    }
+
+    #[test]
+    fn inline_http_autorouting_is_ignored() {
+        let mut meta = None;
+        apply_inline_directives("://autorouting/onadd/http://127.0.0.1/rules", &mut meta);
+        assert!(meta.is_none());
+    }
+
     /// 8.F: full-mihomo YAML с proxy-groups (как в реальной подписке
     /// от провайдера) должен распознаваться как один синтетический
     /// `mihomo-profile` entry, а не плоский список.
@@ -1973,5 +2258,93 @@ rules:
         assert_eq!(proxies[0]["server"], "de.example.com");
         assert_eq!(proxies[1]["name"], "Latvia");
         assert_eq!(proxies[1]["server"], "lv.example.com");
+    }
+
+    #[test]
+    fn runtime_snapshot_rejects_late_primary_generation() {
+        let state = SubscriptionState::new();
+        let epoch = state.begin_epoch().unwrap();
+        let entry = |name: &str| ProxyEntry {
+            name: name.into(),
+            protocol: "vless".into(),
+            server: "example.com".into(),
+            port: 443,
+            raw: serde_json::json!({"uuid": "00000000-0000-0000-0000-000000000000"}),
+            engine_compat: vec!["mihomo".into()],
+        };
+
+        assert!(state
+            .commit(&epoch, "12345678-primary", 2, vec![entry("new")], None)
+            .unwrap());
+        assert!(!state
+            .commit(
+                &epoch,
+                "12345678-primary",
+                1,
+                vec![entry("late-old")],
+                None
+            )
+            .unwrap());
+        assert!(state
+            .commit(
+                &epoch,
+                "12345678-primary",
+                0,
+                vec![entry("invalid")],
+                None
+            )
+            .is_err());
+        assert_eq!(state.snapshot().0[0].name, "new");
+    }
+
+    #[test]
+    fn renderer_epoch_rejects_delayed_runtime_and_cache_mutations() {
+        let state = SubscriptionState::new();
+        let old_epoch = state.begin_epoch().unwrap();
+        let new_epoch = state.begin_epoch().unwrap();
+        assert_ne!(old_epoch, new_epoch);
+        assert!(state
+            .commit(
+                &old_epoch,
+                "12345678-primary",
+                1,
+                Vec::new(),
+                None
+            )
+            .is_err());
+        assert!(state
+            .with_cache_generation(&old_epoch, "12345678-primary", 1, || Ok(()))
+            .is_err());
+        assert!(state
+            .commit(
+                &new_epoch,
+                "12345678-primary",
+                1,
+                Vec::new(),
+                None
+            )
+            .unwrap());
+        assert!(state
+            .snapshot_for_connect(&new_epoch, "12345678-primary", 1)
+            .is_ok());
+        assert!(state
+            .snapshot_for_connect(&new_epoch, "12345678-primary", 2)
+            .is_err());
+        assert!(state
+            .snapshot_for_connect(&new_epoch, "87654321-secondary", 1)
+            .is_err());
+
+        assert!(state
+            .with_cache_delete_generation(
+                &new_epoch,
+                "12345678-primary",
+                4,
+                || -> Result<()> { bail!("simulated delete failure") }
+            )
+            .is_err());
+        assert!(state
+            .with_cache_generation(&new_epoch, "12345678-primary", 3, || Ok(()))
+            .unwrap()
+            .is_none());
     }
 }

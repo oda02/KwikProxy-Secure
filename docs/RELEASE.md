@@ -1,11 +1,16 @@
 # Релизный workflow
 
-С версии **0.1.3** релизы публикуются автоматически через GitHub Actions
-на push тега `v*.*.*`. Auto-updater приложения (`tauri-plugin-updater`)
-проверяет endpoint `https://github.com/kanabicks/KwikProxy/releases/latest/download/latest.json`
-раз в 6 часов и предлагает юзеру обновиться.
+Релизы могут публиковаться через GitHub Actions на push тега
+`v*.*.*`, но **in-app updater и in-place upgrade сейчас отключены fail-closed**.
+Клиент не проверяет `latest.json`, не скачивает и не устанавливает обновления.
+Для новой версии нужно явно удалить текущую и выполнить чистую ручную
+установку. Upstream/legacy сервисы и данные не мигрируются и не меняются.
 
-## Одноразовая настройка
+> Оставшиеся ниже инструкции по ed25519/`latest.json` — архив прежнего
+> workflow и заготовка для будущего transactional updater. Они не описывают
+> текущее runtime-поведение и не должны включаться в release до отдельного security review.
+
+## Архив: одноразовая настройка прежнего updater
 
 ### 1. GitHub Secrets
 
@@ -128,7 +133,7 @@ npm run tauri:bundle
 ⚠️ Этот NSIS не подписан (нет ed25519-подписи) — auto-updater откажется
 его принимать. Для production нужен только CI-build.
 
-## Тестирование auto-updater'а
+## Архив: тестирование отключённого auto-updater'а
 
 После релиза 0.1.3 (текущего):
 

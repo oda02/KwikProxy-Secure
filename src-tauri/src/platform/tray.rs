@@ -76,7 +76,7 @@ pub fn init(app: &AppHandle<Wry>) -> tauri::Result<()> {
 
     let _tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
-        .tooltip("Kwik VPN — отключено")
+        .tooltip("KwikProxy Secure — отключено")
         .menu(&menu)
         // По умолчанию left-click открывает меню. Перехватываем чтобы
         // вместо этого делать toggle главного окна (одинарный клик —
@@ -164,13 +164,13 @@ pub fn set_status(
     // Tooltip — короткая строка, видна при hover в системном трее.
     let tooltip = match status {
         "running" => match server_name {
-            Some(name) => format!("Kwik VPN — {name}"),
-            None => "Kwik VPN — подключено".to_string(),
+            Some(name) => format!("KwikProxy Secure — {name}"),
+            None => "KwikProxy Secure — подключено".to_string(),
         },
-        "starting" => "Kwik VPN — подключаем…".to_string(),
-        "stopping" => "Kwik VPN — отключаем…".to_string(),
-        "error" => "Kwik VPN — ошибка".to_string(),
-        _ => "Kwik VPN — отключено".to_string(),
+        "starting" => "KwikProxy Secure — подключаем…".to_string(),
+        "stopping" => "KwikProxy Secure — отключаем…".to_string(),
+        "error" => "KwikProxy Secure — ошибка".to_string(),
+        _ => "KwikProxy Secure — отключено".to_string(),
     };
     tray.set_tooltip(Some(tooltip)).map_err(|e| e.to_string())?;
 

@@ -298,7 +298,7 @@ export function RoutingProfilesPanel() {
           <div className="settings-row-hint" style={{ marginBottom: 12 }}>
             {t("routingProfiles.emptyHint")}
             <br />
-            <code>kwik://routing/onadd/{"{base64-or-url}"}</code>
+            <code>kwikproxy-secure://routing/onadd/{"{base64-or-url}"}</code>
           </div>
         )}
 

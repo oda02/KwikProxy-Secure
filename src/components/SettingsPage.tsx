@@ -26,8 +26,6 @@ import {
   useBackupModalStore,
 } from "../lib/backup";
 import { showToast } from "../stores/toastStore";
-import { useUpdateStore } from "../stores/updateStore";
-import { checkForUpdates } from "../lib/updater";
 import { useEffectiveSettings } from "../lib/hooks/useEffectiveSettings";
 import { Toggle } from "./Toggle";
 
@@ -513,10 +511,9 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
                   />
                 </div>
 
-                {/* 12.E маскировка имени TUN убрана: в Mihomo built-in TUN
-                    имя берётся из YAML, наш override не применялся (no-op
-                    после выпила sing-box). Вернуть, если реализуем patch
-                    имени адаптера для Mihomo. */}
+                {/* Provider-selected/masked adapter names are intentionally
+                    not configurable: privileged cleanup requires the unique
+                    KwikProxy Secure ownership marker. */}
 
                 <div className="settings-row">
                   <div>
@@ -722,10 +719,9 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
                             message: t("toast.diagnostics.savedMessage", { path }),
                             durationMs: 8_000,
                           });
-                          // Открываем explorer на родительской папке.
-                          // Используем уже подключённый tauri-plugin-opener.
-                          const dir = path.replace(/[\\/][^\\/]*$/, "");
-                          void openUrl(dir).catch(() => {});
+                          // Local filesystem paths are never handed to the
+                          // broad URL opener. The toast displays the exact
+                          // path for an explicit user action.
                         })
                         .catch((e) =>
                           showToast({
@@ -956,33 +952,31 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
                 </p>
                 <div className="schemes">
                   <div className="scheme-row">
-                    <span className="scheme-url">kwik://add?url=&lt;url&gt;</span>
+                    <span className="scheme-url">kwikproxy-secure://add?url=&lt;url&gt;</span>
                     <span className="scheme-desc">{t("settings.urlSchemes.add")}</span>
                   </div>
                   <div className="scheme-row">
-                    <span className="scheme-url">kwik://connect</span>
+                    <span className="scheme-url">kwikproxy-secure://connect</span>
                     <span className="scheme-desc">{t("settings.urlSchemes.connect")}</span>
                   </div>
                   <div className="scheme-row">
-                    <span className="scheme-url">kwik://disconnect</span>
+                    <span className="scheme-url">kwikproxy-secure://disconnect</span>
                     <span className="scheme-desc">{t("settings.urlSchemes.disconnect")}</span>
                   </div>
                   <div className="scheme-row">
-                    <span className="scheme-url">kwik://toggle</span>
+                    <span className="scheme-url">kwikproxy-secure://toggle</span>
                     <span className="scheme-desc">{t("settings.urlSchemes.toggle")}</span>
                   </div>
                   <div className="scheme-row">
-                    <span className="scheme-url">kwik://export</span>
+                    <span className="scheme-url">kwikproxy-secure://export</span>
                     <span className="scheme-desc">{t("settings.urlSchemes.export")}</span>
                   </div>
                   <div className="scheme-row">
-                    <span className="scheme-url">kwik://import-from-url/&lt;url&gt;</span>
+                    <span className="scheme-url">kwikproxy-secure://import-from-url/&lt;url&gt;</span>
                     <span className="scheme-desc">{t("settings.urlSchemes.importFromUrl")}</span>
                   </div>
                 </div>
               </section>
-
-              <UpdatesSection />
 
               <section className="settings-section">
                 <div className="settings-section-title">{t("settings.about.title")}</div>
@@ -1033,7 +1027,7 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
                     onClick={() => void openUrl(GITHUB_URL)}
                     className="about-link"
                   >
-                    kanabicks/KwikProxy
+                    oda02/KwikProxy-Secure
                   </button>
                   <span className="about-key">{t("settings.about.privacy")}</span>
                   <button
@@ -1528,23 +1522,30 @@ function AppTrafficPanel({ onAddRule }: { onAddRule: (exe: string) => void }) {
 /**
  * 12.D — экспорт/импорт настроек.
  *
- * - **выгрузить в файл** → пишем JSON в `~/Documents/kwik-backup-<ts>.json`,
- *   показываем toast с путём.
+ * - **выгрузить в файл** → пишем JSON в `~/Documents/kwikproxy-secure-backup-<ts>.json`,
+ *   показываем toast с путём. URL/token подписки по умолчанию
+ *   не входит; для него есть отдельный opt-in и confirm-step.
  * - **загрузить из файла** → `<input type="file">` + FileReader →
  *   `parseBackup` → `useBackupModalStore.show(...)` → preview-модалка
  *   с diff'ом и кнопкой «применить».
  *
- * Также активны deep-link'и `kwik://export` и
- * `kwik://import-from-url/<url>` (см. lib/deepLinks.ts).
+ * Deep-link actions use the isolated `kwikproxy-secure://` scheme.
  */
 function BackupBlock() {
   const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
+  const [includeSubscriptionSecret, setIncludeSubscriptionSecret] = useState(false);
 
   const onExport = async () => {
+    if (
+      includeSubscriptionSecret &&
+      !window.confirm(t("settings.backup.includeSecretConfirm"))
+    ) {
+      return;
+    }
     setBusy(true);
     try {
-      const path = await exportBackupToDocuments();
+      const path = await exportBackupToDocuments(includeSubscriptionSecret);
       showToast({
         kind: "success",
         title: t("toast.backup.exportedTitle"),
@@ -1592,6 +1593,36 @@ function BackupBlock() {
       >
         {t("settings.backup.intro")}
       </p>
+      <div className="settings-row" style={{ marginBottom: 8 }}>
+        <div>
+          <div className="settings-row-label">
+            {t("settings.backup.includeSecretLabel")}
+          </div>
+          <div className="settings-row-hint">
+            {t("settings.backup.includeSecretHint")}
+          </div>
+        </div>
+        <Toggle
+          on={includeSubscriptionSecret}
+          onChange={setIncludeSubscriptionSecret}
+        />
+      </div>
+      {includeSubscriptionSecret && (
+        <p
+          role="alert"
+          className="hint"
+          style={{
+            textTransform: "none",
+            letterSpacing: 0,
+            color: "var(--warning, #b7791f)",
+            fontSize: 12,
+            lineHeight: 1.5,
+            margin: "0 0 8px",
+          }}
+        >
+          {t("settings.backup.includeSecretWarning")}
+        </p>
+      )}
       <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
         <button
           type="button"
@@ -1647,8 +1678,8 @@ function FeedbackButton() {
       `- Language: \`${language}\``,
       `- UA: \`${ua}\``,
       "",
-      "<!-- если связано с kill-switch / TUN — прикрепи `C:\\ProgramData\\KwikVPN\\helper.log` -->",
-      "<!-- если mihomo ругается — `%TEMP%\\KwikVPN\\mihomo-stderr.log` -->",
+      "<!-- если связано с kill-switch / TUN — прикрепи `C:\\ProgramData\\KwikProxy Secure\\helper.log` -->",
+      "<!-- если mihomo ругается — `%TEMP%\\KwikProxy Secure\\mihomo-stderr.log` -->",
       "<!-- Settings → System → диагностика собирает ZIP со всем разом -->",
     ].join("\n");
     const url = new URL(`${GITHUB_URL}/issues/new`);
@@ -1710,76 +1741,6 @@ function LanguageSection() {
             { value: "en", label: "English" },
           ]}
         />
-      </div>
-    </section>
-  );
-}
-
-// ── 14.A Updates section ──────────────────────────────────────────────────
-
-function UpdatesSection() {
-  const { t } = useTranslation();
-  const autoCheck = useSettingsStore((s) => s.autoCheckUpdates);
-  const setSetting = useSettingsStore((s) => s.set);
-  const updateState = useUpdateStore((s) => s.state);
-  const setUpdateState = useUpdateStore((s) => s.setState);
-  const setLastCheckAt = useUpdateStore((s) => s.setLastCheckAt);
-  const [busy, setBusy] = useState(false);
-
-  const onCheckNow = async () => {
-    setBusy(true);
-    setUpdateState({ kind: "checking" });
-    setLastCheckAt(Date.now());
-    try {
-      const update = await checkForUpdates();
-      if (update) {
-        setUpdateState({ kind: "available", update });
-      } else {
-        setUpdateState({ kind: "idle" });
-        showToast({
-          kind: "success",
-          title: t("toast.update.checkTitle"),
-          message: t("toast.update.upToDate"),
-        });
-      }
-    } catch (e) {
-      setUpdateState({ kind: "idle" });
-      showToast({
-        kind: "error",
-        title: t("toast.update.checkFailed"),
-        message: String(e),
-      });
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const checking = updateState.kind === "checking" || busy;
-
-  return (
-    <section className="settings-section">
-      <div className="settings-section-title">{t("settings.updates.title")}</div>
-      <div className="settings-row">
-        <div>
-          <div className="settings-row-label">{t("settings.updates.auto.label")}</div>
-          <div className="settings-row-hint">
-            {t("settings.updates.auto.hint")}
-          </div>
-        </div>
-        <Toggle
-          on={autoCheck}
-          onChange={(v) => setSetting("autoCheckUpdates", v)}
-        />
-      </div>
-      <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8 }}>
-        <button
-          type="button"
-          onClick={onCheckNow}
-          disabled={checking}
-          className="btn-ghost"
-        >
-          {checking ? t("settings.updates.checking") : t("settings.updates.checkNow")}
-        </button>
       </div>
     </section>
   );
@@ -2148,7 +2109,8 @@ function LogsBlock() {
  *   и HWID-override остаются. Полезно когда подкрутил тему/anti-DPI
  *   до сломанного состояния, а перенастраивать подписку не хочется.
  * - **удалить всё** — settings + подписка + HWID + dismissed-set
- *   объявлений. Это полный wipe localStorage.
+ *   объявлений. Удаляются только ключи namespace этого fork; чужие и
+ *   upstream-данные не затрагиваются.
  *
  * Двойной confirm-step для каждой — чтобы случайный клик не уничтожил
  * данные. Active-confirm подсвечивает только одну из двух — пользователь
@@ -2159,6 +2121,7 @@ function ResetBlock({ onAfterReset }: { onAfterReset: () => void }) {
   type Pending = null | "settings" | "all";
   const [pending, setPending] = useState<Pending>(null);
   const disconnect = useVpnStore((s) => s.disconnect);
+  const deleteSubscription = useSubscriptionStore((s) => s.deleteSubscription);
   const settings = useSettingsStore();
 
   const doResetSettings = () => {
@@ -2173,8 +2136,14 @@ function ResetBlock({ onAfterReset }: { onAfterReset: () => void }) {
     } catch {
       // вне зависимости от результата чистим локальные данные
     }
+    await deleteSubscription();
     try {
-      localStorage.clear();
+      for (let i = localStorage.length - 1; i >= 0; i -= 1) {
+        const key = localStorage.key(i);
+        if (key?.startsWith("kwikproxy-secure.")) {
+          localStorage.removeItem(key);
+        }
+      }
     } catch {
       // приватный режим
     }

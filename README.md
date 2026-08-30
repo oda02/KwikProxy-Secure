@@ -1,15 +1,15 @@
-# Kwik
+# KwikProxy Secure
 
 > VPN-клиент под Windows на ядре **Mihomo** (Clash Meta).
 > Одна кнопка · подключение за ~1.5 секунды · ноль телеметрии ·
-> открытый код · auto-update.
+> открытый код · обновления только вручную.
 
 «VPN одной кнопкой»: минимум вопросов к пользователю, максимум
 совместимости с современными протоколами обхода блокировок.
 Архитектура изначально готова к портированию на macOS, iOS и
 Android — UI отделён от системного слоя.
 
-[![release](https://img.shields.io/github/v/release/kanabicks/KwikProxy?label=release)](https://github.com/kanabicks/KwikProxy/releases/latest)
+[![release](https://img.shields.io/github/v/release/oda02/KwikProxy-Secure?label=release)](https://github.com/oda02/KwikProxy-Secure/releases/latest)
 [![tauri](https://img.shields.io/badge/tauri-2-blue)](https://v2.tauri.app/)
 [![mihomo](https://img.shields.io/badge/mihomo-1.19-orange)](https://github.com/MetaCubeX/mihomo)
 [![license: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -18,17 +18,13 @@ Android — UI отделён от системного слоя.
 
 ## Скачать
 
-**[⬇ Последний релиз](https://github.com/kanabicks/KwikProxy/releases/latest)** —
+**[⬇ Последний релиз](https://github.com/oda02/KwikProxy-Secure/releases/latest)** —
 скачай `Kwik_<версия>_x64-setup.exe`, запусти, installer сделает всё сам.
 
-> **SmartScreen предупреждает «Unknown publisher»?** Это нормально для
-> приложений без платного code-signing сертификата. Жми
-> **More info → Run anyway**. Целостность установщика при этом защищена:
-> авто-обновления подписаны ed25519 и проверяются клиентом.
-
-После установки **обновления приходят автоматически**: клиент проверяет
-GitHub Releases раз в 6 часов и предлагает обновиться. Скачивание идёт
-в фоне **без отключения VPN**, установка — отдельным подтверждением.
+> **Security preview:** in-app updater и in-place upgrade отключены,
+> пока не готов транзакционный цикл подписи, замены и rollback всех
+> привилегированных бинарников. Новые релизы нужно скачивать вручную;
+> перед установкой текущую версию нужно удалить явно.
 
 ---
 
@@ -52,12 +48,15 @@ GitHub Releases раз в 6 часов и предлагает обновить�
 | любая | base64 / raw-список URI (`vless://`, `vmess://`, …) | универсальный парсер URI |
 
 - **Мульти-подписки** — несколько провайдеров в одном клиенте,
-  переключение без повторной загрузки (кеш серверов).
+  переключение без повторной загрузки. Офлайн-кеш профилей проходит
+  sanitizer и шифруется Windows DPAPI для текущего пользователя.
 - **Server-driven UX** — провайдер может прислать дефолты через
   заголовки `X-Kwik-*` (тема, маршрутизация, объявления, ссылки
   поддержки). Пользовательская настройка всегда приоритетнее.
   Заголовки и deep-links — строгий whitelist: они не могут запускать
-  процессы, читать файлы или скрывать настройки.
+  процессы, читать файлы или скрывать настройки. Routing-директивы из
+  подписки остаются pending: ничего не скачивается и не активируется без
+  явного подтверждения в UI.
 - **Drag-and-drop** ссылки подписки прямо в окно.
 
 ### Режимы подключения
@@ -66,8 +65,8 @@ GitHub Releases раз в 6 часов и предлагает обновить�
   **случайным портом** `[30000, 60000)` — сторонние процессы не
   детектят VPN по «известному порту».
 - **TUN** — весь системный трафик через WinTUN-адаптер (built-in TUN
-  Mihomo, `strict-route` против утечек). Имя адаптера **маскируется**
-  под обычный сетевой интерфейс (`wlan99`, `Ethernet 7`, …).
+  Mihomo, `strict-route` против утечек). Имя всегда начинается с точного
+  ownership-префикса **`kwikproxy-secure-`**, чтобы cleanup не затронул чужой VPN.
 - **LAN** — доступ с других устройств сети, SOCKS5 защищён
   автогенерируемым логином/паролем.
 
@@ -115,6 +114,8 @@ GitHub Releases раз в 6 часов и предлагает обновить�
   `Ctrl+Shift+M` показать/скрыть — настраиваются).
 - Автозапуск с Windows, backup/restore настроек, onboarding-тур,
   экспорт диагностики одной кнопкой.
+  URL/token подписки исключён из backup по умолчанию и добавляется только
+  отдельным opt-in с предупреждением.
 
 ---
 
@@ -133,8 +134,14 @@ GitHub Releases раз в 6 часов и предлагает обновить�
 Kwik **не собирает телеметрию**, не отправляет crash-репорты «домой»
 и не имеет remote-control механизмов. Все логи — локально:
 
-- `%TEMP%\KwikVPN\` — лог приложения и `mihomo-stderr.log`
-- `C:\ProgramData\KwikVPN\` — `helper.log`, `mihomo.log` (TUN-режим)
+- `%TEMP%\KwikProxy Secure\` — лог приложения и `mihomo-stderr.log`
+- `C:\ProgramData\KwikProxy Secure\` — `helper.log`, `mihomo.log` (TUN-режим)
+
+`x-hwid` выключен, пока пользователь сам его не включит. Вместо Windows
+MachineGuid клиент выводит отдельный псевдоним для каждой HTTPS-подписки.
+Хранилища и установщик изолированы namespace `KwikProxy Secure` /
+`kwikproxy-secure.*`; данные и сервисы upstream/других клиентов не мигрируются и
+не изменяются автоматически.
 
 Подробный разбор — какие файлы пишутся, какие сетевые запросы и куда
 уходят — в [PRIVACY.md](PRIVACY.md).
@@ -145,7 +152,7 @@ Kwik **не собирает телеметрию**, не отправляет c
 
 В Settings → «системное» есть кнопка **«выгрузить диагностику»** —
 она собирает zip с логами (без приватных данных подписки). Приложи его
-к [issue](https://github.com/kanabicks/KwikProxy/issues) с описанием:
+к [issue](https://github.com/oda02/KwikProxy-Secure/issues) с описанием:
 что делал, что ожидал, что произошло. Кнопка «сообщить о проблеме»
 в Settings → «о приложении» откроет форму с уже заполненным окружением.
 
@@ -155,7 +162,7 @@ Kwik **не собирает телеметрию**, не отправляет c
 
 ```powershell
 # Требуется Node.js 22+ и Rust stable (msvc).
-git clone https://github.com/kanabicks/KwikProxy.git
+git clone https://github.com/oda02/KwikProxy-Secure.git
 cd KwikProxy
 npm ci
 npm run tauri:bundle
@@ -193,7 +200,7 @@ Ready. Движок и TUN-адаптер создаются при connect и �
 disconnect — никаких фоновых процессов в простое.
 
 **Helper-сервис** (`kwik-helper.exe`) работает под SYSTEM, общается
-с приложением через named pipe `\\.\pipe\kwik-helper` (с
+с приложением через named pipe `\\.\pipe\KwikProxySecure.Helper.v13` (с
 access-check'ами), управляет WFP-фильтрами и спавнит mihomo для TUN.
 
 ---
@@ -220,10 +227,10 @@ CHANGELOG в release-нотах генерируется из git log от пр�
 - ✅ Mihomo-only ядро: все актуальные протоколы, passthrough
   полных профилей провайдера (0.5.0)
 - ✅ Kill switch (WFP) + 4-слойная защита сети от крэшей
-- ✅ Auto-updater (ed25519) + CI/CD на GitHub Actions
+- ✅ In-app updater fail-closed отключён; релизы публикуются CI/CD
 - ✅ Routing-профили, split-DNS, per-app маршрутизация с live-трафиком
 - ✅ Новый UI «soft»: дашборд, графики, мульти-подписки (0.4–0.7)
-- ✅ Ребрендинг + бесшовная миграция установок Nemefisto → Kwik (0.7.0)
+- ✅ Изолированный namespace KwikProxy Secure; без автоматической upstream-миграции
 
 ### Запланировано
 - [ ] Code signing через [SignPath Foundation](https://signpath.org/about)

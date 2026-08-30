@@ -19,11 +19,9 @@ pub fn engine_memory_bytes() -> Option<u64> {
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
     };
 
-    // Имена exe нашего sidecar pipeline'а. Tauri-shell спавнит без
-    // переименования, поэтому имя содержит target-triple (например
-    // `mihomo-x86_64-pc-windows-msvc.exe`). Helper-spawn (TUN-режим)
-    // запускает тот же exe с тем же именем. Сравнение по `starts_with`
-    // переживает обе формы.
+    // Tauri 2 strips the target triple from the build-time sidecar source,
+    // so both Tauri-shell and helper TUN mode run the installed `mihomo.exe`.
+    // Prefix matching also keeps this diagnostic tolerant of dev layouts.
     const ENGINE_PREFIXES: &[&str] = &["mihomo"];
 
     unsafe {

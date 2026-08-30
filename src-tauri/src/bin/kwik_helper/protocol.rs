@@ -2,79 +2,20 @@
 //!
 //! Каждое сообщение — одна строка JSON, заканчивается `\n`. Helper читает
 //! строку, парсит как `Request`, выполняет, отвечает `Response` (тоже одна
-//! строка JSON + `\n`). Соединение остаётся открытым — клиент может слать
-//! несколько команд подряд.
+//! строка JSON + `\n`). Одно соединение принимает ровно один ограниченный
+//! по размеру запрос.
 
 use serde::{Deserialize, Serialize};
 
-/// Версия wire-протокола helper-сервиса. Бампается каждый раз когда
-/// меняется набор полей в `Request` / `Response` так, что старый helper
-/// не сможет корректно обработать запрос от нового клиента.
-///
-/// История:
-/// - 1: исходный набор (TunStart без extra_server_hosts).
-/// - 2 (0.1.2): добавлено `TunStart.extra_server_hosts` — для
-///   mihomo-passthrough bypass на все ноды подписки. Старый helper
-///   игнорит поле и добавляет bypass только на primary, что приводит
-///   к петле для других нод.
-/// - 3 (0.1.2 / 13.L): добавлены `MihomoStart` / `MihomoStop` для
-///   SYSTEM-spawn'а mihomo. Built-in TUN-режим mihomo требует админа
-///   на `CreateAdapter` WinTUN — без помощи helper'а Tauri-main
-///   (user-level) не может его запустить.
-/// - 4 (0.1.2 / debug): bump для форсирования reinstall'а helper'а
-///   на dev-машинах. Wire-формат не менялся, но мы добавили в
-///   helper-tun.rs диагностический writeln в tun2socks.log который
-///   показывает реальные значения socks-auth полей. Без bump'а
-///   `ensure_running` не переустанавливает старый helper.
-/// - 5/6 (0.1.2 / debug): итеративные bump'ы во время диагностики
-///   tun2proxy auth (см. git log). Wire-формат не менялся.
-/// - 7 (0.1.2 / sing-box миграция): добавлены `SingBoxStart` /
-///   `SingBoxStop` для SYSTEM-spawn'а sing-box (по аналогии с
-///   `MihomoStart`/`MihomoStop` из v3). Built-in TUN-режим sing-box
-///   требует админа на `CreateAdapter` WinTUN — без помощи helper'а
-///   Tauri-main (user-level) не может его запустить.
-///
-/// - 8 (0.1.2 / sing-box миграция Phase 5): выпилены `TunStart` /
-///   `TunStop` — клиент больше не использует tun2proxy pipeline (TUN
-///   делает sing-box или mihomo через built-in inbound). Helper-side
-///   функции `start()`/`stop()` для tun2proxy тоже удалены, остался
-///   только `cleanup_orphan_resources` для очистки legacy-адаптеров.
-///
-/// - 9 (0.1.3 / kill-switch fix): добавлено `KillSwitchEnable.expect_tun`.
-///   Без него helper не знал нужен ли retry-поиск WinTUN-адаптера → в
-///   TUN-режиме kill-switch поднимался без TUN allow-фильтра и блокировал
-///   user-трафик. Bump форсит апгрейд helper'а на 0.1.3 — старый helper
-///   v8 поднимет kill-switch БЕЗ TUN allow (старая версия игнорирует
-///   новое поле, и `current_tun_interface_index` стабом возвращает None).
-///
-/// - 10 (14.D / IPv6 leak protection): добавлено
-///   `KillSwitchEnable.force_disable_ipv6`. Если `true` — пропускаются
-///   все v6 allow-фильтры (LAN, server, app-allow, TUN-interface), а
-///   базовый block-all v6 остаётся → весь IPv6 outbound блокируется
-///   пока VPN активен. Защита от утечек на dual-stack ISP. Bump чтобы
-///   старый helper v9 не молча игнорил флаг (он поднял бы kill-switch
-///   с дефолтными v6 allow'ами, и leak бы остался).
-///
-/// - 11 (0.3.1 / installer file-lock fix): добавлен `ShutdownHelper`.
-///   Helper graceful self-stop через SCM (`SERVICE_CONTROL_STOP`).
-///   Используется auto-updater'ом перед запуском NSIS installer'а:
-///   helper закрывает свой `.exe`-handle, файл становится перезаписываемым
-///   без админ-прав. Старый helper v10 не понимает команду — bump форсит
-///   reinstall через UAC, после чего обновления станут гладкими.
-///
-/// - 12 (Mihomo-only): выпилены `SingBoxStart` / `SingBoxStop` — движок
-///   sing-box полностью удалён, остался только Mihomo. Старый helper
-///   v11 умеет лишние команды, но это безвредно; bump нужен чтобы при
-///   апгрейде клиента helper переустановился до версии без sing-box-кода.
-///
-/// Tauri-main сравнивает с `Response::Version.protocol_version` при
-/// `ensure_running()` — если получил `<` (или 0 от helper'а без поля)
-/// форсит uninstall+install через UAC, чтобы пользователь получил
-/// помощь с дев-сборки или релиз-апгрейда без ручных шагов.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// Version 13 intentionally breaks compatibility with the upstream helper:
+/// a new pipe identity, authenticated clients, no client-supplied paths and
+/// no remote self-shutdown command. Client and helper require an exact version
+/// match; upgrades are performed only by the per-machine installer.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum Request {
     /// Health-check. Helper отвечает `Response::Pong`.
     Ping,
@@ -89,17 +30,11 @@ pub enum Request {
     /// `allow_lan` — пускать ли локальную сеть (10/8, 172.16/12,
     /// 192.168/16, 169.254/16, fe80::/10, ff00::/8).
     ///
-    /// `allow_app_paths` — абсолютные пути к нашим бинарям, которым
-    /// разрешён исходящий трафик (mihomo.exe, helper.exe,
-    /// vpn-client.exe). Без этого VPN-движок не сможет соединиться
-    /// даже если IP сервера есть в server_ips.
     KillSwitchEnable {
         #[serde(default)]
         server_ips: Vec<String>,
         #[serde(default)]
         allow_lan: bool,
-        #[serde(default)]
-        allow_app_paths: Vec<String>,
         /// DNS leak protection (этап 13.D step B): блокировать весь
         /// :53/UDP+TCP трафик кроме явно разрешённых IP.
         #[serde(default)]
@@ -143,8 +78,8 @@ pub enum Request {
     /// сейчас не имеет активного kill-switch state, удалит всё что
     /// потенциально зависло от прошлых сессий.
     KillSwitchForceCleanup,
-    /// Cleanup orphan TUN-адаптеров (`kwik-*`) и half-default
-    /// routes через `198.18.0.1`. Используется UI-кнопкой
+    /// Cleanup orphan TUN adapters bearing the reserved
+    /// `kwikproxy-secure-*` ownership marker. Используется UI-кнопкой
     /// «восстановить сеть» когда видимо, что что-то осталось от
     /// упавшей сессии. Безопасно вызывать только когда VPN не активен.
     OrphanCleanup,
@@ -154,34 +89,15 @@ pub enum Request {
     /// Не destructive: только читает существование sublayer'а с
     /// нашим GUID.
     WfpQueryOrphan,
-    /// 13.L: запустить mihomo как SYSTEM-процесс. Нужно для built-in
-    /// TUN-режима — `CreateAdapter` WinTUN требует админа, и Tauri-main
-    /// (user-level) не может его поднять напрямую.
-    ///
-    /// `mihomo_exe_path` / `config_path` / `data_dir` — абсолютные пути.
-    /// Helper не знает где у Tauri лежат sidecar-binaries, поэтому
-    /// получает их явно.
-    ///
-    /// stdout/stderr процесса перенаправляются в
-    /// `C:\ProgramData\KwikVPN\mihomo.log` (помощник имеет туда
-    /// SYSTEM-доступ; Tauri-main как user тоже может читать для
-    /// диагностики).
-    MihomoStart {
-        config_path: String,
-        mihomo_exe_path: String,
-        data_dir: String,
+    /// Start the fixed, installer-owned Mihomo binary. The unprivileged UI
+    /// supplies configuration bytes, never filesystem/executable paths.
+    StartTunnel {
+        config_yaml: String,
+        allow_lan: bool,
     },
     /// 13.L: остановить SYSTEM-spawned mihomo. Идемпотентно: если
     /// helper не запускал mihomo — no-op.
     MihomoStop,
-    /// 0.3.1 / installer file-lock fix: graceful self-shutdown.
-    /// Helper отвечает `Ok`, потом в фоновой задаче после короткой
-    /// задержки (чтобы клиент успел получить ответ) сам себя стопит
-    /// через SCM `SERVICE_CONTROL_STOP`. Helper работает под SYSTEM,
-    /// имеет SERVICE_STOP rights на свой же сервис. После shutdown
-    /// `.exe`-файл становится перезаписываемым без admin-прав → NSIS
-    /// installer может обновить helper.exe в auto-update'е.
-    ShutdownHelper,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -200,26 +116,27 @@ pub enum Response {
     Ok,
     /// 14.E: ответ на `WfpQueryOrphan`. `has_orphan` — есть ли
     /// sublayer с нашим GUID в persistent WFP-store.
-    WfpOrphan { has_orphan: bool },
+    WfpOrphan {
+        has_orphan: bool,
+    },
     /// Ошибка с описанием.
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 impl Response {
     pub fn err(msg: impl Into<String>) -> Self {
-        Self::Error { message: msg.into() }
+        Self::Error {
+            message: msg.into(),
+        }
     }
 }
 
-pub const PIPE_NAME: &str = r"\\.\pipe\kwik-helper";
-pub const SERVICE_NAME: &str = "KwikHelper";
-pub const SERVICE_DISPLAY_NAME: &str = "Kwik VPN Helper";
-pub const SERVICE_DESCRIPTION: &str = "Управление TUN-интерфейсом и системной маршрутизацией для Kwik VPN.";
-/// Имя сервиса до ребрендинга 0.7.0 (Kwik → Kwik). Используется
-/// для one-time авто-uninstall старого сервиса при установке нового
-/// (`service::install`) — иначе на машине остался бы висеть SYSTEM-сервис
-/// со старым именем и своим pipe.
-pub const LEGACY_SERVICE_NAME: &str = "KwikHelper";
+pub const PIPE_NAME: &str = r"\\.\pipe\KwikProxySecure.Helper.v13";
+pub const SERVICE_NAME: &str = "KwikProxySecureHelper";
+pub const SERVICE_DISPLAY_NAME: &str = "KwikProxy Secure Helper";
+pub const SERVICE_DESCRIPTION: &str = "Protected TUN and kill-switch broker for KwikProxy Secure.";
 
 #[cfg(test)]
 mod tests {
@@ -251,5 +168,25 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, Request::WfpQueryOrphan));
+    }
+
+    #[test]
+    fn start_tunnel_contains_no_paths() {
+        let json = serde_json::to_string(&Request::StartTunnel {
+            config_yaml: "mixed-port: 7890".into(),
+            allow_lan: false,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"cmd":"start_tunnel","config_yaml":"mixed-port: 7890","allow_lan":false}"#
+        );
+        assert!(!json.contains("path"));
+    }
+
+    #[test]
+    fn legacy_path_injection_request_is_rejected() {
+        let legacy = r#"{"cmd":"mihomo_start","config_path":"C:\\\\evil.yml","mihomo_exe_path":"C:\\\\evil.exe","data_dir":"C:\\\\"}"#;
+        assert!(serde_json::from_str::<Request>(legacy).is_err());
     }
 }

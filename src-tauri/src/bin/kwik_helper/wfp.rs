@@ -41,20 +41,20 @@ use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 /// найти именно «наши» объекты, не задев чужие WFP-фильтры (Defender,
 /// другие VPN, etc).
 pub const KWIK_PROVIDER_GUID: GUID = GUID {
-    data1: 0xc6f1_bd86,
-    data2: 0xc5e9,
-    data3: 0x4e7a,
-    data4: [0x9d, 0x7a, 0x2d, 0x81, 0xd6, 0xe4, 0xa2, 0xc1],
+    data1: 0xf72f_c30b,
+    data2: 0xaf34,
+    data3: 0x45f6,
+    data4: [0xaf, 0xb5, 0xe4, 0x20, 0x46, 0xbd, 0x5b, 0x6d],
 };
 
 /// GUID sublayer'а — наша группа фильтров. Высокий weight чтобы они
 /// рассматривались ДО windows-default рулежа (например allow-all из
 /// Mullvad/NordVPN если оба активны).
 pub const KWIK_SUBLAYER_GUID: GUID = GUID {
-    data1: 0xc6f1_bd87,
-    data2: 0xc5e9,
-    data3: 0x4e7a,
-    data4: [0x9d, 0x7a, 0x2d, 0x81, 0xd6, 0xe4, 0xa2, 0xc2],
+    data1: 0xaef0_1ce1,
+    data2: 0x2adc,
+    data3: 0x49b8,
+    data4: [0x92, 0x52, 0xb9, 0x2e, 0xbe, 0x68, 0x91, 0x02],
 };
 
 // Веса фильтров живут в firewall.rs — он единственный потребитель
@@ -189,12 +189,7 @@ impl WfpEngine {
 
     /// Базовый billed: filter без conditions = match-all в layer.
     /// Используется для block-all fallback'а в самом низу sublayer'а.
-    pub fn add_filter_block_all(
-        &self,
-        layer: GUID,
-        sublayer_key: GUID,
-        name: &str,
-    ) -> Result<()> {
+    pub fn add_filter_block_all(&self, layer: GUID, sublayer_key: GUID, name: &str) -> Result<()> {
         // weight = 0 — самый низкий, любые allow-фильтры с >0 перебивают.
         self.add_filter(layer, sublayer_key, name, 0, FWP_ACTION_BLOCK, &mut [])
     }
@@ -216,7 +211,14 @@ impl WfpEngine {
         conditions[0].matchType = FWP_MATCH_EQUAL;
         conditions[0].conditionValue.r#type = FWP_V4_ADDR_MASK;
         conditions[0].conditionValue.Anonymous.v4AddrMask = &mut addr_mask;
-        self.add_filter(layer, sublayer_key, name, weight, FWP_ACTION_PERMIT, &mut conditions)
+        self.add_filter(
+            layer,
+            sublayer_key,
+            name,
+            weight,
+            FWP_ACTION_PERMIT,
+            &mut conditions,
+        )
     }
 
     /// Allow для IPv6 подсети. `addr` — 16 байт, `prefix_length` 0..=128.
@@ -238,7 +240,14 @@ impl WfpEngine {
         conditions[0].matchType = FWP_MATCH_EQUAL;
         conditions[0].conditionValue.r#type = FWP_V6_ADDR_MASK;
         conditions[0].conditionValue.Anonymous.v6AddrMask = &mut addr_mask;
-        self.add_filter(layer, sublayer_key, name, weight, FWP_ACTION_PERMIT, &mut conditions)
+        self.add_filter(
+            layer,
+            sublayer_key,
+            name,
+            weight,
+            FWP_ACTION_PERMIT,
+            &mut conditions,
+        )
     }
 
     /// Allow для одного IPv4 адреса (хост, /32).
@@ -250,14 +259,7 @@ impl WfpEngine {
         weight: u8,
         addr: u32,
     ) -> Result<()> {
-        self.add_filter_allow_v4_subnet(
-            layer,
-            sublayer_key,
-            name,
-            weight,
-            addr,
-            0xFFFF_FFFF,
-        )
+        self.add_filter_allow_v4_subnet(layer, sublayer_key, name, weight, addr, 0xFFFF_FFFF)
     }
 
     /// Allow для одного IPv6 адреса (/128).
@@ -304,7 +306,14 @@ impl WfpEngine {
         conditions[2].matchType = FWP_MATCH_EQUAL;
         conditions[2].conditionValue.r#type = FWP_UINT8;
         conditions[2].conditionValue.Anonymous.uint8 = protocol;
-        self.add_filter(layer, sublayer_key, name, weight, FWP_ACTION_PERMIT, &mut conditions)
+        self.add_filter(
+            layer,
+            sublayer_key,
+            name,
+            weight,
+            FWP_ACTION_PERMIT,
+            &mut conditions,
+        )
     }
 
     /// Block по протоколу+порту без условия на адрес. Используется
@@ -328,7 +337,14 @@ impl WfpEngine {
         conditions[1].matchType = FWP_MATCH_EQUAL;
         conditions[1].conditionValue.r#type = FWP_UINT8;
         conditions[1].conditionValue.Anonymous.uint8 = protocol;
-        self.add_filter(layer, sublayer_key, name, weight, FWP_ACTION_BLOCK, &mut conditions)
+        self.add_filter(
+            layer,
+            sublayer_key,
+            name,
+            weight,
+            FWP_ACTION_BLOCK,
+            &mut conditions,
+        )
     }
 
     /// Allow для всего трафика через указанный сетевой интерфейс
@@ -366,7 +382,14 @@ impl WfpEngine {
         conditions[0].matchType = FWP_MATCH_EQUAL;
         conditions[0].conditionValue.r#type = FWP_UINT64;
         conditions[0].conditionValue.Anonymous.uint64 = &mut luid_storage as *mut u64;
-        self.add_filter(layer, sublayer_key, name, weight, FWP_ACTION_PERMIT, &mut conditions)
+        self.add_filter(
+            layer,
+            sublayer_key,
+            name,
+            weight,
+            FWP_ACTION_PERMIT,
+            &mut conditions,
+        )
     }
 
     /// Allow для процесса по абсолютному пути к exe. Использует
@@ -456,8 +479,7 @@ impl WfpEngine {
                 conditions.as_mut_ptr()
             };
 
-            let rc =
-                FwpmFilterAdd0(self.handle, &filter, ptr::null_mut(), ptr::null_mut());
+            let rc = FwpmFilterAdd0(self.handle, &filter, ptr::null_mut(), ptr::null_mut());
             if rc != ERROR_SUCCESS {
                 bail!("FwpmFilterAdd0({}) failed: 0x{:08x}", name, rc);
             }
@@ -494,11 +516,7 @@ pub fn has_orphan_filters() -> Result<bool> {
     let engine = WfpEngine::open_persistent().context("orphan-check: open engine")?;
     let mut sublayer_ptr: *mut FWPM_SUBLAYER0 = ptr::null_mut();
     unsafe {
-        let rc = FwpmSubLayerGetByKey0(
-            engine.handle,
-            &KWIK_SUBLAYER_GUID,
-            &mut sublayer_ptr,
-        );
+        let rc = FwpmSubLayerGetByKey0(engine.handle, &KWIK_SUBLAYER_GUID, &mut sublayer_ptr);
         if rc == ERROR_SUCCESS {
             // Sublayer существует — есть остатки. Освобождаем память.
             if !sublayer_ptr.is_null() {
@@ -548,3 +566,15 @@ pub fn cleanup_provider() -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fork_uses_distinct_provider_and_sublayer_identity() {
+        assert_eq!(KWIK_PROVIDER_GUID.data1, 0xf72f_c30b);
+        assert_eq!(KWIK_SUBLAYER_GUID.data1, 0xaef0_1ce1);
+        assert_ne!(KWIK_PROVIDER_GUID.data1, 0xc6f1_bd86);
+        assert_ne!(KWIK_SUBLAYER_GUID.data1, 0xc6f1_bd87);
+    }
+}

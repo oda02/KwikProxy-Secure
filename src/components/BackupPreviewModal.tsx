@@ -86,6 +86,15 @@ export function BackupPreviewModal({
           <span style={{ color: "var(--fg)" }}>{exportedAt}</span>
           {t("modal.backup.createdAtMiddle", { version: backup.app_version })}
         </div>
+        {backup.subscription_url && (
+          <div
+            role="alert"
+            className="recovery-text"
+            style={{ marginTop: 8, color: "var(--warning, #b7791f)" }}
+          >
+            {t("modal.backup.subscriptionSecretWarning")}
+          </div>
+        )}
         {diff.length === 0 ? (
           <div className="recovery-text" style={{ marginTop: 8 }}>
             {t("modal.backup.noChanges")}

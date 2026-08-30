@@ -15,7 +15,7 @@
 import { useEffect } from "react";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useUpdateStore } from "../../stores/updateStore";
-import { checkForUpdates } from "../updater";
+import { checkForUpdates, UPDATER_ENABLED } from "../updater";
 
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 часов
 const STARTUP_DELAY_MS = 10_000;
@@ -27,7 +27,7 @@ export function useAutoUpdateCheck() {
   const setLastCheckAt = useUpdateStore((s) => s.setLastCheckAt);
 
   useEffect(() => {
-    if (!autoCheck) return;
+    if (!autoCheck || !UPDATER_ENABLED) return;
 
     let cancelled = false;
     let intervalId: number | undefined;

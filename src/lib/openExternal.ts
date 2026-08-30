@@ -1,6 +1,29 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useSubscriptionStore } from "../stores/subscriptionStore";
 
+function trustedHttpsUrl(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" || url.username || url.password) return null;
+    const host = url.hostname.toLowerCase().replace(/\.$/, "");
+    if (
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      host.endsWith(".local") ||
+      host.endsWith(".internal") ||
+      /^(127\.|10\.|192\.168\.|169\.254\.)/.test(host) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+      host === "::1"
+    ) {
+      return null;
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 /** Открыть личный кабинет подписки.
  *
  *  ВАЖНО (изменение поведения): URL берётся ТОЛЬКО из заголовка
@@ -14,7 +37,9 @@ import { useSubscriptionStore } from "../stores/subscriptionStore";
  *     релевантна;
  *   - UI должен скрывать кнопку когда `useHasDashboardUrl() === false`. */
 export function openDashboard() {
-  const url = useSubscriptionStore.getState().meta?.webPageUrl;
+  const url = trustedHttpsUrl(
+    useSubscriptionStore.getState().meta?.webPageUrl
+  );
   if (!url) return;
   void openUrl(url);
 }
@@ -23,7 +48,9 @@ export function openDashboard() {
  *  Возвращает `true` только если подписка прислала
  *  `profile-web-page-url`. */
 export function useHasDashboardUrl(): boolean {
-  return !!useSubscriptionStore((s) => s.meta?.webPageUrl);
+  return useSubscriptionStore(
+    (s) => trustedHttpsUrl(s.meta?.webPageUrl) !== null
+  );
 }
 
 /** Открыть страницу поддержки.
@@ -33,7 +60,7 @@ export function useHasDashboardUrl(): boolean {
  *  провайдеру, поддержку задаёт сама подписка. Если заголовка нет —
  *  no-op, а UI должен скрывать кнопку (`useHasSupportUrl() === false`). */
 export function openSupport() {
-  const url = useSubscriptionStore.getState().meta?.supportUrl;
+  const url = trustedHttpsUrl(useSubscriptionStore.getState().meta?.supportUrl);
   if (!url) return;
   void openUrl(url);
 }
@@ -41,5 +68,7 @@ export function openSupport() {
 /** Hook для условного рендера кнопки «поддержка».
  *  Возвращает `true` только если подписка прислала `support-url`. */
 export function useHasSupportUrl(): boolean {
-  return !!useSubscriptionStore((s) => s.meta?.supportUrl);
+  return useSubscriptionStore(
+    (s) => trustedHttpsUrl(s.meta?.supportUrl) !== null
+  );
 }

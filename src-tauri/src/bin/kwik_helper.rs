@@ -5,13 +5,12 @@
 //! (CreateAdapter требует админа).
 //!
 //! User-mode Tauri-приложение общается с этим helper-ом через named pipe
-//! `\\.\pipe\kwik-helper` line-delimited JSON-RPC протоколом.
+//! `\\.\pipe\KwikProxySecure.Helper.v13` bounded JSON-RPC протоколом.
 //!
 //! CLI:
 //!   kwik-helper install      — установить и запустить сервис (нужен UAC)
 //!   kwik-helper uninstall    — остановить и удалить сервис (нужен UAC)
 //!   kwik-helper service      — точка входа SCM, не вызывать руками
-//!   kwik-helper status       — диагностический ping в pipe
 
 #[cfg(windows)]
 mod kwik_helper {
@@ -43,13 +42,6 @@ fn main() {
         "uninstall" => kwik_helper::service::uninstall(),
         "service" => kwik_helper::service::run_as_service(),
         "debug" => run_debug_foreground(),
-        "status" => match status_check() {
-            Ok(version) => {
-                println!("сервис отвечает, версия: {version}");
-                Ok(())
-            }
-            Err(e) => Err(e),
-        },
         // 13.D EMERGENCY: восстанавливает интернет если kill-switch
         // фильтры остались висеть (helper не убрал их при crash, или
         // DYNAMIC не сработал). Не требует запущенного сервиса —
@@ -57,15 +49,13 @@ fn main() {
         // каскадно (вместе со всеми filter'ами).
         // Запускать ОТ АДМИНА:
         //   & "C:\path\to\kwik-helper.exe" killswitch-cleanup
-        "killswitch-cleanup" => {
-            match kwik_helper::wfp::cleanup_provider() {
-                Ok(()) => {
-                    println!("✓ WFP kill-switch фильтры удалены, интернет восстановлен");
-                    Ok(())
-                }
-                Err(e) => Err(e),
+        "killswitch-cleanup" => match kwik_helper::wfp::cleanup_provider() {
+            Ok(()) => {
+                println!("✓ WFP kill-switch фильтры удалены, интернет восстановлен");
+                Ok(())
             }
-        }
+            Err(e) => Err(e),
+        },
         _ => {
             print_usage();
             Ok(())
@@ -135,48 +125,6 @@ fn ctrlc_or_warn<F: FnMut() + Send + 'static>(handler: F) {
 }
 
 #[cfg(windows)]
-fn status_check() -> anyhow::Result<String> {
-    use std::io::{Read, Write};
-    use std::time::{Duration, Instant};
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut pipe = loop {
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(kwik_helper::protocol::PIPE_NAME)
-        {
-            Ok(f) => break f,
-            Err(e) => {
-                if Instant::now() >= deadline {
-                    anyhow::bail!("не удалось подключиться к pipe: {e}");
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-    };
-
-    // ping
-    pipe.write_all(b"{\"cmd\":\"ping\"}\n")?;
-    let mut buf = [0u8; 1024];
-    let n = pipe.read(&mut buf)?;
-    let resp: serde_json::Value = serde_json::from_slice(&buf[..n])?;
-    if resp.get("result").and_then(|v| v.as_str()) != Some("pong") {
-        anyhow::bail!("ожидали pong, получили {resp}");
-    }
-
-    // version
-    pipe.write_all(b"{\"cmd\":\"version\"}\n")?;
-    let n = pipe.read(&mut buf)?;
-    let resp: serde_json::Value = serde_json::from_slice(&buf[..n])?;
-    Ok(resp
-        .get("version")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("нет поля version: {resp}"))?
-        .to_string())
-}
-
-#[cfg(windows)]
 fn print_usage() {
     eprintln!("kwik-helper — Windows-сервис для управления TUN-режимом");
     eprintln!();
@@ -185,7 +133,6 @@ fn print_usage() {
     eprintln!("  kwik-helper uninstall   остановить и удалить сервис");
     eprintln!("  kwik-helper service     (внутренняя — вызывается SCM)");
     eprintln!("  kwik-helper debug       foreground-режим для отладки");
-    eprintln!("  kwik-helper status      проверить, что сервис отвечает");
     eprintln!(
         "  kwik-helper killswitch-cleanup  EMERGENCY: убрать WFP-фильтры если \
          kill-switch завис и интернет заблокирован"

@@ -1,7 +1,7 @@
 //! Генерация YAML-конфига Mihomo (Clash Meta) из ProxyEntry — этап 8.B.
 //!
 //! Симметричен `xray_config.rs`. Возвращает готовую YAML-строку, которая
-//! записывается в `%TEMP%\KwikVPN\mihomo-config.yaml` и подсовывается
+//! записывается в `%TEMP%\KwikProxy Secure\mihomo-config.yaml` и подсовывается
 //! Mihomo через `-f <file>`.
 //!
 //! Поддерживаемые протоколы: всё что умеет Mihomo — vless / vmess / trojan /
@@ -105,9 +105,8 @@ pub fn build(
     // сам поднимает WinTUN-адаптер для URI/base64-серверов (раньше TUN
     // работал только для full mihomo-profile подписок).
     use_builtin_tun: bool,
-    // 12.E маскировка имени TUN-адаптера. `Some(name)` → `tun.device`
-    // ставится в замаскированное имя (`wlan99` / `Ethernet 7` и т.п.);
-    // `None` → mihomo default (kill-switch детектит по Description/IP).
+    // Уникальная ownership-метка TUN-адаптера. В TUN-режиме обязателен
+    // префикс `kwikproxy-secure-`, чтобы cleanup не затрагивал другой VPN.
     tun_device: Option<&str>,
     // #4: разрешить IPv6 (root + dns). По умолчанию false (анти-leak).
     ipv6: bool,
@@ -119,6 +118,10 @@ pub fn build(
     external_controller_port: u16,
     external_controller_secret: &str,
 ) -> Result<MihomoConfig> {
+    validate_runtime_inputs(app_rules, anti_dpi, custom_dns, use_builtin_tun, tun_device)?;
+    if let Some(profile) = routing_profile {
+        profile.validate().context("invalid routing profile at config sink")?;
+    }
     let proxy = proxy_for_entry(entry)
         .with_context(|| format!("не удалось собрать mihomo-proxy для «{}»", entry.name))?;
 
@@ -233,7 +236,7 @@ pub fn build(
     // block→REJECT.
     let mut rules: Vec<Value> = Vec::new();
     for r in app_rules {
-        if let Some(rule) = app_rule_to_mihomo(r) {
+        if let Some(rule) = app_rule_to_mihomo(r, "PROXY") {
             rules.push(Value::String(rule));
         }
     }
@@ -271,15 +274,16 @@ pub fn build(
 
     let yaml = serde_yaml::to_string(&Value::Mapping(root))
         .context("сериализация mihomo YAML")?;
+    if yaml.len() > MAX_FULL_YAML_BYTES {
+        bail!("generated mihomo YAML is too large");
+    }
 
     Ok(MihomoConfig { yaml, mixed_port })
 }
 
-/// 13.L + 12.E: собрать `tun:` секцию для built-in TUN-режима mihomo.
+/// 13.L: собрать `tun:` секцию для built-in TUN-режима mihomo.
 ///
-/// `device` — кастомное имя WinTUN-адаптера (12.E маскировка). `None` →
-/// mihomo default (`Meta`); kill-switch тогда детектит адаптер по
-/// Description/IP, а не по alias.
+/// `device` — имя WinTUN-адаптера с уникальной ownership-меткой fork.
 ///
 /// `dns-hijack: any:53` обязателен в TUN-режиме — без него DNS-запросы
 /// приложений уходят мимо нашего DNS и могут утечь (DNS leak). С ним
@@ -315,29 +319,6 @@ fn builtin_tun_mapping(device: Option<&str>) -> Mapping {
         tun.insert("device".into(), dev.into());
     }
     tun
-}
-
-/// 12.E: сгенерировать замаскированное имя TUN-адаптера.
-///
-/// Имя выбирается псевдослучайно из набора, имитирующего стандартные
-/// сетевые адаптеры Windows — чтобы сторонний процесс при перечислении
-/// интерфейсов не распознал VPN-туннель по характерному имени
-/// (`Mihomo` / `kwik-*`). Угроза: https://habr.com/ru/news/1020902/.
-///
-/// Наборы: `wlan{99..198}`, `Local Area Connection {2..16}`,
-/// `Ethernet {2..16}`. Энтропия — наносекунды (как в `random_high_port`),
-/// криптостойкость не требуется.
-pub fn masked_tun_name() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0);
-    match nanos % 3 {
-        0 => format!("wlan{}", 99 + (nanos / 3) % 100),
-        1 => format!("Local Area Connection {}", 2 + (nanos / 3) % 15),
-        _ => format!("Ethernet {}", 2 + (nanos / 3) % 15),
-    }
 }
 
 /// 11.F: преобразовать правила routing-профиля в Mihomo-формат строк.
@@ -381,6 +362,14 @@ fn mihomo_rules_from_profile(
 ///  2. иначе — имя первой `proxy-groups[].name`;
 ///  3. иначе — встроенная mihomo-группа `GLOBAL` (есть всегда).
 fn detect_proxy_target(root: &Mapping) -> String {
+    let group_names: Vec<&str> = root
+        .get("proxy-groups")
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("name").and_then(Value::as_str))
+        .filter(|name| is_safe_rule_token(name))
+        .collect();
     if let Some(Value::Sequence(rules)) = root.get("rules") {
         for r in rules {
             let Some(s) = r.as_str() else { continue };
@@ -388,38 +377,48 @@ fn detect_proxy_target(root: &Mapping) -> String {
             let head = parts.next().unwrap_or("").trim().to_uppercase();
             if head == "MATCH" || head == "FINAL" {
                 if let Some(t) = parts.next().map(str::trim) {
-                    if !t.is_empty() {
+                    if group_names.contains(&t) {
                         return t.to_string();
                     }
                 }
             }
         }
     }
-    if let Some(Value::Sequence(groups)) = root.get("proxy-groups") {
-        if let Some(name) = groups
-            .first()
-            .and_then(|g| g.get("name"))
-            .and_then(|v| v.as_str())
-        {
-            return name.to_string();
-        }
+    if let Some(name) = group_names.first() {
+        return (*name).to_string();
     }
     "GLOBAL".to_string()
+}
+
+fn is_safe_rule_token(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.contains(',')
+        && !value.chars().any(char::is_control)
 }
 
 /// 8.D / #5: одно app-rule → строка правила mihomo. Если `exe` содержит
 /// разделитель пути (`\` или `/`) — матчим по полному пути (`PROCESS-PATH`,
 /// различает два разных exe с одним именем), иначе по имени (`PROCESS-NAME`).
 /// `action`: proxy→PROXY / direct→DIRECT / block→REJECT. `None` если exe пуст.
-fn app_rule_to_mihomo(r: &AppRule) -> Option<String> {
+fn app_rule_to_mihomo(r: &AppRule, proxy_target: &str) -> Option<String> {
     let exe = r.exe.trim();
-    if exe.is_empty() {
+    // Mihomo rules are comma-separated strings.  A newline or comma in a
+    // process value would let untrusted persisted/UI state inject another
+    // argument/rule.  Paths longer than the Win32 extended-path limit are
+    // not useful here and are a cheap memory/DoS vector.
+    if exe.is_empty()
+        || exe.len() > 1024
+        || exe.chars().any(|c| c == ',' || c == '\r' || c == '\n' || c.is_control())
+    {
         return None;
     }
     let target = match r.action.as_str() {
+        "proxy" => proxy_target,
         "direct" => "DIRECT",
         "block" => "REJECT",
-        _ => "PROXY",
+        _ => return None,
     };
     let matcher = if exe.contains('\\') || exe.contains('/') {
         "PROCESS-PATH"
@@ -427,6 +426,57 @@ fn app_rule_to_mihomo(r: &AppRule) -> Option<String> {
         "PROCESS-NAME"
     };
     Some(format!("{matcher},{exe},{target}"))
+}
+
+fn validate_runtime_inputs(
+    app_rules: &[AppRule],
+    anti_dpi: Option<&AntiDpiOptions>,
+    custom_dns: Option<&[String]>,
+    use_builtin_tun: bool,
+    tun_device: Option<&str>,
+) -> Result<()> {
+    if app_rules.len() > 4096 {
+        bail!("too many per-application rules");
+    }
+    for rule in app_rules {
+        if app_rule_to_mihomo(rule, "PROXY").is_none() {
+            bail!("invalid per-application rule");
+        }
+    }
+    if let Some(servers) = custom_dns {
+        if servers.len() > 16 {
+            bail!("too many custom DNS servers");
+        }
+        for server in servers.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if !super::routing_profile::is_valid_dns_endpoint(server) {
+                bail!("unsafe custom DNS endpoint");
+            }
+        }
+    }
+    if let Some(options) = anti_dpi.filter(|options| options.server_resolve) {
+        let bootstrap = options.server_resolve_bootstrap.parse::<std::net::IpAddr>();
+        let safe_bootstrap = match bootstrap {
+            Ok(ip) => super::routing_profile::is_public_ip(ip),
+            Err(_) => false,
+        };
+        if !super::routing_profile::is_https_remote_url(&options.server_resolve_doh)
+            || !safe_bootstrap
+        {
+            bail!("unsafe anti-DPI DNS resolver settings");
+        }
+    }
+    if use_builtin_tun {
+        let device = tun_device.context("TUN mode requires an owned adapter name")?;
+        if !device.starts_with("kwikproxy-secure-")
+            || device.len() > 96
+            || !device
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            bail!("TUN adapter name must use the reserved fork prefix");
+        }
+    }
+    Ok(())
 }
 
 /// Базовые DIRECT-правила для loopback / приватных / link-local /
@@ -1230,9 +1280,8 @@ pub struct FullYamlPatch<'a> {
     /// (создание WinTUN-адаптера). Для этого запускаем mihomo через
     /// helper-сервис (он SYSTEM), а не напрямую как Tauri sidecar.
     pub use_builtin_tun: bool,
-    /// 12.E маскировка имени TUN-адаптера. `Some(name)` → принудительно
-    /// ставим `tun.device` в замаскированное имя (перезаписывая
-    /// провайдерское). `None` → имя из подписки / mihomo default.
+    /// Уникальная ownership-метка TUN-адаптера. В TUN-режиме имя должно
+    /// начинаться с `kwikproxy-secure-`; provider value перезаписывается.
     pub tun_device: Option<&'a str>,
     /// 11.F: активный routing-профиль. `Some(p)` → его explicit-правила
     /// (block/direct/proxy) вставляются ПЕРЕД провайдерскими (после
@@ -1250,6 +1299,298 @@ pub struct FullYamlPatch<'a> {
     /// перезаписываем `dns.nameserver` (общий резолвер), сохраняя
     /// провайдерскую `nameserver-policy`. `None` → не трогаем DNS провайдера.
     pub custom_dns: Option<&'a [String]>,
+}
+
+// Leave room for the helper protocol envelope below its 1.5 MiB privileged
+// config ceiling.
+const MAX_FULL_YAML_BYTES: usize = 1400 * 1024;
+const MAX_PROXIES: usize = 4096;
+const MAX_GROUPS: usize = 512;
+const MAX_PROVIDERS: usize = 256;
+const MAX_RULES: usize = 200_000;
+const APP_HEALTH_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
+
+fn yaml_key(name: &str) -> Value {
+    Value::String(name.to_string())
+}
+
+fn remove_keys(map: &mut Mapping, names: &[&str]) {
+    for name in names {
+        map.remove(yaml_key(name));
+    }
+}
+
+fn reject_tagged_yaml(value: &Value) -> Result<()> {
+    match value {
+        Value::Tagged(_) => bail!("YAML tags are not allowed in subscription profiles"),
+        Value::Sequence(seq) => {
+            for item in seq {
+                reject_tagged_yaml(item)?;
+            }
+        }
+        Value::Mapping(map) => {
+            for (key, value) in map {
+                reject_tagged_yaml(key)?;
+                reject_tagged_yaml(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_https_remote_url(raw: &str, field: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(raw)
+        .with_context(|| format!("{field}: invalid URL"))?;
+    if parsed.scheme() != "https" {
+        bail!("{field}: only HTTPS URLs are allowed");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("{field}: embedded URL credentials are not allowed");
+    }
+    let host = parsed
+        .host_str()
+        .context(format!("{field}: URL has no host"))?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
+        bail!("{field}: local-network host is not allowed");
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if !super::routing_profile::is_public_ip(ip) {
+            bail!("{field}: local/private IP is not allowed");
+        }
+    }
+    Ok(())
+}
+
+fn provider_cache_path(kind: &str, name: &str, url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{kind}\0{name}\0{url}").as_bytes());
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    format!("providers/{kind}/{hex}.yaml")
+}
+
+fn sanitize_providers(root: &mut Mapping, key: &str, kind: &str) -> Result<()> {
+    let Some(value) = root.get_mut(yaml_key(key)) else {
+        return Ok(());
+    };
+    let providers = value
+        .as_mapping_mut()
+        .with_context(|| format!("{key} must be a mapping"))?;
+    if providers.len() > MAX_PROVIDERS {
+        bail!("{key}: too many providers");
+    }
+    for (name_value, provider_value) in providers.iter_mut() {
+        let name = name_value
+            .as_str()
+            .context("provider name must be a string")?;
+        if name.is_empty()
+            || name.len() > 256
+            || name
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '/' | '\\' | ','))
+        {
+            bail!("{key}: unsafe provider name");
+        }
+        let provider = provider_value
+            .as_mapping_mut()
+            .with_context(|| format!("{key}.{name} must be a mapping"))?;
+        let provider_type = provider
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("http");
+        // File providers let a SYSTEM-owned Mihomo read attacker-selected
+        // local paths.  Full profiles may use remote providers only.
+        if provider_type != "http" {
+            bail!("{key}.{name}: only remote HTTP providers are allowed");
+        }
+        let url = provider
+            .get("url")
+            .and_then(Value::as_str)
+            .with_context(|| format!("{key}.{name}.url is required"))?
+            .to_string();
+        validate_https_remote_url(&url, &format!("{key}.{name}.url"))?;
+        provider.insert(
+            "path".into(),
+            provider_cache_path(kind, name, &url).into(),
+        );
+        provider.insert("type".into(), "http".into());
+        if let Some(interval) = provider.get("interval").and_then(Value::as_u64) {
+            provider.insert("interval".into(), interval.clamp(300, 604_800).into());
+        }
+        if let Some(health) = provider
+            .get_mut("health-check")
+            .and_then(Value::as_mapping_mut)
+        {
+            // Health checks need no provider-selected destination. Normalize
+            // even plain-HTTP legacy probes instead of rejecting the graph.
+            health.insert("url".into(), APP_HEALTH_PROBE_URL.into());
+            if let Some(interval) = health.get("interval").and_then(Value::as_u64) {
+                health.insert("interval".into(), interval.clamp(60, 86_400).into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_sequence_bound(root: &Mapping, key: &str, max: usize) -> Result<()> {
+    if let Some(value) = root.get(yaml_key(key)) {
+        let seq = value
+            .as_sequence()
+            .with_context(|| format!("{key} must be a sequence"))?;
+        if seq.len() > max {
+            bail!("{key}: too many entries ({} > {max})", seq.len());
+        }
+    }
+    Ok(())
+}
+
+/// Reduce a provider-controlled full profile to the data plane surface that
+/// Kwik actually supports.  This runs at the final config sink, so stale
+/// frontend caches and future import paths cannot bypass it.
+fn sanitize_full_profile(root: &mut Mapping, patch: &FullYamlPatch) -> Result<()> {
+    remove_keys(
+        root,
+        &[
+            "listeners",
+            "inbounds",
+            "tunnels",
+            "ss-config",
+            "vmess-config",
+            "tuic-server",
+            "script",
+            "script-mode",
+            "experimental",
+            "external-ui",
+            "external-ui-name",
+            "external-ui-url",
+            "external-controller-tls",
+            "external-controller-pipe",
+            "external-controller-unix",
+            "external-controller-cors",
+            "external-doh-server",
+            "geox-url",
+            "ntp",
+            "skip-auth-prefixes",
+            "lan-allowed-ips",
+            "lan-disallowed-ips",
+            "interface-name",
+            "routing-mark",
+            "tls",
+            "hosts",
+        ],
+    );
+    root.insert("geo-auto-update".into(), false.into());
+    root.insert("mode".into(), "rule".into());
+    root.insert("log-level".into(), "warning".into());
+    root.insert("ipv6".into(), patch.ipv6.into());
+    root.insert(
+        "find-process-mode".into(),
+        (if patch.app_rules.is_empty() { "off" } else { "always" }).into(),
+    );
+
+    validate_sequence_bound(root, "proxies", MAX_PROXIES)?;
+    validate_sequence_bound(root, "proxy-groups", MAX_GROUPS)?;
+    validate_sequence_bound(root, "rules", MAX_RULES)?;
+
+    if let Some(proxies) = root.get("proxies").and_then(Value::as_sequence) {
+        for proxy in proxies {
+            let map = proxy.as_mapping().context("proxy entry must be a mapping")?;
+            let name = map
+                .get("name")
+                .and_then(Value::as_str)
+                .context("proxy entry must have a string name")?;
+            if !is_safe_rule_token(name) {
+                bail!("proxy entry has an unsafe name");
+            }
+            if map.get("type").and_then(Value::as_str) == Some("ssh") {
+                bail!("SSH proxies are not allowed in full profiles (local key-file access)");
+            }
+        }
+    }
+    if let Some(groups) = root
+        .get_mut("proxy-groups")
+        .and_then(Value::as_sequence_mut)
+    {
+        for group in groups {
+            let map = group
+                .as_mapping_mut()
+                .context("proxy-group entry must be a mapping")?;
+            let name = map
+                .get("name")
+                .and_then(Value::as_str)
+                .context("proxy-group must have a string name")?;
+            if !is_safe_rule_token(name) {
+                bail!("proxy-group has an unsafe name");
+            }
+            if map.contains_key("url") {
+                map.insert("url".into(), APP_HEALTH_PROBE_URL.into());
+            }
+        }
+    }
+    if let Some(rules) = root.get("rules").and_then(Value::as_sequence) {
+        for rule in rules {
+            let text = rule.as_str().context("rules entries must be strings")?;
+            if text.len() > 4096 || text.contains('\r') || text.contains('\n') {
+                bail!("unsafe/oversized rule entry");
+            }
+            let kind = text.split(',').next().unwrap_or("").trim();
+            if kind.eq_ignore_ascii_case("SCRIPT") {
+                bail!("SCRIPT rules are not allowed");
+            }
+        }
+    }
+
+    sanitize_providers(root, "proxy-providers", "proxy")?;
+    sanitize_providers(root, "rule-providers", "rule")?;
+
+    // Provider-selected DNS endpoints can probe local services or bypass the
+    // user's routing policy. Rebuild the resolver from validated app/profile
+    // settings and keep it internal (no privileged listener).
+    let mut dns = build_dns(
+        patch.anti_dpi,
+        patch.routing_profile,
+        patch.ipv6,
+        patch.custom_dns,
+    );
+    dns.remove(yaml_key("listen"));
+    root.insert("dns".into(), Value::Mapping(dns));
+
+    // Untrusted route include/exclude and adapter options can bypass the
+    // user's routing policy.  Rebuild TUN solely from trusted app settings.
+    root.remove(yaml_key("tun"));
+    if patch.use_builtin_tun {
+        root.insert(
+            "tun".into(),
+            Value::Mapping(builtin_tun_mapping(patch.tun_device)),
+        );
+    } else {
+        let mut disabled_tun = Mapping::new();
+        disabled_tun.insert("enable".into(), false.into());
+        root.insert("tun".into(), Value::Mapping(disabled_tun));
+    }
+
+    // Never persist provider-selected controller/UI cache behavior.
+    root.insert(
+        "profile".into(),
+        Value::Mapping({
+            let mut profile = Mapping::new();
+            profile.insert("store-selected".into(), true.into());
+            profile.insert("store-fake-ip".into(), true.into());
+            profile
+        }),
+    );
+    root.insert("sniffer".into(), Value::Mapping(build_sniffer()));
+    Ok(())
 }
 
 /// 8.F: применяет patch к полному mihomo-YAML из подписки и возвращает
@@ -1271,11 +1612,26 @@ pub struct FullYamlPatch<'a> {
 /// `tun.exclude-address`, `tun.stack`, `tun.auto-route`,
 /// `nameserver-policy`, `fake-ip-filter` и т.д.
 pub fn patch_full_yaml(raw_yaml: &str, patch: &FullYamlPatch) -> Result<MihomoConfig> {
+    if raw_yaml.len() > MAX_FULL_YAML_BYTES {
+        bail!("full mihomo YAML is too large");
+    }
+    if let Some(profile) = patch.routing_profile {
+        profile.validate().context("invalid routing profile at config sink")?;
+    }
+    validate_runtime_inputs(
+        patch.app_rules,
+        patch.anti_dpi,
+        patch.custom_dns,
+        patch.use_builtin_tun,
+        patch.tun_device,
+    )?;
     let mut value: Value = serde_yaml::from_str(raw_yaml)
         .context("не удалось распарсить full mihomo YAML")?;
+    reject_tagged_yaml(&value)?;
     let root = value
         .as_mapping_mut()
         .context("YAML root — не mapping")?;
+    sanitize_full_profile(root, patch)?;
 
     // ── inbound: единственный mixed-port на нашем порту ───────────────
     root.insert(
@@ -1365,8 +1721,8 @@ pub fn patch_full_yaml(raw_yaml: &str, patch: &FullYamlPatch) -> Result<MihomoCo
             // явно выключил).
             tun.entry(Value::String("strict-route".into()))
                 .or_insert_with(|| true.into());
-            // 12.E: перезаписываем имя адаптера на замаскированное, если
-            // включена маскировка. Иначе сохраняем провайдерское / default.
+            // Provider device is always replaced with the fork's unique
+            // ownership marker before privileged launch.
             if let Some(dev) = patch.tun_device {
                 tun.insert("device".into(), dev.into());
             }
@@ -1391,9 +1747,10 @@ pub fn patch_full_yaml(raw_yaml: &str, patch: &FullYamlPatch) -> Result<MihomoCo
     }
 
     // ── Префиксные правила (наш приоритет) ────────────────────────────
+    let proxy_target = detect_proxy_target(root);
     let mut prefix_rules: Vec<Value> = Vec::new();
     for r in patch.app_rules {
-        if let Some(rule) = app_rule_to_mihomo(r) {
+        if let Some(rule) = app_rule_to_mihomo(r, &proxy_target) {
             prefix_rules.push(Value::String(rule));
         }
     }
@@ -1405,7 +1762,6 @@ pub fn patch_full_yaml(raw_yaml: &str, patch: &FullYamlPatch) -> Result<MihomoCo
     // proxy-target — провайдерская группа (detect_proxy_target), иначе
     // mihomo отбросил бы правило на несуществующий outbound.
     if let Some(p) = patch.routing_profile {
-        let proxy_target = detect_proxy_target(root);
         for r in mihomo_rules_from_profile(p, &proxy_target) {
             prefix_rules.push(Value::String(r));
         }
@@ -1537,6 +1893,9 @@ pub fn patch_full_yaml(raw_yaml: &str, patch: &FullYamlPatch) -> Result<MihomoCo
 
     let yaml = serde_yaml::to_string(&value)
         .context("сериализация патченного YAML")?;
+    if yaml.len() > MAX_FULL_YAML_BYTES {
+        bail!("patched mihomo YAML is too large");
+    }
     Ok(MihomoConfig {
         yaml,
         mixed_port: patch.mixed_port,
@@ -1587,8 +1946,8 @@ proxy-groups:
         assert!(!m.contains_key("redir-port"), "redir-port должен быть удалён");
     }
 
-    /// 8.F: tun.enable → false; остальные поля tun секции (stack,
-    /// exclude-address) сохраняются для будущего 13.L.
+    /// Untrusted TUN routing surface is discarded; only enable=false remains
+    /// when the app did not request trusted built-in TUN mode.
     #[test]
     fn patch_disables_tun_keeping_other_fields() {
         let yaml = r#"
@@ -1608,8 +1967,9 @@ proxy-groups:
         let v: Value = serde_yaml::from_str(&cfg.yaml).unwrap();
         let tun = v.as_mapping().unwrap()["tun"].as_mapping().unwrap();
         assert_eq!(tun["enable"].as_bool(), Some(false));
-        assert_eq!(tun["stack"].as_str(), Some("mixed"));
-        assert!(tun.contains_key("exclude-address"));
+        assert_eq!(tun.len(), 1);
+        assert!(!tun.contains_key("stack"));
+        assert!(!tun.contains_key("exclude-address"));
     }
 
     /// 8.F: app_rules (PROCESS-NAME) попадают в начало rules списка —
@@ -1646,6 +2006,33 @@ rules:
             "первая rule должна быть наша app-rule"
         );
         assert_eq!(rules.last().unwrap().as_str(), Some("MATCH,select"));
+    }
+
+    #[test]
+    fn full_profile_app_proxy_rule_targets_provider_group() {
+        let yaml = r#"
+proxies: []
+proxy-groups:
+  - name: provider-main
+    type: select
+    proxies: []
+rules:
+  - MATCH,provider-main
+"#;
+        let rules_owned = vec![AppRule {
+            exe: "browser.exe".into(),
+            action: "proxy".into(),
+            comment: None,
+        }];
+        let mut patch = base_patch();
+        patch.app_rules = &rules_owned;
+        let cfg = patch_full_yaml(yaml, &patch).unwrap();
+        let value: Value = serde_yaml::from_str(&cfg.yaml).unwrap();
+        let rules = value.as_mapping().unwrap()["rules"].as_sequence().unwrap();
+        assert_eq!(
+            rules[0].as_str(),
+            Some("PROCESS-NAME,browser.exe,provider-main")
+        );
     }
 
     /// 8.F: external-controller перезаписывается нашим (для mihomo_api).
@@ -1971,7 +2358,7 @@ proxies: []
 proxy-groups:
   - name: auto
     type: url-test
-    url: http://www.gstatic.com/generate_204
+    url: http://legacy-provider.example/generate_204
     interval: 300
     proxies: [a, b, c]
 rules:
@@ -1984,6 +2371,7 @@ rules:
         assert_eq!(g["type"].as_str(), Some("url-test"));
         assert_eq!(g["interval"].as_u64(), Some(300));
         assert_eq!(g["proxies"].as_sequence().unwrap().len(), 3);
+        assert_eq!(g["url"].as_str(), Some(APP_HEALTH_PROBE_URL));
     }
 
     /// #2: ECH из URI-параметра `ech` → ech-opts {enable, config}.
@@ -2027,11 +2415,11 @@ rules:
             comment: None,
         };
         assert_eq!(
-            app_rule_to_mihomo(&by_name).unwrap(),
+            app_rule_to_mihomo(&by_name, "PROXY").unwrap(),
             "PROCESS-NAME,telegram.exe,PROXY"
         );
         assert_eq!(
-            app_rule_to_mihomo(&by_path).unwrap(),
+            app_rule_to_mihomo(&by_path, "PROXY").unwrap(),
             r"PROCESS-PATH,C:\Program Files\App\app.exe,DIRECT"
         );
     }
@@ -2066,11 +2454,9 @@ rules:
         let dns = m["dns"].as_mapping().unwrap();
         assert_eq!(dns["ipv6"].as_bool(), Some(true));
         assert_eq!(dns["nameserver"][0].as_str(), Some("8.8.4.4"));
-        // policy провайдера сохранена.
-        assert!(dns
-            .get(Value::String("nameserver-policy".into()))
-            .and_then(|v| v.as_mapping())
-            .is_some_and(|p| p.contains_key(Value::String("geosite:ru".into()))));
+        // Provider-selected DNS policy/endpoints are removed; validated app
+        // settings are the only network DNS source.
+        assert!(!dns.contains_key(Value::String("nameserver-policy".into())));
     }
 
     /// 11.F: detect_proxy_target — приоритет MATCH > первая группа > GLOBAL.
@@ -2078,7 +2464,7 @@ rules:
     fn detect_proxy_target_priority() {
         // 1. из MATCH
         let m: Mapping = serde_yaml::from_str(
-            "rules:\n  - MATCH,my-group\nproxy-groups:\n  - name: other\n",
+            "rules:\n  - MATCH,my-group\nproxy-groups:\n  - name: my-group\n  - name: other\n",
         )
         .unwrap();
         assert_eq!(detect_proxy_target(&m), "my-group");
@@ -2173,18 +2559,19 @@ rules:
 "#;
         let cfg = patch_full_yaml(yaml, &base_patch())
             .expect("реальная подписка должна патчиться");
-        // log-level: info в подписке — сохраняется как есть. Только
-        // silent/missing мы форсим в warning.
+        // Provider debug/info logging can expose traffic metadata.
         assert!(
-            cfg.yaml.contains("log-level: info"),
-            "log-level=info из подписки должен сохраниться"
+            cfg.yaml.contains("log-level: warning"),
+            "log-level должен быть ограничен приложением"
         );
         // tun.enable должно быть false — наш tun2socks pipeline активный
         assert!(cfg.yaml.contains("enable: false"));
-        // rule-providers должны сохраниться целиком
+        // Provider graph is preserved, but attacker-selected cache paths are
+        // replaced with app-owned hashed relative paths.
         assert!(cfg.yaml.contains("geosite-ru"));
         assert!(cfg.yaml.contains("geoip-ru"));
-        assert!(cfg.yaml.contains("category-ru.mrs"));
+        assert!(cfg.yaml.contains("providers/rule/"));
+        assert!(!cfg.yaml.contains("./geosite-ru.mrs"));
         // rules в исходном порядке (мы только префиксы добавляем)
         let pos_iprule = cfg.yaml.find("3.68.63.139").expect("ip-cidr rule");
         let pos_match = cfg.yaml.find("MATCH,ariyvpn").expect("match rule");
@@ -2217,6 +2604,7 @@ tun:
 "#;
         let mut p = base_patch();
         p.use_builtin_tun = true;
+        p.tun_device = Some("kwikproxy-secure-keep-enabled");
         let cfg = patch_full_yaml(yaml, &p).expect("patch ok");
         let v: Value = serde_yaml::from_str(&cfg.yaml).unwrap();
         let tun = v.as_mapping().unwrap()["tun"].as_mapping().unwrap();
@@ -2242,6 +2630,7 @@ proxy-groups:
 "#;
         let mut p = base_patch();
         p.use_builtin_tun = true;
+        p.tun_device = Some("kwikproxy-secure-synthesized");
         let cfg = patch_full_yaml(yaml, &p).expect("patch ok");
         let v: Value = serde_yaml::from_str(&cfg.yaml).unwrap();
         let tun = v.as_mapping().unwrap()["tun"].as_mapping().unwrap();
@@ -2250,49 +2639,147 @@ proxy-groups:
         assert_eq!(tun["auto-route"], Value::Bool(true));
         // Синтезированный tun должен hijack'ить DNS (защита от leak).
         assert!(tun.contains_key("dns-hijack"));
-        // Без маскировки device не задаётся (mihomo default).
-        assert!(!tun.contains_key("device"));
+        assert_eq!(
+            tun["device"].as_str(),
+            Some("kwikproxy-secure-synthesized")
+        );
     }
 
-    /// 12.E: синтезированный tun-блок берёт замаскированное имя адаптера
-    /// из `tun_device`, перезаписывая (тут — задавая) `tun.device`.
+    /// Синтезированный tun-блок использует app-owned имя адаптера.
     #[test]
-    fn patch_synthesized_tun_uses_masked_device() {
+    fn patch_synthesized_tun_uses_owned_device() {
         let yaml = "proxies: []\n";
         let mut p = base_patch();
         p.use_builtin_tun = true;
-        p.tun_device = Some("wlan137");
+        p.tun_device = Some("kwikproxy-secure-owned-a");
         let cfg = patch_full_yaml(yaml, &p).expect("patch ok");
         let v: Value = serde_yaml::from_str(&cfg.yaml).unwrap();
         let tun = v.as_mapping().unwrap()["tun"].as_mapping().unwrap();
-        assert_eq!(tun["device"].as_str(), Some("wlan137"));
+        assert_eq!(tun["device"].as_str(), Some("kwikproxy-secure-owned-a"));
     }
 
-    /// 12.E: для подписки с уже существующей tun-секцией маскировка
-    /// перезаписывает провайдерский `device`.
+    /// Для существующей tun-секции app-owned имя перезаписывает provider.
     #[test]
-    fn patch_existing_tun_overrides_device_when_masking() {
+    fn patch_existing_tun_overrides_provider_device() {
         let yaml = "proxies: []\ntun:\n  enable: false\n  device: Meta\n";
         let mut p = base_patch();
         p.use_builtin_tun = true;
-        p.tun_device = Some("Ethernet 9");
+        p.tun_device = Some("kwikproxy-secure-owned-b");
         let cfg = patch_full_yaml(yaml, &p).expect("patch ok");
         let v: Value = serde_yaml::from_str(&cfg.yaml).unwrap();
         let tun = v.as_mapping().unwrap()["tun"].as_mapping().unwrap();
-        assert_eq!(tun["device"].as_str(), Some("Ethernet 9"));
+        assert_eq!(tun["device"].as_str(), Some("kwikproxy-secure-owned-b"));
         assert_eq!(tun["enable"], Value::Bool(true));
     }
 
-    /// 12.E: имя адаптера из одного из ожидаемых наборов и непустое.
     #[test]
-    fn masked_tun_name_is_plausible() {
-        let n = masked_tun_name();
-        assert!(!n.is_empty());
-        assert!(
-            n.starts_with("wlan")
-                || n.starts_with("Local Area Connection ")
-                || n.starts_with("Ethernet "),
-            "неожиданное имя: {n}"
-        );
+    fn builtin_tun_rejects_unowned_or_missing_device_names() {
+        let yaml = "proxies: []\n";
+        let mut patch = base_patch();
+        patch.use_builtin_tun = true;
+        assert!(patch_full_yaml(yaml, &patch).is_err());
+        patch.tun_device = Some("Ethernet 9");
+        assert!(patch_full_yaml(yaml, &patch).is_err());
+    }
+
+    #[test]
+    fn sanitizer_rebuilds_provider_dns_from_trusted_defaults() {
+        let yaml = r#"
+dns:
+  enable: true
+  listen: 0.0.0.0:53
+  nameserver: [https://127.0.0.1/admin]
+  nameserver-policy:
+    '+.example.com': [tls://localhost:853]
+proxies: []
+"#;
+        let config = patch_full_yaml(yaml, &base_patch()).unwrap();
+        let value: Value = serde_yaml::from_str(&config.yaml).unwrap();
+        let dns = value.as_mapping().unwrap()["dns"].as_mapping().unwrap();
+        assert!(!dns.contains_key("listen"));
+        assert!(!dns.contains_key("nameserver-policy"));
+        assert!(dns["nameserver"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .all(|server| !server.as_str().unwrap_or("").contains("127.0.0.1")));
+    }
+
+    #[test]
+    fn sanitizer_removes_privileged_control_surfaces() {
+        let yaml = r#"
+listeners:
+  - {name: evil, type: tun, port: 1}
+ss-config: C:\\Users\\Public\\shadow-socks-server.yaml
+vmess-config: C:\\Users\\Public\\vmess-server.yaml
+tuic-server:
+  enable: true
+  listen: 0.0.0.0:443
+script: {code: "danger"}
+external-ui: C:\\Users\\Public\\ui
+external-ui-url: https://attacker.example/ui.zip
+external-controller-pipe: \\.\\pipe\\attacker
+geox-url: {geoip: https://attacker.example/geo.dat}
+geo-auto-update: true
+dns:
+  enable: true
+  listen: 0.0.0.0:53
+proxies: []
+rules: ['MATCH,DIRECT']
+"#;
+        let cfg = patch_full_yaml(yaml, &base_patch()).expect("sanitized");
+        let root: Value = serde_yaml::from_str(&cfg.yaml).unwrap();
+        let root = root.as_mapping().unwrap();
+        for key in [
+            "listeners",
+            "ss-config",
+            "vmess-config",
+            "tuic-server",
+            "script",
+            "external-ui",
+            "external-ui-url",
+            "external-controller-pipe",
+            "geox-url",
+        ] {
+            assert!(!root.contains_key(key), "{key} must be removed");
+        }
+        assert_eq!(root["geo-auto-update"].as_bool(), Some(false));
+        assert!(!root["dns"].as_mapping().unwrap().contains_key("listen"));
+    }
+
+    #[test]
+    fn sanitizer_rejects_file_and_local_providers() {
+        let file_provider = r#"
+proxy-providers:
+  nodes:
+    type: file
+    path: C:\\Windows\\win.ini
+proxies: []
+rules: ['MATCH,DIRECT']
+"#;
+        assert!(patch_full_yaml(file_provider, &base_patch()).is_err());
+
+        let local_provider = r#"
+rule-providers:
+  local:
+    type: http
+    url: https://127.0.0.1/admin
+proxies: []
+rules: ['MATCH,DIRECT']
+"#;
+        assert!(patch_full_yaml(local_provider, &base_patch()).is_err());
+    }
+
+    #[test]
+    fn invalid_app_rule_cannot_inject_rule_fields() {
+        let yaml = "proxies: []\nrules: ['MATCH,DIRECT']\n";
+        let mut patch = base_patch();
+        let rules = vec![AppRule {
+            exe: "good.exe,DIRECT\nPROCESS-NAME,evil.exe".into(),
+            action: "proxy".into(),
+            comment: None,
+        }];
+        patch.app_rules = &rules;
+        assert!(patch_full_yaml(yaml, &patch).is_err());
     }
 }

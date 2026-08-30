@@ -1,138 +1,30 @@
-name: Release
-# 14.I — на push tag вида `v*.*.*` собираем NSIS installer + latest.json,
-# публикуем как GitHub Release. Использует tauri-action который сам:
-#   - пакует tauri build (вызывая beforeBuildCommand из tauri.conf.json)
-#   - подписывает NSIS .exe ed25519 ключом (TAURI_SIGNING_PRIVATE_KEY)
-#   - генерирует latest.json с ссылкой на signed installer
-#   - аплоадит NSIS + latest.json как assets в GitHub Release
+name: Release (disabled pending security sign-off)
+
+# Fail-closed release placeholder for the security fork.
 #
-# Pre-requirements (одноразово, ручками):
-#   1. GitHub Settings → Secrets and variables → Actions → New repository secret:
-#      - TAURI_SIGNING_PRIVATE_KEY = содержимое ~/.tauri/kwik.key
-#      - TAURI_SIGNING_PRIVATE_KEY_PASSWORD = пустая строка (ключ без пароля)
-#   2. tauri.conf.json должен содержать `plugins.updater.pubkey` (уже добавлен).
+# The upstream workflow automatically installed JavaScript dependencies, published unsigned Windows
+# installers on every version tag, and emitted updater metadata trusted by the
+# upstream application key. This fork must not download/execute npm packages or
+# publish installers until all of the following are reviewed explicitly:
+#   * the exact frontend dependency lock and lifecycle scripts;
+#   * the protected per-machine helper installation path and hostile IPC tests;
+#   * an independent Authenticode identity for every Windows executable;
+#   * a new Tauri updater key and fork-owned immutable release endpoint;
+#   * pinned action commit SHAs and artifact provenance/attestations.
 #
-# Использование:
-#   git tag v0.1.4 && git push origin v0.1.4
-#
-# CI запустится автоматически, через ~10-15 мин будет release с NSIS-installer'ом.
+# There is intentionally no push/tag trigger and no checkout/build action here.
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
-
-  # Manual trigger для тестов (без публикации, только проверка что собирается)
   workflow_dispatch:
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
-  release:
-    runs-on: windows-latest
-
+  release-disabled:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          # tauri-action для release notes генерит CHANGELOG из git log от
-          # предыдущего тега — нужна вся история.
-          fetch-depth: 0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-
-      - name: Install npm dependencies
-        run: npm ci
-
-      # Генерируем CHANGELOG из git log с предыдущего tag'а. Списком
-      # включается в releaseBody — пользователи видят что нового прямо
-      # на странице release'а и в auto-updater'е (он показывает
-      # release notes в модалке).
-      - name: Generate changelog
-        id: changelog
+      - name: Explain the security gate
         shell: bash
         run: |
-          set -e
-          # Предыдущий tag (если есть) — обрезаем сам тег HEAD, ищем ближайший.
-          PREV=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          if [ -n "$PREV" ]; then
-            echo "Previous tag: $PREV"
-            LOG=$(git log --pretty=format:'- %s' "$PREV..HEAD" --no-merges)
-          else
-            echo "No previous tag — using last 20 commits"
-            LOG=$(git log --pretty=format:'- %s' -20 --no-merges)
-          fi
-          # Многострочный output для GitHub Actions.
-          {
-            echo 'CHANGELOG<<CHANGELOG_EOF'
-            echo "$LOG"
-            echo 'CHANGELOG_EOF'
-          } >> "$GITHUB_OUTPUT"
-
-      # prepare-bundle.mjs: собирает helper.exe в release + копирует с
-      # triplet-суффиксом в src-tauri/binaries/. Без этого tauri-build
-      # упадёт на отсутствии externalBin kwik-helper.
-      - name: Prepare helper binary
-        run: npm run prepare-bundle
-
-      # tauri-action: вызывает `tauri build`, подписывает результат
-      # signing-ключом из env, генерит latest.json и публикует в Release.
-      - name: Build NSIS + create GitHub Release
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          # Работает только на push tag-event'е. На workflow_dispatch
-          # tagName=null → tauri-action всё равно соберёт но не создаст
-          # release (нет тега). Это удобно для проверки что workflow
-          # не сломан.
-          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
-          releaseName: "Kwik __VERSION__"
-          releaseBody: |
-            ## Что нового
-
-            ${{ steps.changelog.outputs.CHANGELOG }}
-
-            ## Установка
-
-            Скачай `Kwik_VERSION_x64-setup.exe` ниже, запусти, дальше installer всё сделает сам.
-
-            **SmartScreen warning** — нормально, мы пока без code-signing сертификата.
-            Жми «More info» → «Run anyway».
-
-            ## Auto-update
-
-            Начиная с **0.1.3+** установленный клиент сам найдёт новую версию через 6-часовую
-            проверку и предложит обновиться. Подпись проверяется через Tauri ed25519 (защита от
-            man-in-the-middle подмены NSIS-installer'а).
-          releaseDraft: false
-          # prerelease: false — релизы помечаются как Latest, что
-          # критично для auto-updater'а: endpoint
-          # `releases/latest/download/latest.json` редиректит ТОЛЬКО на
-          # non-prerelease. Если хочется тестовый канал — для тегов
-          # `v*-beta.*` / `v*-rc.*` будет отдельный workflow с prerelease.
-          prerelease: false
-          # Это и есть основная фича 14.I — генерация подписанного latest.json.
-          includeUpdaterJson: true
-          # Не передаём --target: prepare-bundle.mjs копирует helper.exe в
-          # target/release/ (без target-suffix), а тауриный bundler с
-          # --target ищет в target/<triplet>/release/. Убрав флаг,
-          # выравниваем CI и локальную сборку (юзер так же делает
-          # `npm run tauri:bundle` без target).
+          echo "Release publishing is disabled pending security sign-off."
+          echo "No npm dependencies were installed or executed."

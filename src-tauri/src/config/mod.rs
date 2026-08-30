@@ -8,6 +8,7 @@ pub mod routing_profile;
 pub mod routing_store;
 pub mod server;
 pub mod subscription;
+pub mod subscription_cache;
 
 pub use hwid::HwidState;
 pub use server::ProxyEntry;

@@ -205,12 +205,17 @@
     "subscriptionDuplicate": {
       "title": "subscription already added",
       "message": "this URL is already in the list"
+    },
+    "routingDirectivePending": {
+      "title": "routing suggestion needs approval",
+      "message": "the subscription suggested routing changes; nothing was downloaded, installed, or activated automatically"
     }
   },
   "backup": {
     "parseError": "could not parse JSON: {{error}}",
     "expectedJson": "expected a JSON object",
     "unsupportedSchema": "unsupported schema_version: {{version}}",
+    "tooLarge": "backup is larger than the {{maxMiB}} MiB limit",
     "fieldLabels": {
       "subscriptionUrl": "subscription URL",
       "appRules": "app rules"
@@ -220,6 +225,7 @@
       "off": "off",
       "empty": "empty",
       "dash": "—",
+      "secretPresent": "secret present (value hidden)",
       "itemsCount_one": "{{count}} item",
       "itemsCount_other": "{{count}} items"
     }
@@ -236,6 +242,14 @@
     "importSettings": {
       "title": "import-settings",
       "notBase64OrJson": "not base64 and not JSON"
+    },
+    "pending": {
+      "title": "confirmation required",
+      "subscription": "the HTTPS subscription URL was placed in the app; review it and start import manually",
+      "vpnAction": "deep-links cannot connect or disconnect the VPN; use the app controls",
+      "export": "deep-links cannot export settings; start export from Settings",
+      "remoteImport": "deep-links cannot download settings; paste the URL in Settings to review it",
+      "routing": "deep-links cannot install or activate routing profiles; import it manually in Settings"
     },
     "routing": {
       "title": "routing deep-link",
@@ -294,7 +308,7 @@
       },
       "tunnel": {
         "title": "Tunnel",
-        "desc": "LAN, TUN name masking"
+        "desc": "LAN, safe TUN ownership, strict mode"
       },
       "security": {
         "title": "Anti-DPI & protection",
@@ -337,11 +351,11 @@
     },
     "hwid": {
       "title": "device hwid",
-      "hint": "windows machineguid · sent automatically with every subscription request",
+      "hint": "random per-subscription pseudonym · never Windows MachineGuid · sent only when x-hwid is explicitly enabled",
       "override": "override hwid",
-      "overrideActive": "override active — the app sends «{{value}}…» instead of the system hwid",
+      "overrideActive": "override active — the app sends «{{value}}…» instead of the per-subscription pseudonym",
       "resetOverride": "reset",
-      "placeholder": "leave blank to use the system hwid"
+      "placeholder": "leave blank to use the per-subscription pseudonym"
     },
     "connection": {
       "onStart": {
@@ -413,8 +427,8 @@
         "placeholder": "https://dns.google/dns-query, 1.1.1.1"
       },
       "tunMasking": {
-        "label": "TUN name masking",
-        "hint": "the adapter is named like a regular network interface (wlan99 / Local Area Connection / Ethernet). protects against spy apps that detect VPN by adapter name via GetAdaptersAddresses"
+        "label": "safe TUN ownership marker",
+        "hint": "the adapter uses a unique KwikProxy Secure prefix so recovery and cleanup never touch another VPN's adapter"
       },
       "tunOnlyStrict": {
         "label": "TUN-only mode (strict)",
@@ -611,7 +625,11 @@
     },
     "backup": {
       "title": "settings backup",
-      "intro": "exports all settings + subscription URL into a JSON file (HWID and other machine-specific data are excluded). on import a preview of changes is shown first.",
+      "intro": "exports settings to a JSON file. subscription URL/token, HWID and other machine-specific data are excluded by default. on import a preview of changes is shown first.",
+      "includeSecretLabel": "include subscription URL/token",
+      "includeSecretHint": "off by default; enable only for a backup you will protect like a password",
+      "includeSecretWarning": "warning: the exported file will contain a credential that may grant access to your subscription. anyone who gets the file may be able to use it.",
+      "includeSecretConfirm": "Include the subscription URL/token in this backup? The file will contain a secret. Store and share it like a password.",
       "export": "export to file",
       "import": "import from file"
     },
@@ -622,7 +640,7 @@
     },
     "urlSchemes": {
       "title": "url schemes",
-      "intro": "the app responds to links with the kwik:// prefix. a bot can send such links to add a subscription or toggle the tunnel automatically.",
+      "intro": "the app recognizes kwikproxy-secure:// links, but never imports subscriptions or changes VPN state without an explicit in-app action.",
       "add": "add subscription (URL must be encoded)",
       "connect": "connect the selected server",
       "disconnect": "stop the tunnel",
@@ -678,7 +696,7 @@
       "findings": {
         "proxy": "system proxy is pointing to us",
         "backup": "a backup of the original proxy settings is saved",
-        "tun": "tun adapter `kwik-*` is in the system",
+        "tun": "tun adapter `kwikproxy-secure-*` is in the system",
         "wfp": "kill switch wfp filters survived from the previous session"
       }
     },
@@ -693,6 +711,7 @@
       "appliedTitle": "settings applied",
       "appliedMessage_one": "{{count}} change",
       "appliedMessage_other": "{{count}} changes",
+      "subscriptionSecretWarning": "this backup contains a subscription URL/token. applying it will replace the current subscription credential.",
       "subscriptionUpdatedSuffix": "\nsubscription URL updated — press ↻ to reload servers",
       "applyFailedTitle": "failed to apply"
     },

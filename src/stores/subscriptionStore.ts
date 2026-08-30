@@ -111,6 +111,12 @@ type FetchSubscriptionRaw = {
   meta: SubscriptionMetaRaw | null;
 };
 
+export type SubscriptionRuntimeReceipt = {
+  sessionEpoch: string;
+  primaryId: string;
+  generation: number;
+};
+
 /** 0.3.0 (multi-subscription): описание одной подписки. До 0.3.0 был
  *  один URL/HWID/meta в singleton-полях; теперь — массив `subscriptions`,
  *  каждая со своими данными. Legacy-поля (url/hwid/meta/...) остаются для
@@ -153,15 +159,17 @@ type SubscriptionStore = {
    *  становится primary. Чистит keyring entries и связанные servers. */
   removeSubscription: (id: string) => Promise<void>;
   /** Назначить primary (обычно UI-переключатель в Welcome / Settings). */
-  setPrimaryId: (id: string) => void;
+  setPrimaryId: (id: string) => Promise<boolean>;
+  /** Publish and verify the exact current primary snapshot before connect. */
+  ensurePrimaryRuntimeReady: () => Promise<SubscriptionRuntimeReceipt | null>;
   /** Set engineOverride для подписки (через ⋯ меню → radio выбор). */
   setEngineOverride: (id: string, engine: Engine | null) => void;
   /** Получить effective engine для подписки. Mihomo-only — всегда "mihomo". */
   getEffectiveEngine: (id: string) => Engine;
   /** Fetch конкретной подписки. Если эта подписка primary, синхронизирует
-   *  legacy state.servers/meta для backward compat. Если не primary —
-   *  обновляет только sub.servers/meta. Internally делает swap+restore
-   *  primary, чтобы Rust state в момент connect содержал нужные servers. */
+    *  legacy state.servers/meta для backward compat. Если не primary —
+    *  обновляет только sub.servers/meta. Rust runtime принимает только
+    *  generation-guarded snapshot актуальной primary подписки. */
   fetchSubscriptionById: (id: string) => Promise<void>;
   /** Пинги серверов конкретной подписки. */
   pingAllOf: (id: string) => Promise<void>;
@@ -180,16 +188,15 @@ type SubscriptionStore = {
   loading: boolean;
   error: string | null;
   url: string;
-  /** HWID устройства (читается из Windows MachineGuid). Auto, read-only. */
+  /** Origin-scoped subscription pseudonym. Auto, read-only, never MachineGuid. */
   deviceHwid: string;
   /** Опциональный override HWID для разработки / переноса с другого клиента. */
   hwid: string;
   setUrl: (url: string) => void;
   setHwid: (hwid: string) => void;
   loadDeviceHwid: () => Promise<void>;
-  /** Прочитать URL/HWID из Windows Credential Manager. При первом запуске
-   *  мигрирует значения из localStorage → keyring и удаляет их из
-   *  localStorage. См. этап 6.A. */
+  /** Прочитать URL/HWID из Windows Credential Manager и current-user DPAPI
+    *  cache серверов. Raw credentials/YAML не читаются из localStorage. */
   loadSecureCreds: () => Promise<void>;
   fetchSubscription: () => Promise<void>;
   loadCached: () => Promise<void>;
@@ -236,22 +243,56 @@ const normalizeMeta = (
       }
     : null;
 
+const serializeMeta = (
+  meta: SubscriptionMeta | null
+): SubscriptionMetaRaw | null =>
+  meta
+    ? {
+        used: meta.used,
+        total: meta.total,
+        expire_at: meta.expireAt,
+        title: meta.title,
+        web_page_url: meta.webPageUrl,
+        support_url: meta.supportUrl,
+        update_interval_hours: meta.updateIntervalHours,
+        announce: meta.announce,
+        announce_url: meta.announceUrl,
+        premium_url: meta.premiumUrl,
+        theme: meta.theme,
+        mode: meta.mode,
+        engine: meta.engine,
+        fragmentation_enable: meta.fragmentationEnable,
+        fragmentation_packets: meta.fragmentationPackets,
+        fragmentation_length: meta.fragmentationLength,
+        fragmentation_interval: meta.fragmentationInterval,
+        noises_enable: meta.noisesEnable,
+        noises_type: meta.noisesType,
+        noises_packet: meta.noisesPacket,
+        noises_delay: meta.noisesDelay,
+        server_resolve_enable: meta.serverResolveEnable,
+        server_resolve_doh: meta.serverResolveDoH,
+        server_resolve_bootstrap: meta.serverResolveBootstrap,
+        routing_autorouting: meta.routingAutorouting,
+        routing_static: meta.routingStatic,
+      }
+    : null;
+
 /** Ключи в Windows Credential Manager (этап 6.A). Чувствительные данные
  *  переехали из localStorage в защищённое хранилище ОС. localStorage
  *  ключи остаются как fallback на время миграции. */
 const URL_KEYRING = "subscription_url";
 const HWID_KEYRING = "hwid_override";
 
-const URL_KEY = "kwik.subscription.url";
-const LAST_FETCH_KEY = "kwik.subscription.lastFetchedAt";
-const KEYRING_MIGRATION_KEY = "kwik.migrated.keyring.v1";
+const URL_KEY = "kwikproxy-secure.subscription.url";
+const LAST_FETCH_KEY = "kwikproxy-secure.subscription.lastFetchedAt";
+const KEYRING_MIGRATION_KEY = "kwikproxy-secure.migrated.keyring.v1";
 // Версионируем ключ override-HWID: при апгрейде клиента старое значение
 // (когда мы вручную подсовывали Happ-овский HWID для отладки) автоматически
 // перестаёт читаться. Override — теперь advanced-only, по умолчанию используется
-// системный MachineGuid через get_hwid.
-const HWID_KEY = "kwik.subscription.hwid.v2";
-const HWID_KEY_LEGACY = "kwik.subscription.hwid";
-const MIGRATION_KEY = "kwik.migrated.v2";
+// origin-scoped pseudonym через get_hwid.
+const HWID_KEY = "kwikproxy-secure.subscription.hwid.v2";
+const HWID_KEY_LEGACY = "kwikproxy-secure.subscription.hwid";
+const MIGRATION_KEY = "kwikproxy-secure.migrated.v2";
 
 const loadFromStorage = (key: string): string => {
   try {
@@ -329,7 +370,7 @@ const loadTimestamp = (key: string): number | null => {
  *  Windows Credential Manager под ключами `subscription_url:${id}` и
  *  `hwid_override:${id}`. На init читаем этот список → подгружаем по
  *  каждому id креды из keyring. */
-const SUBS_INDEX_KEY = "kwik.subscriptions.index.v1";
+const SUBS_INDEX_KEY = "kwikproxy-secure.subscriptions.index.v1";
 
 const loadSubsIndex = (): string[] => {
   try {
@@ -350,98 +391,151 @@ const saveSubsIndex = (ids: string[]) => {
   }
 };
 
-/** localStorage key для кеша серверов всех подписок. `SubscriptionState`
- *  в Rust живёт только в памяти и теряется на рестарте; без этого кеша
- *  после перезапуска список серверов пуст и юзеру приходится вручную
- *  жать «загрузить» (баг 0.3.5). Кешируем servers+meta по subId; на старте
- *  гидрируем UI мгновенно и заливаем серверы primary обратно в Rust через
- *  `set_servers` — чтобы connect работал без обязательного сетевого fetch'а. */
-const SERVERS_CACHE_KEY = "kwik.servers.cache.v1";
+/** Legacy fork-local plaintext cache key. Raw server credentials are never
+ * written here; loadSecureCreds removes it before DPAPI hydration. */
+const SERVERS_CACHE_KEY = "kwikproxy-secure.servers.cache.v1";
 
-type ServersCacheEntry = {
-  servers: ProxyEntry[];
-  meta: SubscriptionMeta | null;
+const removeLegacyPlaintextCache = () => {
+  try {
+    localStorage.removeItem(SERVERS_CACHE_KEY);
+  } catch {
+    // Storage unavailable is equivalent to an already absent cache.
+  }
 };
-type ServersCache = Record<string, ServersCacheEntry>;
 
-/** Проверка формы одной записи кеша. Кеш — недоверенный localStorage:
- *  битая/частичная запись (или формат от будущей версии) не должна
- *  утекать в state.servers и Rust как мусор. Отсев поэлементный — одна
- *  испорченная подписка не выкидывает весь кеш. */
-const isValidCacheEntry = (e: unknown): e is ServersCacheEntry => {
-  if (!e || typeof e !== "object") return false;
-  const o = e as Record<string, unknown>;
-  if (!Array.isArray(o.servers)) return false;
-  return o.servers.every((s) => {
-    if (!s || typeof s !== "object") return false;
-    const p = s as Record<string, unknown>;
-    return (
-      typeof p.name === "string" &&
-      typeof p.protocol === "string" &&
-      typeof p.server === "string" &&
-      typeof p.port === "number"
+let nextFetchGeneration = 0;
+let nextRuntimeGeneration = 0;
+const fetchGenerations = new Map<string, number>();
+let runtimeEpochPromise: Promise<string> | null = null;
+
+const ensureRuntimeEpoch = (): Promise<string> => {
+  if (!runtimeEpochPromise) {
+    runtimeEpochPromise = invoke<string>("begin_subscription_epoch").catch(
+      (error) => {
+        runtimeEpochPromise = null;
+        throw error;
+      }
     );
-  });
-};
-
-const loadServersCache = (): ServersCache => {
-  try {
-    const raw = localStorage.getItem(SERVERS_CACHE_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return {};
-    }
-    const out: ServersCache = {};
-    for (const [id, entry] of Object.entries(parsed)) {
-      if (isValidCacheEntry(entry)) out[id] = entry;
-    }
-    return out;
-  } catch {
-    return {};
   }
+  return runtimeEpochPromise;
 };
 
-const saveServersCache = (cache: ServersCache) => {
-  try {
-    localStorage.setItem(SERVERS_CACHE_KEY, JSON.stringify(cache));
-  } catch {
-    // квота/приватный режим — не критично, просто потеряем instant-старт
-  }
+const beginFetch = (id: string): number => {
+  const generation = ++nextFetchGeneration;
+  fetchGenerations.set(id, generation);
+  return generation;
 };
 
-/** Записать/обновить кеш серверов одной подписки. */
-const cacheServersFor = (
+const invalidateFetch = (id: string): number => {
+  const generation = ++nextFetchGeneration;
+  fetchGenerations.set(id, generation);
+  return generation;
+};
+
+const isCurrentFetch = (id: string, url: string, generation: number): boolean => {
+  const state = useSubscriptionStore.getState();
+  const subscription = state.subscriptions.find((item) => item.id === id);
+  return (
+    fetchGenerations.get(id) === generation &&
+    subscription?.url === url
+  );
+};
+
+const saveEncryptedCache = async (
   id: string,
+  url: string,
+  result: FetchSubscriptionRaw,
+  generation: number
+): Promise<void> => {
+  if (!isCurrentFetch(id, url, generation)) return;
+  try {
+    const sessionEpoch = await ensureRuntimeEpoch();
+    if (!isCurrentFetch(id, url, generation)) return;
+    await invoke("save_subscription_cache", {
+      sessionEpoch,
+      subscriptionId: id,
+      sourceUrl: url,
+      servers: result.servers,
+      meta: result.meta,
+      generation,
+    });
+  } catch (error) {
+    console.warn("[subscription] encrypted cache save failed:", error);
+  }
+};
+
+const deleteEncryptedCache = async (id: string): Promise<void> => {
+  const generation = invalidateFetch(id);
+  try {
+    const sessionEpoch = await ensureRuntimeEpoch();
+    await invoke("delete_subscription_cache", {
+      sessionEpoch,
+      subscriptionId: id,
+      generation,
+    });
+  } catch (error) {
+    console.warn("[subscription] encrypted cache delete failed:", error);
+    showToast({
+      kind: "error",
+      title: "Encrypted cache cleanup failed",
+      message: String(error),
+      durationMs: 8000,
+    });
+    throw error;
+  }
+};
+
+/** Commit the primary snapshot with an app-global monotonic generation.
+ * Rust rejects late invokes, so a previous primary cannot win a race. */
+const pushPrimaryToRust = async (
+  id: string,
+  url: string,
   servers: ProxyEntry[],
   meta: SubscriptionMeta | null
-) => {
-  const cache = loadServersCache();
-  cache[id] = { servers, meta };
-  saveServersCache(cache);
-};
-
-/** Удалить из кеша записи подписок, которых больше нет (по списку живых id). */
-const pruneServersCache = (liveIds: string[]) => {
-  const cache = loadServersCache();
-  const live = new Set(liveIds);
-  let changed = false;
-  for (const id of Object.keys(cache)) {
-    if (!live.has(id)) {
-      delete cache[id];
-      changed = true;
-    }
-  }
-  if (changed) saveServersCache(cache);
-};
-
-/** Залить список серверов в Rust runtime-state (для connect-by-index без
- *  сетевого fetch'а). Best-effort — ошибки логируем, не валим старт. */
-const pushServersToRust = async (servers: ProxyEntry[]): Promise<void> => {
+): Promise<SubscriptionRuntimeReceipt | null> => {
+  const state = useSubscriptionStore.getState();
+  const current = state.subscriptions.find((item) => item.id === id);
+  if (state.primaryId !== id || current?.url !== url) return null;
+  const generation = ++nextRuntimeGeneration;
   try {
-    await invoke("set_servers", { servers });
+    const sessionEpoch = await ensureRuntimeEpoch();
+    const beforeCommit = useSubscriptionStore.getState();
+    const beforePrimary = beforeCommit.subscriptions.find((item) => item.id === id);
+    if (beforeCommit.primaryId !== id || beforePrimary?.url !== url) return null;
+    const committed = await invoke<boolean>("set_servers", {
+      sessionEpoch,
+      primaryId: id,
+      servers,
+      meta: serializeMeta(meta),
+      generation,
+    });
+    if (!committed) return null;
+    const afterCommit = useSubscriptionStore.getState();
+    const afterPrimary = afterCommit.subscriptions.find((item) => item.id === id);
+    if (afterCommit.primaryId !== id || afterPrimary?.url !== url) return null;
+    return { sessionEpoch, primaryId: id, generation };
   } catch (e) {
     console.warn("[subscription] set_servers failed:", e);
+    return null;
+  }
+};
+
+const clearRustRuntime = async (): Promise<void> => {
+  const state = useSubscriptionStore.getState();
+  const primaryId = state.primaryId;
+  if (!primaryId) return;
+  const generation = ++nextRuntimeGeneration;
+  try {
+    const sessionEpoch = await ensureRuntimeEpoch();
+    await invoke("set_servers", {
+      sessionEpoch,
+      primaryId,
+      servers: [],
+      meta: null,
+      generation,
+    });
+  } catch (error) {
+    console.warn("[subscription] runtime clear failed:", error);
   }
 };
 
@@ -583,24 +677,20 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
     await Promise.all([
       keyringDelete(`${URL_KEYRING}:${id}`),
       keyringDelete(`${HWID_KEYRING}:${id}`),
+      deleteEncryptedCache(id),
     ]);
 
     const remaining = subs.filter((s) => s.id !== id);
     set({ subscriptions: remaining });
     saveSubsIndex(remaining.map((s) => s.id));
-    // 0.3.5: вычищаем кеш серверов удалённой подписки.
-    pruneServersCache(remaining.map((s) => s.id));
-
     if (wasPrimary) {
       // Promote first remaining to primary, или если пусто — полная очистка.
       if (remaining.length > 0) {
         const next = remaining[0];
-        set({ primaryId: next.id, url: next.url, hwid: next.hwid });
-        await keyringSet(URL_KEYRING, next.url);
-        if (next.hwid.trim()) await keyringSet(HWID_KEYRING, next.hwid);
-        else await keyringDelete(HWID_KEYRING);
-        // Fetch новой primary (servers нужно перезагрузить).
-        await get().fetchSubscription();
+        await get().setPrimaryId(next.id);
+        if (next.servers.length === 0) {
+          await get().fetchSubscriptionById(next.id);
+        }
       } else {
         // Это была последняя подписка — выкидываем все legacy данные.
         await get().deleteSubscription();
@@ -608,14 +698,44 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
     }
   },
 
-  setPrimaryId(id) {
+  async setPrimaryId(id) {
     const sub = get().subscriptions.find((s) => s.id === id);
-    if (!sub) return;
-    set({ primaryId: id, url: sub.url, hwid: sub.hwid, meta: sub.meta });
+    if (!sub) return false;
+    set({
+      primaryId: id,
+      url: sub.url,
+      hwid: sub.hwid,
+      meta: sub.meta,
+      servers: sub.servers,
+      pings: sub.pings ?? [],
+      lastFetchedAt: sub.lastFetchedAt,
+      deviceHwid: "",
+    });
+    // This synchronous selection change always publishes a newer runtime
+    // generation, including an empty list, so the previous primary cannot be
+    // connected while the new one is still loading.
+    const receipt = await pushPrimaryToRust(id, sub.url, sub.servers, sub.meta);
+    void invoke<string>("get_hwid", { url: sub.url })
+      .then((derived) => {
+        if (get().primaryId === id && get().url === sub.url) {
+          set({ deviceHwid: derived });
+        }
+      })
+      .catch(() => {});
     // Sync legacy keyring keys на новый primary.
     void keyringSet(URL_KEYRING, sub.url);
     if (sub.hwid.trim()) void keyringSet(HWID_KEYRING, sub.hwid);
     else void keyringDelete(HWID_KEYRING);
+    return receipt !== null;
+  },
+
+  async ensurePrimaryRuntimeReady() {
+    const state = get();
+    const id = state.primaryId;
+    if (!id) return null;
+    const sub = state.subscriptions.find((item) => item.id === id);
+    if (!sub) return null;
+    return await pushPrimaryToRust(id, sub.url, sub.servers, sub.meta);
   },
 
   setEngineOverride(id, engine) {
@@ -639,11 +759,15 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
     const sub = get().subscriptions.find((s) => s.id === id);
     if (!sub) return;
     if (!sub.url.trim()) return;
+    const requestUrl = sub.url;
+    const generation = beginFetch(id);
+    const wasPrimary = get().primaryId === id;
     // Помечаем sub как loading для UI.
     set({
       subscriptions: get().subscriptions.map((s) =>
         s.id === id ? { ...s, loading: true, error: null } : s
       ),
+      ...(wasPrimary ? { loading: true, error: null } : {}),
     });
     const settings = useSettingsStore.getState();
     const ua = effectiveUserAgent(
@@ -653,11 +777,12 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
     );
     try {
       const result = await invoke<FetchSubscriptionRaw>("fetch_subscription", {
-        url: sub.url,
+        url: requestUrl,
         hwidOverride: sub.hwid.trim() || null,
         userAgent: ua.trim() || null,
         sendHwid: settings.sendHwid,
       });
+      if (!isCurrentFetch(id, requestUrl, generation)) return;
       const now = Date.now();
       const normalized = normalizeMeta(result.meta);
       // Tag servers с subscriptionId.
@@ -678,12 +803,15 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
             : s
         ),
       });
-      // Кешируем servers+meta в localStorage — переживут рестарт, на
-      // старте гидрируются мгновенно (0.3.5).
-      cacheServersFor(id, tagged, normalized);
+      // Persist only after the request-id/URL generation check. Rust applies
+      // the full-profile sanitizer before current-user DPAPI encryption.
+      void saveEncryptedCache(id, requestUrl, result, generation);
       // Если primary — синхронизируем legacy state для backward compat
       // (компоненты вроде vpnStore.connect и старого ServerSelector).
-      if (get().primaryId === id) {
+      if (
+        get().primaryId === id &&
+        isCurrentFetch(id, requestUrl, generation)
+      ) {
         saveToStorage(LAST_FETCH_KEY, String(now));
         set({
           servers: tagged,
@@ -694,7 +822,19 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
         });
         // Rust runtime-state получает серверы primary — connect-by-index
         // работает без re-fetch'а.
-        void pushServersToRust(tagged);
+        const receipt = await pushPrimaryToRust(
+          id,
+          requestUrl,
+          tagged,
+          normalized
+        );
+        if (!receipt) return;
+        if (
+          get().primaryId !== id ||
+          !isCurrentFetch(id, requestUrl, generation)
+        ) {
+          return;
+        }
         // Restore selectedIndex по сохранённому имени (как и в legacy fetch).
         const restoredIndex = findSelectedIndexByName(tagged);
         if (restoredIndex >= 0) {
@@ -707,11 +847,24 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
       }
       // Авто-пинг для этой sub.
       void get().pingAllOf(id);
+
+      if (normalized?.routingAutorouting || normalized?.routingStatic) {
+        showToast({
+          kind: "warning",
+          title: i18n.t("toast.routingDirectivePending.title"),
+          message: i18n.t("toast.routingDirectivePending.message"),
+          durationMs: 8000,
+        });
+      }
     } catch (e) {
+      if (!isCurrentFetch(id, requestUrl, generation)) return;
       set({
         subscriptions: get().subscriptions.map((s) =>
           s.id === id ? { ...s, loading: false, error: String(e) } : s
         ),
+        ...(get().primaryId === id
+          ? { loading: false, error: String(e) }
+          : {}),
       });
     }
   },
@@ -719,12 +872,8 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
   async pingAllOf(id) {
     const sub = get().subscriptions.find((s) => s.id === id);
     if (!sub || sub.servers.length === 0) return;
-    // Текущая Rust команда `ping_servers` пингует state.servers (singleton).
-    // Чтобы пингануть servers конкретной подписки, нужно временно
-    // подменить state.servers через Rust set_servers — командной нет, и
-    // делать её сейчас переусложнение. Простой workaround: если sub
-    // primary, ping_servers даёт корректный результат; иначе используем
-    // primary's pings (заглушка, обновятся при swap primary).
+    // Rust ping_servers intentionally sees only the generation-guarded
+    // primary snapshot. Secondary refreshes never replace it.
     if (get().primaryId !== id) return;
     set({ pingsLoading: true });
     try {
@@ -743,15 +892,46 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
   // ─── Legacy API (sync'ится с primary subscription) ───────────────────
 
   setUrl: (url) => {
-    set({ url });
+    set({
+      url,
+      deviceHwid: "",
+      servers: [],
+      meta: null,
+      pings: [],
+      loading: false,
+      error: null,
+    });
+    const normalizedInput = url.trim();
+    if (/^https:\/\//i.test(normalizedInput)) {
+      void invoke<string>("get_hwid", { url: normalizedInput })
+        .then((id) => {
+          // Ignore stale async results while the user is still editing.
+          if (get().url.trim() === normalizedInput) set({ deviceHwid: id });
+        })
+        .catch(() => {});
+    }
     // 0.3.0: обновляем primary subscription тоже (sync legacy ↔ multi).
     const primaryId = get().primaryId;
     if (primaryId) {
       set({
         subscriptions: get().subscriptions.map((s) =>
-          s.id === primaryId ? { ...s, url } : s
+          s.id === primaryId
+            ? {
+                ...s,
+                url,
+                servers: [],
+                meta: null,
+                pings: [],
+                loading: false,
+                error: null,
+              }
+            : s
         ),
       });
+      void deleteEncryptedCache(primaryId).catch(() => {
+        // Error is already surfaced by deleteEncryptedCache.
+      });
+      void pushPrimaryToRust(primaryId, url, [], null);
       void keyringSet(`${URL_KEYRING}:${primaryId}`, url);
     }
     // Чувствительные значения пишем в Windows Credential Manager.
@@ -783,7 +963,8 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
 
   async loadDeviceHwid() {
     try {
-      const id = await invoke<string>("get_hwid");
+      const url = get().url.trim();
+      const id = await invoke<string>("get_hwid", { url: url || null });
       set({ deviceHwid: id });
     } catch {
       // не критично — UI покажет пустую строку
@@ -791,36 +972,10 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
   },
 
   async loadSecureCreds() {
-    // Ребрендинг 0.7.0: перенос записей Credential Manager из legacy
-    // namespace `nemefisto.*` в `kwik.*`. Делаем ДО первого keyringGet,
-    // иначе подписка «исчезнет» после апгрейда. Ключи: singleton
-    // URL/HWID + per-id варианты (id берём из уже мигрированного
-    // localStorage-индекса). One-shot через localStorage-флаг.
-    try {
-      if (!localStorage.getItem("kwik.migrated.credentials.rebrand.v1")) {
-        const ids = loadSubsIndex();
-        const keys = [URL_KEYRING, HWID_KEYRING];
-        for (const id of ids) {
-          keys.push(`${URL_KEYRING}:${id}`, `${HWID_KEYRING}:${id}`);
-        }
-        try {
-          await invoke("secure_storage_migrate_legacy", { keys });
-          // Флаг ставим ТОЛЬКО после успешного вызова: если invoke упал
-          // (транзиентная ошибка Credential Manager на старте), миграция
-          // повторится при следующем запуске — иначе подписка «пропала бы»
-          // навсегда при единственном неудачном старте.
-          localStorage.setItem("kwik.migrated.credentials.rebrand.v1", "1");
-        } catch (e) {
-          console.warn(
-            "[subscription] миграция keyring nemefisto→kwik не удалась, повторим при следующем старте:",
-            e
-          );
-        }
-      }
-    } catch {
-      // localStorage недоступен — миграция best-effort
-    }
-
+    // Rotate the backend-issued epoch before reading any runtime/cache state.
+    // Renderer reloads therefore cannot reuse sequence numbers or complete
+    // delayed mutations from the previous WebView instance.
+    await ensureRuntimeEpoch();
     // Этап 6.A: читаем URL/HWID из Windows Credential Manager. Если в
     // keyring пусто, но в localStorage есть — мигрируем (один раз) и
     // зачищаем localStorage. Маркер миграции защищает от повторного
@@ -960,52 +1115,80 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
       }
     }
 
-    // 0.3.5: гидрация серверов из localStorage-кеша. Rust SubscriptionState
-    // пуст на холодном старте, поэтому без этого список серверов пропадает и
-    // юзеру приходится вручную жать «загрузить». Восстанавливаем servers+meta
-    // в UI мгновенно и заливаем серверы primary в Rust (connect-by-index).
+    removeLegacyPlaintextCache();
+
+    // Hydrate each URL-bound record from the current-user DPAPI cache. A
+    // corrupt, foreign-user or URL-mismatched record fails closed and is
+    // treated as a cache miss; credentials never pass through localStorage.
     {
-      const subs = get().subscriptions;
-      const primaryId = get().primaryId;
-      if (subs.length > 0) {
-        const cache = loadServersCache();
-        // Чистим кеш от записей подписок, которых уже нет.
-        pruneServersCache(subs.map((s) => s.id));
-        let hydratedAny = false;
-        const hydrated = subs.map((s) => {
-          const c = cache[s.id];
-          if (c && c.servers.length > 0) {
-            hydratedAny = true;
-            // Перетегируем serversId на случай если кеш писался под другим
-            // (id стабилен, но дешевле гарантировать корректность).
-            const tagged = c.servers.map((e) => ({
-              ...e,
-              subscriptionId: s.id,
-            }));
-            return { ...s, servers: tagged, meta: c.meta ?? s.meta };
+      const subscriptions = get().subscriptions;
+      const cached = await Promise.all(
+        subscriptions.map(async (subscription) => {
+          try {
+            const result = await invoke<FetchSubscriptionRaw | null>(
+              "load_subscription_cache",
+              {
+                sessionEpoch: await ensureRuntimeEpoch(),
+                subscriptionId: subscription.id,
+                sourceUrl: subscription.url,
+              }
+            );
+            return { id: subscription.id, url: subscription.url, result };
+          } catch (error) {
+            console.warn("[subscription] encrypted cache load failed:", error);
+            return { id: subscription.id, url: subscription.url, result: null };
           }
-          return s;
-        });
-        if (hydratedAny) {
-          set({ subscriptions: hydrated });
-          const primary = hydrated.find((s) => s.id === primaryId);
-          if (primary && primary.servers.length > 0) {
-            set({
-              servers: primary.servers,
-              meta: primary.meta,
-              pings: [],
-            });
-            // Rust runtime-state получает серверы primary — connect работает
-            // без обязательного сетевого fetch'а.
-            void pushServersToRust(primary.servers);
-            const restoredIndex = findSelectedIndexByName(primary.servers);
-            if (restoredIndex >= 0) {
-              useVpnStore.setState({ selectedIndex: restoredIndex });
-            } else if (primary.servers.length === 1) {
-              useVpnStore.setState({ selectedIndex: 0 });
-            }
-          }
+        })
+      );
+      const byId = new Map(cached.map((entry) => [entry.id, entry]));
+      const current = get().subscriptions;
+      const hydrated = current.map((subscription) => {
+        const entry = byId.get(subscription.id);
+        if (
+          !entry?.result ||
+          entry.url !== subscription.url ||
+          entry.result.servers.length === 0
+        ) {
+          return subscription;
         }
+        const servers = entry.result.servers.map((server) => ({
+          ...server,
+          subscriptionId: subscription.id,
+        }));
+        return {
+          ...subscription,
+          servers,
+          meta: normalizeMeta(entry.result.meta),
+          pings: [],
+        };
+      });
+      set({ subscriptions: hydrated });
+      const currentPrimaryId = get().primaryId;
+      const primary = hydrated.find(
+        (subscription) => subscription.id === currentPrimaryId
+      );
+      if (primary && primary.servers.length > 0) {
+        set({
+          servers: primary.servers,
+          meta: primary.meta,
+          pings: [],
+        });
+        const receipt = await pushPrimaryToRust(
+          primary.id,
+          primary.url,
+          primary.servers,
+          primary.meta
+        );
+        if (!receipt) return;
+        const restoredIndex = findSelectedIndexByName(primary.servers);
+        useVpnStore.setState({
+          selectedIndex:
+            restoredIndex >= 0
+              ? restoredIndex
+              : primary.servers.length === 1
+                ? 0
+                : null,
+        });
       }
     }
   },
@@ -1058,123 +1241,13 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
       }
     }
 
-    const settings = useSettingsStore.getState();
     const primaryId = get().primaryId;
-    // Mihomo-only: движок всегда Mihomo → UA = clash-verge (если юзер не
-    // переопределил userAgent вручную). effectiveUserAgent сам отдаст
-    // DEFAULT_USER_AGENT_MIHOMO при engine="mihomo".
-    const ua = effectiveUserAgent(
-      "mihomo",
-      settings.userAgent,
-      settings.userAgentTouched
-    );
-    set({ loading: true, error: null });
-    try {
-      const result = await invoke<FetchSubscriptionRaw>("fetch_subscription", {
-        url,
-        hwidOverride: hwid.trim() || null,
-        userAgent: ua.trim() || null,
-        sendHwid: settings.sendHwid,
-      });
-      const now = Date.now();
-      saveToStorage(LAST_FETCH_KEY, String(now));
-      const normalized = normalizeMeta(result.meta);
-      // 0.3.0: tag servers с subscriptionId для multi-source группировки
-      // и engine resolution. Все servers первой fetch-итерации
-      // принадлежат primary subscription.
-      const tagged = primaryId
-        ? result.servers.map((s) => ({ ...s, subscriptionId: primaryId }))
-        : result.servers;
-      set({
-        servers: tagged,
-        meta: normalized,
-        pings: [],
-        lastFetchedAt: now,
-        loading: false,
-      });
-      // 0.3.0: sync servers/meta/lastFetchedAt в primary subscription.
-      if (primaryId) {
-        set({
-          subscriptions: get().subscriptions.map((s) =>
-            s.id === primaryId
-              ? {
-                  ...s,
-                  servers: tagged,
-                  meta: normalized,
-                  lastFetchedAt: now,
-                  pings: [],
-                  loading: false,
-                }
-              : s
-          ),
-        });
-        // Кешируем для instant-старта после рестарта (0.3.5). Rust
-        // runtime-state уже наполнен самой командой fetch_subscription.
-        cacheServersFor(primaryId, tagged, normalized);
-      }
-      // 0.2.4: восстанавливаем выбранный сервер ПО ИМЕНИ. После refetch
-      // массив пересоздаётся, индексы сбиваются — поэтому ищем по
-      // (subscriptionId, name) паре. 0.3.0: toast «server gone» удалён —
-      // в multi-subscription при swap'е подписок имена естественно не
-      // совпадают, это не потеря, а просто другой источник. Юзер просто
-      // увидит unselected state и выберет новый сервер сам.
-      {
-        const restoredIndex = findSelectedIndexByName(result.servers);
-        if (restoredIndex >= 0) {
-          useVpnStore.setState({ selectedIndex: restoredIndex });
-        } else if (result.servers.length === 1) {
-          // Auto-select для mihomo-passthrough single-entry — без него
-          // MihomoGroupsInline не отрисуется (нужен selectedServer).
-          useVpnStore.setState({ selectedIndex: 0 });
-        }
-      }
-      // Авто-пинг сразу после получения списка
-      void get().pingAll();
-
-      // 11.E: если в подписке нашлись routing-директивы (`://routing/...`,
-      // `://autorouting/...` спец-строки) — применяем через bash-команды.
-      // Не блокируем основной flow — выполняем в фоне.
-      if (normalized?.routingAutorouting) {
-        const [autoUrl, activate] = normalized.routingAutorouting;
-        void invoke<string>("routing_add_url", {
-          url: autoUrl,
-          intervalHours: 24,
-        })
-          .then((id) =>
-            activate
-              ? invoke("routing_set_active", { id })
-              : Promise.resolve()
-          )
-          .catch((e) =>
-            console.warn("[subscription] routing_autorouting failed:", e)
-          );
-      }
-      if (normalized?.routingStatic) {
-        const [payload, activate] = normalized.routingStatic;
-        const isUrl = /^https?:\/\//i.test(payload);
-        const promise = isUrl
-          ? invoke<string>("routing_add_url", {
-              url: payload,
-              intervalHours: 8760, // эффективное «не обновлять»
-            })
-          : invoke<string>("routing_add_static", { payload });
-        void promise
-          .then((id) =>
-            activate
-              ? invoke("routing_set_active", { id })
-              : Promise.resolve()
-          )
-          .catch((e) =>
-            console.warn("[subscription] routing_static failed:", e)
-          );
-      }
-    } catch (e) {
-      set({ loading: false, error: String(e) });
-    }
+    if (primaryId) await get().fetchSubscriptionById(primaryId);
   },
 
   async loadCached() {
     try {
+      await ensureRuntimeEpoch();
       const servers = await invoke<ProxyEntry[]>("get_servers");
       if (servers.length > 0) {
         // 0.3.0 auto-bootstrap: если subscriptions[] пуст НО Rust имеет
@@ -1279,10 +1352,8 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
       }
     }
 
-    // Кеш серверов в Rust живёт только в памяти SubscriptionState
-    // (Mutex'ы), без диска. После закрытия app state сбрасывается;
-    // в текущей сессии оставшийся в Rust список не критичен — UI
-    // показывает Welcome потому что мы обнулили `servers` ниже.
+    // Runtime snapshot живёт в памяти; per-subscription offline cache ниже
+    // удаляется отдельными DPAPI-командами вместе с keyring credentials.
 
     // 1. Удаляем URL и override-HWID из keyring (legacy + per-id для
      //    каждой подписки в multi-state).
@@ -1292,6 +1363,7 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
       ...get().subscriptions.flatMap((s) => [
         keyringDelete(`${URL_KEYRING}:${s.id}`),
         keyringDelete(`${HWID_KEYRING}:${s.id}`),
+        deleteEncryptedCache(s.id),
       ]),
     ]);
 
@@ -1299,7 +1371,7 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
      //    multi-subscription index.
     try {
       localStorage.removeItem(LAST_FETCH_KEY);
-      localStorage.removeItem("kwik.selectedServerName.v1");
+      localStorage.removeItem("kwikproxy-secure.selectedServerName.v1");
       localStorage.removeItem(SUBS_INDEX_KEY);
       localStorage.removeItem(SERVERS_CACHE_KEY);
     } catch {
@@ -1307,7 +1379,7 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
     }
     // Rust runtime-state тоже обнуляем — иначе orphan-серверы прошлой
     // подписки останутся в памяти до рестарта.
-    void pushServersToRust([]);
+    void clearRustRuntime();
 
     // 3. Сбрасываем in-memory state (multi + legacy) и selectedIndex в vpnStore.
     set({

@@ -11,11 +11,11 @@ use config::hwid::load_or_create;
 use config::{HwidState, SubscriptionState};
 use ipc::commands::{
     app_traffic_stats, autostart_disable, autostart_enable, autostart_is_enabled,
-    check_routing_conflicts, connect,
+    begin_subscription_epoch, check_routing_conflicts, connect,
     connection_ping, count_recent_crashes, discard_proxy_backup, disconnect,
-    export_diagnostics, export_settings_to_documents, fetch_settings_backup, fetch_subscription,
+    export_diagnostics, export_settings_to_documents, fetch_subscription,
     geofiles_refresh, geofiles_status, get_hwid, get_recovery_state, get_routing_table,
-    get_servers,
+    get_servers, load_subscription_cache,
     get_subscription_meta, hide_floating_window, is_xray_running,
     kill_switch_apply, kill_switch_heartbeat, leak_test,
     list_processes, mihomo_delay_test, mihomo_proxies, mihomo_select_proxy, ping_mihomo_nodes,
@@ -23,34 +23,12 @@ use ipc::commands::{
     read_xray_log, recover_network, restore_proxy_backup, routing_add_static,
     routing_add_static_from_url, routing_add_url,
     routing_list, routing_refresh, routing_remove, routing_set_active, secure_storage_delete,
-    secure_storage_get, secure_storage_migrate_legacy, secure_storage_set, set_servers,
-    show_floating_window, shutdown_helper,
+    secure_storage_get, secure_storage_set, set_servers, save_subscription_cache,
+    delete_subscription_cache,
+    show_floating_window,
     tray_set_status, KillSwitchState,
 };
 use vpn::MihomoState;
-
-/// Ребрендинг 0.7.0 (Nemefisto → Kwik): one-time перенос каталогов данных
-/// `NemefistoVPN` → `KwikVPN` в `%LOCALAPPDATA%` и `%PROGRAMDATA%`. В них
-/// лежат routing-профили, кеш geofiles, hwid.txt и crash-dump'ы. Делаем
-/// простым rename, только если старый каталог есть, а нового ещё нет —
-/// идемпотентно и без перезаписи. Best-effort: ошибки игнорируем (в
-/// худшем случае пользователь переподтянет geofiles и потеряет кеш hwid,
-/// который и так пересоздаётся из MachineGuid).
-fn migrate_legacy_data_dirs() {
-    use std::path::PathBuf;
-    for var in ["LOCALAPPDATA", "PROGRAMDATA"] {
-        let Some(base) = std::env::var_os(var) else {
-            continue;
-        };
-        let old = PathBuf::from(&base).join("NemefistoVPN");
-        let new = PathBuf::from(&base).join("KwikVPN");
-        if old.is_dir() && !new.exists() {
-            if let Err(e) = std::fs::rename(&old, &new) {
-                eprintln!("миграция каталога {} → {}: {e}", old.display(), new.display());
-            }
-        }
-    }
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -81,18 +59,13 @@ pub fn run() {
         // `@tauri-apps/plugin-global-shortcut`, при изменении настроек
         // (см. lib/hooks/useGlobalShortcuts.ts).
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        // 14.A: auto-updater. Endpoint в tauri.conf.json (GitHub Releases
-        // latest.json), pubkey там же. Проверка инициируется фронтом
-        // через @tauri-apps/plugin-updater (см. src/lib/updater.ts).
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        // 14.A: relaunch после install update'а — нужен process-plugin
-        // (`@tauri-apps/plugin-process` фронта вызывает relaunch()).
-        .plugin(tauri_plugin_process::init())
+        // In-app updater is intentionally not registered until this fork has
+        // its own signing key and protected service-aware installer.
         // Native Windows toasts (через WinRT ToastNotifier). Используется
         // для событий когда окно свёрнуто/в трее (connect/disconnect/update/
         // kill-switch trigger). При visible-окне используем in-app toaster.
         // AppUserModelID берётся автоматически из bundle.identifier
-        // (`com.kwik.vpn-client`) — Windows группирует уведомления
+        // (`io.github.oda02.kwikproxy-secure`) — Windows группирует уведомления
         // под именем productName из tauri.conf.json.
         .plugin(tauri_plugin_notification::init())
         .manage(MihomoState::new())
@@ -130,24 +103,14 @@ pub fn run() {
             let hwid = load_or_create().unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
             app.manage(HwidState(hwid));
 
-            // В dev-режиме регистрируем kwik:// в HKCU\Software\Classes
+            // В dev-режиме регистрируем kwikproxy-secure:// в HKCU\Software\Classes
             // для текущего пользователя. Production-инсталлятор пишет
             // регистрацию сам через bundle-metadata.
             #[cfg(any(windows, target_os = "linux"))]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
-                let _ = app.deep_link().register("kwik");
+                let _ = app.deep_link().register("kwikproxy-secure");
             }
-            // Ребрендинг 0.7.0: one-time перенос каталога данных
-            // `NemefistoVPN` → `KwikVPN` (routing-профили, geofiles, hwid).
-            // Делаем синхронно до первого обращения к этим путям.
-            migrate_legacy_data_dirs();
-            // Ребрендинг 0.7.0: one-time снос legacy-задачи автозапуска
-            // `Nemefisto VPN Autostart` (переносим включённое состояние на
-            // новое имя). Best-effort, в фоне — не блокирует setup.
-            tauri::async_runtime::spawn(async {
-                platform::autostart::cleanup_legacy().await;
-            });
             // 6.C: запускаем watcher смены сети. Polling default-route
             // каждые 5 сек; при смене интерфейса emit-ится событие
             // `network-changed` во фронт, который при активном VPN
@@ -232,9 +195,13 @@ pub fn run() {
             disconnect,
             is_xray_running,
             fetch_subscription,
+            begin_subscription_epoch,
             get_servers,
             set_servers,
             get_subscription_meta,
+            save_subscription_cache,
+            load_subscription_cache,
+            delete_subscription_cache,
             get_hwid,
             ping_servers,
             ping_mihomo_nodes,
@@ -244,7 +211,6 @@ pub fn run() {
             secure_storage_get,
             secure_storage_set,
             secure_storage_delete,
-            secure_storage_migrate_legacy,
             autostart_is_enabled,
             autostart_enable,
             autostart_disable,
@@ -258,10 +224,8 @@ pub fn run() {
             get_recovery_state,
             get_routing_table,
             connection_ping,
-            shutdown_helper,
             export_diagnostics,
             export_settings_to_documents,
-            fetch_settings_backup,
             count_recent_crashes,
             mihomo_proxies,
             mihomo_select_proxy,

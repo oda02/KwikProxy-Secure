@@ -31,7 +31,7 @@ VPN-клиент под Windows на базе **Mihomo** (форк Clash Meta). 
 - **Безопасное хранилище**: Windows Credential Manager через `keyring-rs`
   v3 (⚠️ feature `windows-native` ОБЯЗАТЕЛЬНА — без неё mock-store и
   подписка «исчезает» при перезапуске).
-- **Логирование**: `tracing` с ротацией. Логи: `%TEMP%\KwikVPN\`.
+- **Логирование**: `tracing` с ротацией. Логи: `%TEMP%\KwikProxy Secure\`.
 
 > Подписка запрашивается с UA `clash-verge/v2.0.0` → панели (Marzban /
 > Remnawave / 3x-ui / clash) отдают clash YAML, который парсится в
@@ -155,20 +155,12 @@ mihomo-профиля в soft-UI (`MihomoGroupsInline`) с пинг-тестом
 Двухшаговый auto-updater: скачивание **без отключения VPN** → отдельное
 подтверждение установки (`downloadUpdate` / `installUpdate`).
 
-**0.7.0 (текущий) — ребрендинг Nemefisto → Kwik**: убрано любое упоминание
-nemefisto (внешне и в коде). productName `Kwik`, identifier
-`com.kwik.vpn-client`, scheme `kwik://`, helper `kwik-helper`/сервис
-`KwikHelper`/pipe `\\.\pipe\kwik-helper`, каталог данных `KwikVPN`,
-credential-префикс `kwik.*`, autostart `Kwik VPN Autostart`, TUN-префикс
-`kwik-`, заголовки `X-Kwik-*` (чистый разрыв), репо `kanabicks/KwikProxy`,
-updater endpoint на `KwikProxy`. WFP GUID-**значения** не менялись (только
-display-строки) — детект orphan-фильтров цел. **One-shot миграция
-существующей установки** (без ручных шагов): `secure_storage::migrate_legacy`
-(+ IPC `secure_storage_migrate_legacy`, вызов из `loadSecureCreds`),
-`src/lib/migrateLegacyStorage.ts` (localStorage namespace, импорт первым в
-`main.tsx`), `migrate_legacy_data_dirs` (rename каталога), `service::install`
-сносит legacy-сервис, `autostart::cleanup_legacy` переносит/сносит задачу,
-`tun.rs` чистит legacy `nemefisto-*` адаптеры. Хардкод-URL
+**0.7.2 (текущий) — KwikProxy Secure fork**: productName `KwikProxy Secure`,
+identifier `io.github.oda02.kwikproxy-secure`, scheme
+`kwikproxy-secure://`, service/pipe/WFP GUID/TUN-marker и все runtime data,
+Credential Manager, localStorage и autostart namespaces уникальны для fork.
+Автоматической миграции, переименования или удаления данных и ресурсов
+upstream-клиента нет. Хардкод-URL
 (`DASHBOARD_URL`/`SUPPORT_URL`) убраны — всё приходит от провайдера через
 заголовки подписки. Осталось вручную: rename репо на GitHub, локальной папки;
 логотип бренд-нейтральный (текста нет) — менять опционально.

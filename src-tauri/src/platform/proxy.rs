@@ -5,7 +5,7 @@
 //!
 //! Backup/restore (9.D): перед перезаписью значений мы сохраняем оригиналы
 //! `ProxyEnable` / `ProxyServer` / `ProxyOverride` в JSON-файл
-//! `%LOCALAPPDATA%\KwikVPN\proxy_backup.json`. При `clear_system_proxy`
+//! `%LOCALAPPDATA%\KwikProxy Secure\proxy_backup.json`. При `clear_system_proxy`
 //! восстанавливаем их обратно. Если приложение крашнется в режиме proxy и
 //! не успеет очистить — на старте next-run-а мы детектим backup-файл и
 //! предлагаем пользователю восстановить.
@@ -21,7 +21,7 @@ use winreg::{enums::*, RegKey};
 const INET_SETTINGS: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
-const BACKUP_DIR: &str = "KwikVPN";
+const BACKUP_DIR: &str = "KwikProxy Secure";
 const BACKUP_FILE: &str = "proxy_backup.json";
 
 /// Снимок настроек системного прокси для backup/restore.
@@ -35,7 +35,7 @@ pub struct ProxyBackup {
     pub proxy_override: Option<String>,
 }
 
-/// Путь к файлу backup'а в %LOCALAPPDATA%\KwikVPN\proxy_backup.json.
+/// Путь к файлу backup'а в %LOCALAPPDATA%\KwikProxy Secure\proxy_backup.json.
 fn backup_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -273,6 +273,11 @@ pub fn read_proxy_server() -> Option<String> {
 pub fn is_proxy_pointing_to_us() -> bool {
     #[cfg(windows)]
     {
+        // Port ranges are shared with other clients. Require our own unique
+        // backup marker before treating a proxy as recoverable by this fork.
+        if !has_pending_backup() {
+            return false;
+        }
         let Some(_) = read_proxy_enable().filter(|&v| v == 1) else {
             return false;
         };

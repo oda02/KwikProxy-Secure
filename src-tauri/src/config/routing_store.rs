@@ -1,6 +1,6 @@
 //! 11.C — Хранилище routing-профилей + scheduler авто-обновления.
 //!
-//! Профили хранятся как JSON-файлы в `%LOCALAPPDATA%\KwikVPN\
+//! Профили хранятся как JSON-файлы в `%LOCALAPPDATA%\KwikProxy Secure\
 //! routing-profiles\<id>.json`. Один профиль может быть **активным** —
 //! его правила применяются при connect (см. xray_config / mihomo_config).
 //!
@@ -20,7 +20,7 @@ use tokio::sync::{oneshot, Notify};
 use super::geofiles;
 use super::routing_profile::{ProfileSource, RoutingProfile, RoutingProfileEntry};
 
-const DIR_NAME: &str = "KwikVPN";
+const DIR_NAME: &str = "KwikProxy Secure";
 const STORE_SUBDIR: &str = "routing-profiles";
 const ACTIVE_FILE: &str = "active.txt";
 
@@ -84,9 +84,23 @@ impl RoutingStore {
                 if p.extension().and_then(|s| s.to_str()) != Some("json") {
                     continue;
                 }
-                if let Ok(text) = std::fs::read_to_string(&p) {
+                let file_is_bounded = std::fs::metadata(&p)
+                    .map(|metadata| metadata.len() <= 1024 * 1024)
+                    .unwrap_or(false);
+                if file_is_bounded {
+                    let Ok(text) = std::fs::read_to_string(&p) else {
+                        continue;
+                    };
                     if let Ok(e) = serde_json::from_str::<RoutingProfileEntry>(&text) {
-                        entries.push(e);
+                        // Persisted files are user-writable and therefore
+                        // untrusted. Re-run current validation on every load.
+                        if e.validate().is_ok()
+                            && p.file_stem().and_then(|stem| stem.to_str()) == Some(e.id.as_str())
+                        {
+                            entries.push(e);
+                        } else {
+                            eprintln!("[routing-store] skip небезопасный профиль {}", p.display());
+                        }
                     } else {
                         eprintln!(
                             "[routing-store] skip битый профиль {}",
@@ -96,8 +110,11 @@ impl RoutingStore {
                 }
             }
         }
-        let active_id = std::fs::read_to_string(active_path(&dir))
+        let active_file = active_path(&dir);
+        let active_id = std::fs::metadata(&active_file)
             .ok()
+            .filter(|metadata| metadata.len() <= 128)
+            .and_then(|_| std::fs::read_to_string(active_file).ok())
             .and_then(|s| {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
@@ -128,6 +145,7 @@ impl RoutingStore {
     /// Добавить новую запись. Возвращает её id.
     pub fn add(&mut self, profile: RoutingProfile, source: ProfileSource) -> Result<String> {
         let mut entry = RoutingProfileEntry::new(profile, source);
+        entry.validate()?;
         // Если это autorouting — last_fetched_at = сейчас (мы только что
         // скачали JSON извне).
         if matches!(entry.source, ProfileSource::Autorouting { .. }) {
@@ -175,6 +193,7 @@ impl RoutingStore {
         id: &str,
         new_profile: RoutingProfile,
     ) -> Result<()> {
+        new_profile.validate()?;
         let entry = self
             .entries
             .iter_mut()
@@ -240,18 +259,59 @@ impl RoutingStoreState {
 /// RoutingProfile. Используется при `add_url` и при scheduler-tick.
 pub async fn fetch_profile_from_url(url: &str) -> Result<RoutingProfile> {
     let url = canonicalize_github_blob(url);
+    let parsed = reqwest::Url::parse(&url).context("invalid routing profile URL")?;
+    if !super::routing_profile::is_https_remote_url(parsed.as_str()) {
+        anyhow::bail!("routing profile URL must be a public HTTPS URL");
+    }
+    let origin_host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    let origin_port = parsed.port_or_known_default();
     let client = reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("too many routing profile redirects");
+            }
+            let next = attempt.url();
+            if next.scheme() == "https"
+                && next
+                    .host_str()
+                    .is_some_and(|h| h.eq_ignore_ascii_case(&origin_host))
+                && next.port_or_known_default() == origin_port
+            {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(60))
         .user_agent(format!("Kwik/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .context("reqwest")?;
-    let resp = client.get(&url).send().await.context("HTTP")?;
+    let resp = client
+        .get(parsed)
+        .send()
+        .await
+        .map_err(|error| anyhow!("routing HTTP error: {}", error.without_url()))?;
     if !resp.status().is_success() {
-        anyhow::bail!("HTTP {} для {url}", resp.status());
+        anyhow::bail!("routing server returned HTTP {}", resp.status());
     }
-    let text = resp.text().await.context("read body")?;
+    const MAX_ROUTING_PROFILE_BYTES: u64 = 1024 * 1024;
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_ROUTING_PROFILE_BYTES)
+    {
+        anyhow::bail!("routing profile is too large");
+    }
+    let mut resp = resp;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("read body chunk")? {
+        if bytes.len().saturating_add(chunk.len()) as u64 > MAX_ROUTING_PROFILE_BYTES {
+            anyhow::bail!("routing profile is too large");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let text = std::str::from_utf8(&bytes).context("routing profile is not UTF-8")?;
     RoutingProfile::parse_json(&text)
 }
 

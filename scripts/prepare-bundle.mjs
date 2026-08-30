@@ -16,10 +16,12 @@
 // это критично, в отличие от dev).
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
   mkdirSync,
+  readFileSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -31,6 +33,7 @@ const ROOT = join(__dirname, "..");
 const SRC_TAURI = join(ROOT, "src-tauri");
 const BINARIES = join(SRC_TAURI, "binaries");
 const TARGET_RELEASE = join(SRC_TAURI, "target", "release");
+const ARTIFACT_MANIFEST = join(BINARIES, "ARTIFACTS.json");
 
 // Тот же triplet что и для mihomo-sidecar. Если добавится поддержка
 // ARM64 или Linux — расширим определение.
@@ -53,6 +56,43 @@ function fail(msg) {
 function info(msg) {
   console.log(`[prepare-bundle] ${msg}`);
 }
+
+function sha256(path) {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function verifyPinnedArtifacts() {
+  if (!existsSync(ARTIFACT_MANIFEST)) {
+    fail(`missing artifact manifest: ${ARTIFACT_MANIFEST}`);
+  }
+
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(ARTIFACT_MANIFEST, "utf8"));
+  } catch (e) {
+    fail(`invalid ARTIFACTS.json: ${e.message}`);
+  }
+
+  for (const name of REQUIRED_RESOURCES) {
+    const artifact = manifest.artifacts?.find((entry) => entry.file === name);
+    if (!artifact || !/^[a-f0-9]{64}$/.test(artifact.sha256 ?? "")) {
+      fail(`${name} is not pinned by a valid SHA-256 in ARTIFACTS.json`);
+    }
+
+    const path = join(BINARIES, name);
+    if (!existsSync(path)) {
+      fail(`required bundled artifact is missing: ${name}`);
+    }
+
+    const actual = sha256(path);
+    if (actual !== artifact.sha256) {
+      fail(`${name} SHA-256 mismatch: expected ${artifact.sha256}, got ${actual}`);
+    }
+  }
+}
+
+// Verify all third-party bytes before any compiler or bundler is invoked.
+verifyPinnedArtifacts();
 
 // ── 0. Курица-яйцо с tauri-build ──────────────────────────────────────
 // `tauri-build` (build.rs пакета `vpn-client`) запускается перед компиляцией
@@ -78,6 +118,7 @@ const buildResult = spawnSync(
   "cargo",
   [
     "build",
+    "--locked",
     "--manifest-path",
     join(SRC_TAURI, "Cargo.toml"),
     "--bin",
@@ -86,7 +127,7 @@ const buildResult = spawnSync(
   ],
   {
     stdio: ["inherit", "inherit", "pipe"],
-    shell: true,
+    shell: false,
     encoding: "utf8",
   }
 );
@@ -102,10 +143,9 @@ if (buildResult.status !== 0) {
     /отказано в доступе/i.test(stderr)
   ) {
     fail(
-      "kwik-helper.exe в target/release/ заблокирован запущенным сервисом.\n" +
-        "         Останови сервис админом перед сборкой:\n" +
-        "           sc stop KwikHelper\n" +
-        "           src-tauri\\target\\release\\kwik-helper.exe uninstall"
+      "kwik-helper.exe в target/release/ заблокирован. Secure build scripts " +
+        "никогда не останавливают и не переустанавливают SYSTEM-сервис. " +
+        "Используйте чистую disposable VM/build runner."
     );
   }
   fail(`cargo build завершился с кодом ${buildResult.status}`);
