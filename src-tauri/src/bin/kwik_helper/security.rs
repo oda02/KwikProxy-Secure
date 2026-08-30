@@ -474,7 +474,11 @@ fn final_path_by_handle(handle: HANDLE) -> Result<PathBuf> {
 }
 
 fn file_dacl_sddl(owner_sid: &str) -> String {
-    format!("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;{owner_sid})")
+    // Use the file-specific mapping of GENERIC_READ | GENERIC_EXECUTE.
+    // SetSecurityInfo maps generic rights before storing an ACE, so retaining
+    // GRGX in the expected descriptor makes exact post-write verification
+    // reject the ACL that Windows itself just canonicalized.
+    format!("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;{owner_sid})")
 }
 
 fn verify_file_acl(handle: HANDLE, owner_sid: &str) -> Result<()> {
@@ -897,7 +901,13 @@ fn wide_path(path: &Path) -> Vec<u16> {
 }
 
 fn runtime_dacl_sddl(owner_sid: &str) -> String {
-    format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;{owner_sid})")
+    // Windows canonicalizes one inheritable directory GRGX ACE into an
+    // effective file-specific ACE plus an inherit-only generic ACE. Spell out
+    // that stable representation so exact verification compares like-for-like.
+    format!(
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)\
+         (A;;0x1200a9;;;{owner_sid})(A;OICIIO;GRGX;;;{owner_sid})"
+    )
 }
 
 fn create_directory_if_missing(path: &Path, owner_sid: &str) -> Result<bool> {
@@ -1124,7 +1134,6 @@ unsafe fn acl_matches_exactly(
             AclSizeInformation,
         ) == 0
         || actual_info.AceCount != expected_info.AceCount
-        || actual_info.AceCount != 3
     {
         return false;
     }
@@ -1741,6 +1750,47 @@ mod tests {
             validate_sha256_text(digest, "test digest").unwrap();
             assert!(artifacts.contains(digest));
         }
+    }
+
+    fn sddl_ace_count(sddl: &str) -> u32 {
+        let descriptor = descriptor_from_sddl(sddl).unwrap();
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+            },
+            0
+        );
+        assert_ne!(present, 0);
+        assert!(!dacl.is_null());
+        let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    dacl,
+                    &mut info as *mut _ as *mut c_void,
+                    size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            },
+            0
+        );
+        unsafe { LocalFree(descriptor) };
+        info.AceCount
+    }
+
+    #[test]
+    fn protected_acl_expectations_use_windows_canonical_generic_mapping() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        let directory = runtime_dacl_sddl(sid);
+        let file = file_dacl_sddl(sid);
+        assert!(directory.contains("(A;;0x1200a9;;;"));
+        assert!(directory.contains("(A;OICIIO;GRGX;;;"));
+        assert!(file.contains("(A;;0x1200a9;;;"));
+        assert_eq!(sddl_ace_count(&directory), 4);
+        assert_eq!(sddl_ace_count(&file), 3);
     }
 
     #[test]

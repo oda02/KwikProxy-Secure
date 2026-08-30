@@ -50,8 +50,10 @@
   !insertmacro KWIK_SECURE_REQUIRE_FIXED_INSTALL_ROOT
 
   DetailPrint "Provisioning the protected KwikProxy Secure helper service..."
-  nsExec::ExecToLog '"${KWIK_SECURE_HELPER}" install'
+  nsExec::ExecToStack '"${KWIK_SECURE_HELPER}" install'
   Pop $0
+  Pop $2
+  DetailPrint "$2"
   ${If} $0 != 0
     ; Best-effort rollback uses the same canonical helper and bounded SCM path.
     ; The rollback result is checked and reported; nothing is silently ignored.
