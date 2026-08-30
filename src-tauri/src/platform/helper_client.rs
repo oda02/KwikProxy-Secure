@@ -11,7 +11,7 @@
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStringExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -59,14 +59,6 @@ struct ClientManifestV1 {
     wintun_sha256: String,
     geoip_sha256: String,
     geosite_sha256: String,
-}
-
-struct ServerProcess(HANDLE);
-
-impl Drop for ServerProcess {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.0) };
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -268,7 +260,7 @@ fn process_image(process: HANDLE) -> Result<PathBuf> {
 
 fn authenticate_pipe_server(
     client: &tokio::net::windows::named_pipe::NamedPipeClient,
-) -> Result<ServerProcess> {
+) -> Result<OwnedHandle> {
     let mut pid = 0u32;
     if unsafe { GetNamedPipeServerProcessId(client.as_raw_handle() as HANDLE, &mut pid) } == 0
         || pid == 0
@@ -280,26 +272,27 @@ fn authenticate_pipe_server(
         bail!("pipe server is not running in the service session");
     }
 
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if process.is_null() {
+    let raw_process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw_process.is_null() {
         bail!("OpenProcess(pipe server) failed");
     }
-    let result = (|| -> Result<()> {
-        if !process_is_local_system(process)? {
+    // SAFETY: OpenProcess returned a fresh owned HANDLE. OwnedHandle closes it
+    // exactly once on every success/error path and is Send, so the verified
+    // process identity can remain pinned across the async write/read awaits.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw_process) };
+    let raw_process = process.as_raw_handle() as HANDLE;
+    (|| -> Result<()> {
+        if !process_is_local_system(raw_process)? {
             bail!("pipe server token is not LocalSystem");
         }
         let expected = protected_helper_path()?;
-        let actual = std::fs::canonicalize(process_image(process)?)?;
+        let actual = std::fs::canonicalize(process_image(raw_process)?)?;
         if normalized(&actual) != normalized(&expected) {
             bail!("pipe server image does not match protected HelperPath");
         }
         Ok(())
-    })();
-    if let Err(error) = result {
-        unsafe { CloseHandle(process) };
-        return Err(error);
-    }
-    Ok(ServerProcess(process))
+    })()?;
+    Ok(process)
 }
 
 /// Низкоуровневый round-trip: отправить request, получить response.
@@ -530,5 +523,11 @@ mod tests {
             )),
             normalized(Path::new(r"c:/program files/kwikproxy secure/helper.exe"))
         );
+    }
+
+    #[test]
+    fn authenticated_process_guard_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<OwnedHandle>();
     }
 }
