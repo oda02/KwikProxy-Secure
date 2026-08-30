@@ -3,6 +3,10 @@
   "private": true,
   "version": "0.7.2",
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10"
+  },
   "scripts": {
     "dev": "vite",
     "dev:helper": "node scripts/build-helper.mjs",
@@ -14,30 +18,30 @@
     "tauri:bundle": "npm run prepare-bundle && tauri build"
   },
   "dependencies": {
-    "@fontsource/inter-tight": "^5.2.7",
-    "@fontsource/jetbrains-mono": "^5.2.8",
-    "@fontsource/noto-color-emoji": "^5.2.12",
-    "@fontsource/space-grotesk": "^5.2.10",
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-deep-link": "^2.4.8",
-    "@tauri-apps/plugin-global-shortcut": "^2.3.1",
-    "@tauri-apps/plugin-notification": "^2",
-    "@tauri-apps/plugin-opener": "^2",
-    "flag-icons": "^7.5.0",
-    "i18next": "^23.16.8",
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0",
-    "react-i18next": "^15.7.4",
-    "zustand": "^5.0.12"
+    "@fontsource/inter-tight": "5.3.0",
+    "@fontsource/jetbrains-mono": "5.3.0",
+    "@fontsource/noto-color-emoji": "5.3.1",
+    "@fontsource/space-grotesk": "5.3.0",
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-deep-link": "2.4.9",
+    "@tauri-apps/plugin-global-shortcut": "2.3.2",
+    "@tauri-apps/plugin-notification": "2.3.3",
+    "@tauri-apps/plugin-opener": "2.5.4",
+    "flag-icons": "7.5.0",
+    "i18next": "26.4.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-i18next": "17.0.12",
+    "zustand": "5.0.15"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.2.4",
-    "@tauri-apps/cli": "^2",
-    "@types/react": "^19.1.8",
-    "@types/react-dom": "^19.1.6",
-    "@vitejs/plugin-react": "^4.6.0",
-    "tailwindcss": "^4.2.4",
-    "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "@tailwindcss/vite": "4.3.3",
+    "@tauri-apps/cli": "2.11.4",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "@vitejs/plugin-react": "6.1.1",
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2",
+    "vite": "8.2.2"
   }
 }

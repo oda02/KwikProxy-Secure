@@ -18,21 +18,6 @@ export default defineConfig(async () => ({
     __APP_VERSION__: JSON.stringify(pkg.version),
   },
 
-  // Bundle optimization: splitting vendor-чанков снижает парс-латентность
-  // на старте (один большой 1MB JS парсится дольше двух 400KB). В Tauri
-  // нет HTTP-кеша → итоговый суммарный размер NSIS не меняется, но
-  // независимые файлы стартуют параллельно через <link rel="modulepreload">.
-  build: {
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          "react-vendor": ["react", "react-dom"],
-          "i18n-vendor": ["i18next", "react-i18next"],
-        },
-      },
-    },
-  },
-
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors
