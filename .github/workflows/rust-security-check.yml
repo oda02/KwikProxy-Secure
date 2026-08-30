@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  rust-security-check:
+  rust-build-and-tests:
     runs-on: windows-2022
     timeout-minutes: 45
 

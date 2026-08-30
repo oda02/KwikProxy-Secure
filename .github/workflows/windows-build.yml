@@ -1,0 +1,501 @@
+name: Windows NSIS build (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Dependency install scripts stay disabled for every npm process, including
+# nested npm commands invoked by Tauri's beforeBuildCommand.
+env:
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+  npm_config_ignore_scripts: "true"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-nsis-build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout requested revision with system Git
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'kwikproxy-secure-source'
+
+          if (Test-Path -LiteralPath $sourceRoot) {
+            throw "source directory unexpectedly exists: $sourceRoot"
+          }
+          New-Item -ItemType Directory -Path $sourceRoot -ErrorAction Stop | Out-Null
+
+          & git init $sourceRoot
+          if ($LASTEXITCODE -ne 0) { throw "git init failed with exit code $LASTEXITCODE" }
+
+          & git -C $sourceRoot config core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw "git config failed with exit code $LASTEXITCODE" }
+
+          & git -C $sourceRoot remote add origin 'https://github.com/oda02/KwikProxy-Secure.git'
+          if ($LASTEXITCODE -ne 0) { throw "git remote add failed with exit code $LASTEXITCODE" }
+
+          & git -C $sourceRoot fetch --no-tags --depth=1 origin $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "git fetch failed with exit code $LASTEXITCODE" }
+
+          & git -C $sourceRoot checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "git checkout failed with exit code $LASTEXITCODE" }
+
+          $actualRevision = (& git -C $sourceRoot rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "git rev-parse failed with exit code $LASTEXITCODE" }
+          if ($actualRevision -ne $env:GITHUB_SHA) {
+            throw "checked out $actualRevision instead of requested $env:GITHUB_SHA"
+          }
+
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SOURCE_ROOT=$sourceRoot" -Encoding UTF8
+
+      - name: Install verified Node.js 24.19.0
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Source: https://nodejs.org/dist/v24.19.0/SHASUMS256.txt
+          $nodeArchiveName = 'node-v24.19.0-win-x64.zip'
+          $expectedNodeSha256 = '57f71ab3652e797d84acddc79c81cc9ff1c6ddb2a1974cdb83f00fee9bff4c73'
+          $nodeBaseUrl = 'https://nodejs.org/dist/v24.19.0'
+          $downloadRoot = Join-Path $env:RUNNER_TEMP 'node-v24.19.0-download'
+          $nodeArchive = Join-Path $downloadRoot $nodeArchiveName
+          $shasumsPath = Join-Path $downloadRoot 'SHASUMS256.txt'
+          $extractRoot = Join-Path $env:RUNNER_TEMP 'node-v24.19.0-runtime'
+
+          if ((Test-Path -LiteralPath $downloadRoot) -or (Test-Path -LiteralPath $extractRoot)) {
+            throw 'Node download or extraction path unexpectedly exists'
+          }
+          New-Item -ItemType Directory -Path $downloadRoot -ErrorAction Stop | Out-Null
+
+          Invoke-WebRequest -Uri "$nodeBaseUrl/SHASUMS256.txt" -OutFile $shasumsPath -UseBasicParsing
+          Invoke-WebRequest -Uri "$nodeBaseUrl/$nodeArchiveName" -OutFile $nodeArchive -UseBasicParsing
+
+          $officialLines = @(Get-Content -LiteralPath $shasumsPath | Where-Object {
+            $_ -match "^[0-9a-f]{64}\s+$([regex]::Escape($nodeArchiveName))$"
+          })
+          if ($officialLines.Count -ne 1) {
+            throw "official SHASUMS256.txt has no unique entry for $nodeArchiveName"
+          }
+          $officialNodeSha256 = ($officialLines[0] -split '\s+')[0].ToLowerInvariant()
+          if ($officialNodeSha256 -ne $expectedNodeSha256) {
+            throw "official Node checksum changed: expected $expectedNodeSha256, got $officialNodeSha256"
+          }
+
+          $actualNodeSha256 = (Get-FileHash -LiteralPath $nodeArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualNodeSha256 -ne $expectedNodeSha256) {
+            throw "Node archive checksum mismatch: expected $expectedNodeSha256, got $actualNodeSha256"
+          }
+
+          Expand-Archive -LiteralPath $nodeArchive -DestinationPath $extractRoot
+          $nodeRoot = Join-Path $extractRoot 'node-v24.19.0-win-x64'
+          $nodeExe = Join-Path $nodeRoot 'node.exe'
+          $npmCmd = Join-Path $nodeRoot 'npm.cmd'
+          if (!(Test-Path -LiteralPath $nodeExe -PathType Leaf) -or
+              !(Test-Path -LiteralPath $npmCmd -PathType Leaf)) {
+            throw 'verified Node archive did not contain node.exe and npm.cmd at the expected paths'
+          }
+
+          $nodeVersion = (& $nodeExe --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $nodeVersion -ne 'v24.19.0') {
+            throw "unexpected Node version: $nodeVersion"
+          }
+          $npmVersion = (& $npmCmd --version).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "npm --version failed with exit code $LASTEXITCODE" }
+
+          Write-Host "Node $nodeVersion"
+          Write-Host "npm $npmVersion"
+          Write-Host "Node archive SHA256 $actualNodeSha256"
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $nodeRoot -Encoding UTF8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "NODE_ROOT=$nodeRoot" -Encoding UTF8
+
+      - name: Install exact Rust 1.88.0 toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          & rustup set auto-self-update disable
+          if ($LASTEXITCODE -ne 0) { throw "rustup set failed with exit code $LASTEXITCODE" }
+
+          & rustup toolchain install 1.88.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw "rustup install failed with exit code $LASTEXITCODE" }
+
+          & rustup default 1.88.0
+          if ($LASTEXITCODE -ne 0) { throw "rustup default failed with exit code $LASTEXITCODE" }
+
+          $nodeSource = (Get-Command node -ErrorAction Stop).Source
+          if ($nodeSource -ne (Join-Path $env:NODE_ROOT 'node.exe')) {
+            throw "PATH selected unexpected Node executable: $nodeSource"
+          }
+          $npmSource = (Get-Command npm -ErrorAction Stop).Source
+          $npmCmdSource = (Get-Command npm.cmd -ErrorAction Stop).Source
+          if (![IO.Path]::GetFullPath($npmSource).StartsWith(
+                ([IO.Path]::GetFullPath($env:NODE_ROOT).TrimEnd('\') + '\'),
+                [StringComparison]::OrdinalIgnoreCase) -or
+              $npmCmdSource -ne (Join-Path $env:NODE_ROOT 'npm.cmd')) {
+            throw "PATH selected unexpected npm command: npm=$npmSource npm.cmd=$npmCmdSource"
+          }
+
+          $nodeVersion = (& node --version).Trim()
+          $npmVersion = (& npm --version).Trim()
+          $rustcVersion = (& rustc --version).Trim()
+          $cargoVersion = (& cargo --version).Trim()
+          if ($nodeVersion -ne 'v24.19.0') { throw "unexpected Node version: $nodeVersion" }
+          if ($rustcVersion -notmatch '^rustc 1\.88\.0 ') { throw "unexpected rustc version: $rustcVersion" }
+          if ($cargoVersion -notmatch '^cargo 1\.88\.0 ') { throw "unexpected cargo version: $cargoVersion" }
+
+          Write-Host "Node $nodeVersion"
+          Write-Host "npm $npmVersion"
+          Write-Host $rustcVersion
+          Write-Host $cargoVersion
+
+          Set-Location (Join-Path $env:SOURCE_ROOT 'src-tauri')
+          & cargo metadata --locked --format-version 1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata --locked failed with exit code $LASTEXITCODE" }
+
+      - name: Validate npm lock provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location $env:SOURCE_ROOT
+
+          $package = Get-Content -Raw -LiteralPath 'package.json' | ConvertFrom-Json -AsHashtable
+          $lock = Get-Content -Raw -LiteralPath 'package-lock.json' | ConvertFrom-Json -AsHashtable
+          if ($lock.lockfileVersion -ne 3) {
+            throw "package-lock.json must use lockfileVersion 3, got $($lock.lockfileVersion)"
+          }
+          if ($lock.packages[''].name -ne $package.name -or
+              $lock.packages[''].version -ne $package.version) {
+            throw 'package.json and package-lock.json root identity differ'
+          }
+
+          foreach ($section in @('dependencies', 'devDependencies', 'engines')) {
+            $manifestMap = $package[$section]
+            $lockMap = $lock.packages[''][$section]
+            if ($manifestMap.Count -ne $lockMap.Count) {
+              throw "package.json and lock root $section counts differ"
+            }
+            foreach ($name in $manifestMap.Keys) {
+              if (!$lockMap.ContainsKey($name) -or $lockMap[$name] -ne $manifestMap[$name]) {
+                throw "package.json and lock root differ at ${section}.${name}"
+              }
+            }
+          }
+
+          $resolvedCount = 0
+          $bundledCount = 0
+          $installScriptEntries = @()
+          foreach ($item in $lock.packages.GetEnumerator()) {
+            $path = $item.Key
+            $metadata = $item.Value
+            if ($path -eq '') { continue }
+            if ($metadata.link -eq $true) { throw "linked dependency is forbidden: $path" }
+
+            if ($metadata.hasInstallScript -eq $true) {
+              $installScriptEntries += $path
+            }
+
+            if ($metadata.resolved) {
+              if ($metadata.resolved -notmatch '^https://registry\.npmjs\.org/') {
+                throw "non-registry dependency source: $path -> $($metadata.resolved)"
+              }
+              if ($metadata.integrity -notmatch '^sha512-[A-Za-z0-9+/]+={0,2}$') {
+                throw "missing or invalid SHA512 integrity: $path"
+              }
+              $resolvedCount++
+              continue
+            }
+
+            # npm omits resolved/integrity only for packages bundled inside a
+            # parent tarball. Those bytes are covered by the parent's SHA512.
+            $separator = '/node_modules/'
+            $separatorIndex = $path.LastIndexOf($separator)
+            if ($separatorIndex -lt 0) {
+              throw "dependency has no registry provenance or bundled parent: $path"
+            }
+            $parentPath = $path.Substring(0, $separatorIndex)
+            $childName = $path.Substring($separatorIndex + $separator.Length)
+            if (!$lock.packages.ContainsKey($parentPath)) {
+              throw "bundled dependency parent missing for $path"
+            }
+            $bundleDependencies = @($lock.packages[$parentPath].bundleDependencies)
+            if ($bundleDependencies -notcontains $childName) {
+              throw "unresolved dependency is not declared as bundled: $path"
+            }
+            $bundledCount++
+          }
+
+          $allowedInstallScriptEntry = 'node_modules/fsevents'
+          if ($installScriptEntries.Count -ne 1 -or
+              $installScriptEntries[0] -ne $allowedInstallScriptEntry -or
+              $lock.packages[$allowedInstallScriptEntry].optional -ne $true -or
+              @($lock.packages[$allowedInstallScriptEntry].os) -notcontains 'darwin') {
+            throw "unexpected install-script dependency entries: $($installScriptEntries -join ', ')"
+          }
+
+          $registry = (& npm config get registry).TrimEnd('/')
+          if ($LASTEXITCODE -ne 0 -or $registry -ne 'https://registry.npmjs.org') {
+            throw "npm registry is not forced to the official registry: $registry"
+          }
+
+          Write-Host "Validated lockfile v3: $resolvedCount registry packages, $bundledCount bundled packages."
+          Write-Host 'Dependency lifecycle scripts remain globally disabled.'
+
+          $cli = $lock.packages['node_modules/@tauri-apps/cli']
+          $platformCli = $lock.packages['node_modules/@tauri-apps/cli-win32-x64-msvc']
+          if ($cli.version -ne '2.11.4' -or
+              $cli.resolved -ne 'https://registry.npmjs.org/@tauri-apps/cli/-/cli-2.11.4.tgz' -or
+              $cli.integrity -ne 'sha512-R8xGtMpwyetawSqm9kYOuMmEqkhUbvcUy8n0aNXIxollKBLESUu5f4Fx+64hgASYm1H+jSWq6jCW6zqTnH6hqQ==') {
+            throw 'locked @tauri-apps/cli is not the reviewed 2.11.4 artifact'
+          }
+          if ($platformCli.version -ne '2.11.4' -or
+              $platformCli.resolved -ne 'https://registry.npmjs.org/@tauri-apps/cli-win32-x64-msvc/-/cli-win32-x64-msvc-2.11.4.tgz' -or
+              $platformCli.integrity -ne 'sha512-+vDiqBIU5dMISg/wNvX3sF+ZHfgJGJ5T0AcO+EHNXV9GGAG+P5fzodlDXD3QdKCRgZxMoCm5PPvj3BqLNjBthw==') {
+            throw 'locked Windows Tauri CLI is not the reviewed 2.11.4 artifact'
+          }
+
+      - name: Install exact frontend dependency graph
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location $env:SOURCE_ROOT
+
+          & npm ci --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw "npm ci failed with exit code $LASTEXITCODE" }
+
+      - name: Audit npm lock
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location $env:SOURCE_ROOT
+
+          & npm audit --package-lock-only --audit-level=low --ignore-scripts --no-fund
+          if ($LASTEXITCODE -ne 0) { throw "npm audit failed with exit code $LASTEXITCODE" }
+
+      - name: Verify npm registry signatures and attestations
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location $env:SOURCE_ROOT
+
+          # Fail closed before executing any dependency-provided package binary.
+          & npm audit signatures
+          if ($LASTEXITCODE -ne 0) { throw "npm audit signatures failed with exit code $LASTEXITCODE" }
+
+          $cliPackage = Get-Content -Raw -LiteralPath 'node_modules/@tauri-apps/cli/package.json' | ConvertFrom-Json
+          $platformPackage = Get-Content -Raw -LiteralPath 'node_modules/@tauri-apps/cli-win32-x64-msvc/package.json' | ConvertFrom-Json
+          if ($cliPackage.version -ne '2.11.4' -or $platformPackage.version -ne '2.11.4') {
+            throw 'installed Tauri CLI packages do not match reviewed version 2.11.4'
+          }
+          $platformBinary = Get-Item -LiteralPath 'node_modules/@tauri-apps/cli-win32-x64-msvc/cli.win32-x64-msvc.node'
+          if ($platformBinary.Length -le 0 -or
+              ($platformBinary.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'installed Windows Tauri CLI binary is empty or a reparse point'
+          }
+
+      - name: Build frontend
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location $env:SOURCE_ROOT
+
+          & npm run build --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw "frontend build failed with exit code $LASTEXITCODE" }
+
+      - name: Prepare reviewed sidecars and helper
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location $env:SOURCE_ROOT
+
+          & npm run prepare-bundle --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw "prepare-bundle failed with exit code $LASTEXITCODE" }
+
+      - name: Build application without bundling
+        shell: pwsh
+        env:
+          npm_config_ignore_scripts: "true"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location $env:SOURCE_ROOT
+
+          $nodeExe = Join-Path $env:NODE_ROOT 'node.exe'
+          $tauriJs = Join-Path $env:SOURCE_ROOT 'node_modules\@tauri-apps\cli\tauri.js'
+          & $nodeExe $tauriJs build --no-bundle
+          if ($LASTEXITCODE -ne 0) { throw "Tauri build --no-bundle failed with exit code $LASTEXITCODE" }
+
+      - name: Provision isolated NSIS tools and bundle
+        shell: pwsh
+        env:
+          npm_config_ignore_scripts: "true"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location $env:SOURCE_ROOT
+
+          foreach ($name in @('TAURI_BUNDLER_TOOLS_GITHUB_MIRROR', 'TAURI_BUNDLER_TOOLS_GITHUB_MIRROR_TEMPLATE')) {
+            if ($null -ne [Environment]::GetEnvironmentVariable($name)) {
+              throw "$name must not be set"
+            }
+          }
+
+          $config = Get-Content -Raw -LiteralPath 'src-tauri/tauri.conf.json' | ConvertFrom-Json -AsHashtable
+          if ($config.bundle.windows.webviewInstallMode.type -ne 'skip') {
+            throw 'tauri.conf.json must set bundle.windows.webviewInstallMode.type exactly to skip'
+          }
+          if ($config.bundle.useLocalToolsDir -eq $true) {
+            throw 'bundle.useLocalToolsDir must not redirect the reviewed isolated tools cache'
+          }
+
+          $isolatedLocalAppData = Join-Path $env:RUNNER_TEMP 'kwikproxy-tauri-localappdata'
+          $downloadRoot = Join-Path $env:RUNNER_TEMP 'kwikproxy-tauri-tools-download'
+          if ((Test-Path -LiteralPath $isolatedLocalAppData) -or (Test-Path -LiteralPath $downloadRoot)) {
+            throw 'isolated Tauri cache or download path unexpectedly exists'
+          }
+          New-Item -ItemType Directory -Path $isolatedLocalAppData -ErrorAction Stop | Out-Null
+          New-Item -ItemType Directory -Path $downloadRoot -ErrorAction Stop | Out-Null
+
+          $nsisUrl = 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip'
+          $utilsUrl = 'https://github.com/tauri-apps/nsis-tauri-utils/releases/download/nsis_tauri_utils-v0.5.3/nsis_tauri_utils.dll'
+          $nsisArchive = Join-Path $downloadRoot 'nsis-3.11.zip'
+          $utilsDll = Join-Path $downloadRoot 'nsis_tauri_utils.dll'
+          Invoke-WebRequest -Uri $nsisUrl -OutFile $nsisArchive -UseBasicParsing
+          Invoke-WebRequest -Uri $utilsUrl -OutFile $utilsDll -UseBasicParsing
+
+          $expected = @{
+            $nsisArchive = @{ Size = 2361546; Sha256 = 'c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1' }
+            $utilsDll = @{ Size = 34304; Sha256 = '5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709' }
+          }
+          foreach ($path in $expected.Keys) {
+            $file = Get-Item -LiteralPath $path
+            if ($file.Length -ne $expected[$path].Size -or
+                ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+              throw "downloaded tool has unexpected size or is a reparse point: $path"
+            }
+            $actualSha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualSha256 -ne $expected[$path].Sha256) {
+              throw "SHA256 mismatch for ${path}: expected $($expected[$path].Sha256), got $actualSha256"
+            }
+            Write-Host "verified $path bytes=$($file.Length) sha256=$actualSha256"
+          }
+
+          # tauri-bundler 2.9.4 uses dirs::cache_dir()/tauri/NSIS. On Windows,
+          # dirs::cache_dir() resolves from LOCALAPPDATA. Populate the complete
+          # layout so the bundler performs no tool download.
+          $tauriToolsRoot = Join-Path $isolatedLocalAppData 'tauri'
+          Expand-Archive -LiteralPath $nsisArchive -DestinationPath $tauriToolsRoot
+          $extractedNsis = Join-Path $tauriToolsRoot 'nsis-3.11'
+          $nsisCache = Join-Path $tauriToolsRoot 'NSIS'
+          if (!(Test-Path -LiteralPath $extractedNsis -PathType Container) -or
+              (Test-Path -LiteralPath $nsisCache)) {
+            throw 'verified NSIS archive did not produce the expected nsis-3.11 directory'
+          }
+          Move-Item -LiteralPath $extractedNsis -Destination $nsisCache -ErrorAction Stop
+          $utilsTargetDirectory = Join-Path $nsisCache 'Plugins\x86-unicode\additional'
+          New-Item -ItemType Directory -Path $utilsTargetDirectory -Force -ErrorAction Stop | Out-Null
+          Copy-Item -LiteralPath $utilsDll -Destination (Join-Path $utilsTargetDirectory 'nsis_tauri_utils.dll') -ErrorAction Stop
+
+          foreach ($directory in @($isolatedLocalAppData, $tauriToolsRoot, $nsisCache, $utilsTargetDirectory)) {
+            $directoryInfo = Get-Item -LiteralPath $directory
+            if (!$directoryInfo.PSIsContainer -or
+                ($directoryInfo.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+              throw "Tauri tools cache directory is not an ordinary directory: $directory"
+            }
+          }
+
+          $requiredFiles = @(
+            'makensis.exe',
+            'Bin\makensis.exe',
+            'Stubs\lzma-x86-unicode',
+            'Stubs\lzma_solid-x86-unicode',
+            'Plugins\x86-unicode\additional\nsis_tauri_utils.dll',
+            'Include\MUI2.nsh',
+            'Include\FileFunc.nsh',
+            'Include\x64.nsh',
+            'Include\nsDialogs.nsh',
+            'Include\WinMessages.nsh',
+            'Include\Win\COM.nsh',
+            'Include\Win\Propkey.nsh',
+            'Include\Win\RestartManager.nsh'
+          )
+          foreach ($relativePath in $requiredFiles) {
+            $tool = Get-Item -LiteralPath (Join-Path $nsisCache $relativePath)
+            if ($tool.PSIsContainer -or $tool.Length -le 0) {
+              throw "missing or empty NSIS tool file: $relativePath"
+            }
+            if ($tool.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+              throw "NSIS tool file is a reparse point: $relativePath"
+            }
+          }
+          $cachedUtils = Join-Path $nsisCache 'Plugins\x86-unicode\additional\nsis_tauri_utils.dll'
+          if ((Get-FileHash -LiteralPath $cachedUtils -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected[$utilsDll].Sha256) {
+            throw 'cached nsis_tauri_utils.dll differs from the verified download'
+          }
+
+          $env:LOCALAPPDATA = $isolatedLocalAppData
+          $nodeExe = Join-Path $env:NODE_ROOT 'node.exe'
+          $tauriJs = Join-Path $env:SOURCE_ROOT 'node_modules\@tauri-apps\cli\tauri.js'
+          & $nodeExe $tauriJs bundle --bundles nsis
+          if ($LASTEXITCODE -ne 0) { throw "Tauri bundle --bundles nsis failed with exit code $LASTEXITCODE" }
+
+      - name: Verify and stage build outputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $targetRelease = Join-Path $env:SOURCE_ROOT 'src-tauri\target\release'
+          $helperPath = Join-Path $targetRelease 'kwik-helper.exe'
+          $appPath = Join-Path $targetRelease 'vpn-client.exe'
+          $nsisDirectory = Join-Path $targetRelease 'bundle\nsis'
+          $installers = @(Get-ChildItem -LiteralPath $nsisDirectory -File -Filter '*-setup.exe')
+          if ($installers.Count -ne 1) {
+            throw "expected exactly one NSIS setup executable, found $($installers.Count)"
+          }
+
+          $outputs = @(
+            [pscustomobject]@{ Label = 'kwik-helper.exe'; Path = $helperPath },
+            [pscustomobject]@{ Label = 'vpn-client.exe'; Path = $appPath },
+            [pscustomobject]@{ Label = $installers[0].Name; Path = $installers[0].FullName }
+          )
+          foreach ($output in $outputs) {
+            if (!(Test-Path -LiteralPath $output.Path -PathType Leaf)) {
+              throw "expected build output is missing: $($output.Path)"
+            }
+            $file = Get-Item -LiteralPath $output.Path
+            if ($file.Length -le 0) {
+              throw "expected build output is empty: $($output.Path)"
+            }
+            $sha256 = (Get-FileHash -LiteralPath $output.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Host "$($output.Label) bytes=$($file.Length) sha256=$sha256"
+          }
+
+          # Only the installer is uploaded. Helper/app hashes above are useful
+          # build provenance in logs but must not appear in the artifact manifest.
+          $installerSha256 = (Get-FileHash -LiteralPath $installers[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksumLines = @("$installerSha256  $($installers[0].Name)")
+
+          $artifactRoot = Join-Path $env:RUNNER_TEMP 'kwikproxy-secure-nsis-artifact'
+          if (Test-Path -LiteralPath $artifactRoot) {
+            throw "artifact staging directory unexpectedly exists: $artifactRoot"
+          }
+          New-Item -ItemType Directory -Path $artifactRoot -ErrorAction Stop | Out-Null
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $artifactRoot -ErrorAction Stop
+          $checksumPath = Join-Path $artifactRoot 'SHA256SUMS.txt'
+          Set-Content -LiteralPath $checksumPath -Value $checksumLines -Encoding ASCII
+          if ((Get-Item -LiteralPath $checksumPath).Length -le 0) {
+            throw 'checksum manifest is empty'
+          }
+
+      - name: Upload unsigned NSIS installer and checksums
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: KwikProxy-Secure-${{ github.sha }}-unsigned-nsis
+          path: |
+            ${{ runner.temp }}/kwikproxy-secure-nsis-artifact/*-setup.exe
+            ${{ runner.temp }}/kwikproxy-secure-nsis-artifact/SHA256SUMS.txt
+          if-no-files-found: error
+          overwrite: false
+          include-hidden-files: false
+          retention-days: 3
+          compression-level: 0
