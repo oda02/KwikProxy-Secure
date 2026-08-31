@@ -27,6 +27,8 @@ struct ActiveOwner {
     tunnel_active: bool,
     firewall_active: bool,
     tun_device: Option<String>,
+    tunnel_pid: Option<u32>,
+    tunnel_instance_id: Option<String>,
 }
 
 impl ActiveOwner {
@@ -65,6 +67,8 @@ impl BrokerState {
                     tunnel_active: false,
                     firewall_active: false,
                     tun_device: None,
+                    tunnel_pid: None,
+                    tunnel_instance_id: None,
                 });
                 Ok(())
             }
@@ -96,13 +100,24 @@ impl BrokerState {
             .is_some_and(|owner| owner.tunnel_active || owner.firewall_active)
     }
 
-    fn note_tunnel_exit(&mut self, generation: &str, session_id: u32) -> Option<bool> {
+    fn note_tunnel_exit(
+        &mut self,
+        generation: &str,
+        session_id: u32,
+        pid: u32,
+        instance_id: &str,
+    ) -> Option<bool> {
         let owner = self.owner.as_mut()?;
-        if !owner.matches(generation, session_id) {
+        if !owner.matches(generation, session_id)
+            || owner.tunnel_pid != Some(pid)
+            || owner.tunnel_instance_id.as_deref() != Some(instance_id)
+        {
             return None;
         }
         owner.tunnel_active = false;
         owner.tun_device = None;
+        owner.tunnel_pid = None;
+        owner.tunnel_instance_id = None;
         Some(owner.firewall_active)
     }
 }
@@ -186,10 +201,16 @@ async fn handle_mutating(
             } else {
                 None
             };
-            let tun_if = super::tun::current_tun_interface_index(expect_tun, expected_device).await;
-            if expect_tun && tun_if.is_none() {
-                hlog("[helper-dispatch] exact session-owned TUN adapter was not found");
-            }
+            let tun_if =
+                match super::tun::current_tun_interface_index(expect_tun, expected_device).await {
+                    Ok(interface) => interface,
+                    Err(error) => {
+                        state.release_if_idle();
+                        return Response::err(format!(
+                            "TUN kill-switch ownership gate failed: {error:#}"
+                        ));
+                    }
+                };
             firewall::enable(
                 server_ips,
                 allow_lan,
@@ -252,10 +273,12 @@ async fn handle_mutating(
             }
             mihomo::start(&config_yaml, allow_lan, installation, client.session_id)
                 .await
-                .map(|tun_device| {
+                .map(|started| {
                     if let Some(owner) = state.owner.as_mut() {
                         owner.tunnel_active = true;
-                        owner.tun_device = Some(tun_device);
+                        owner.tun_device = Some(started.tun_device);
+                        owner.tunnel_pid = Some(started.pid);
+                        owner.tunnel_instance_id = Some(started.instance_id);
                     }
                 })
         }
@@ -277,6 +300,8 @@ async fn handle_mutating(
                     if let Some(owner) = state.owner.as_mut() {
                         owner.tunnel_active = false;
                         owner.tun_device = None;
+                        owner.tunnel_pid = None;
+                        owner.tunnel_instance_id = None;
                     }
                     state.release_if_idle();
                     Ok(())
@@ -304,9 +329,15 @@ async fn handle_mutating(
 /// Reconcile broker/WFP ownership after the monitored SYSTEM Mihomo child
 /// exits without an explicit stop request. Matching is exact, so a delayed
 /// monitor from an older process cannot clear a replacement session.
-pub async fn on_tunnel_process_exit(session_id: u32, generation: &str) {
+pub async fn on_tunnel_process_exit(
+    session_id: u32,
+    generation: &str,
+    pid: u32,
+    instance_id: &str,
+) {
     let mut state = broker().lock().await;
-    let Some(firewall_active) = state.note_tunnel_exit(generation, session_id) else {
+    let Some(firewall_active) = state.note_tunnel_exit(generation, session_id, pid, instance_id)
+    else {
         return;
     };
     if firewall_active {
@@ -356,6 +387,8 @@ mod tests {
                 tunnel_active: true,
                 firewall_active: false,
                 tun_device: Some("kwikproxy-secure-owned".into()),
+                tunnel_pid: Some(701),
+                tunnel_instance_id: Some("instance-a".into()),
             }),
         }
     }
@@ -387,12 +420,29 @@ mod tests {
     #[test]
     fn spontaneous_exit_clears_only_matching_tunnel_owner() {
         let mut state = state();
-        assert_eq!(state.note_tunnel_exit("generation-b", 7), None);
+        assert_eq!(
+            state.note_tunnel_exit("generation-b", 7, 701, "instance-a"),
+            None
+        );
         assert!(state.owner.as_ref().unwrap().tunnel_active);
-        assert_eq!(state.note_tunnel_exit("generation-a", 7), Some(false));
+        assert_eq!(
+            state.note_tunnel_exit("generation-a", 7, 701, "instance-a"),
+            Some(false)
+        );
         assert!(!state.owner.as_ref().unwrap().tunnel_active);
         assert!(state.owner.as_ref().unwrap().tun_device.is_none());
         state.release_if_idle();
         assert!(state.owner.is_none());
+    }
+
+    #[test]
+    fn stale_same_session_monitor_cannot_clear_replacement() {
+        let mut state = state();
+        assert_eq!(
+            state.note_tunnel_exit("generation-a", 7, 700, "instance-old"),
+            None
+        );
+        assert!(state.owner.as_ref().unwrap().tunnel_active);
+        assert!(state.owner.as_ref().unwrap().firewall_active == false);
     }
 }

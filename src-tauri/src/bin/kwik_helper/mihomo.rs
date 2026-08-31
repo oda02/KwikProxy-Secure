@@ -40,6 +40,13 @@ struct State {
     session_id: u32,
     generation: String,
     tun_device: String,
+    instance_id: String,
+}
+
+pub struct StartedTunnel {
+    pub tun_device: String,
+    pub pid: u32,
+    pub instance_id: String,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::const_new(None);
@@ -49,7 +56,7 @@ pub async fn start(
     allow_lan: bool,
     installation: &Installation,
     session_id: u32,
-) -> Result<String> {
+) -> Result<StartedTunnel> {
     if config_yaml.len() > MAX_CONFIG_BYTES {
         bail!("mihomo config exceeds {MAX_CONFIG_BYTES} bytes");
     }
@@ -122,6 +129,7 @@ pub async fn start(
     super::helper_log::log(
         "[helper-mihomo] stage=readiness outcome=ok code=controller_and_tun_ready",
     );
+    let instance_id = uuid::Uuid::new_v4().to_string();
     *state = Some(State {
         child,
         pid,
@@ -129,6 +137,7 @@ pub async fn start(
         session_id,
         generation: installation.generation.clone(),
         tun_device: tun_device.clone(),
+        instance_id: instance_id.clone(),
     });
     drop(state);
     spawn_exit_monitor(
@@ -136,8 +145,13 @@ pub async fn start(
         session_id,
         installation.generation.clone(),
         tun_device.clone(),
+        instance_id.clone(),
     );
-    Ok(tun_device)
+    Ok(StartedTunnel {
+        tun_device,
+        pid,
+        instance_id,
+    })
 }
 
 async fn loopback_listener_ready(address: std::net::SocketAddr) -> bool {
@@ -175,7 +189,13 @@ async fn wait_for_child_readiness(
     }
 }
 
-fn spawn_exit_monitor(pid: u32, session_id: u32, generation: String, tun_device: String) {
+fn spawn_exit_monitor(
+    pid: u32,
+    session_id: u32,
+    generation: String,
+    tun_device: String,
+    instance_id: String,
+) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -187,6 +207,7 @@ fn spawn_exit_monitor(pid: u32, session_id: u32, generation: String, tun_device:
                 if active.pid != pid
                     || active.session_id != session_id
                     || active.generation != generation
+                    || active.instance_id != instance_id
                 {
                     return;
                 }
@@ -207,7 +228,8 @@ fn spawn_exit_monitor(pid: u32, session_id: u32, generation: String, tun_device:
                     "[helper-mihomo] stage=orphan_cleanup outcome=error code=cleanup_failed",
                 );
             }
-            super::dispatch::on_tunnel_process_exit(session_id, &generation).await;
+            super::dispatch::on_tunnel_process_exit(session_id, &generation, pid, &instance_id)
+                .await;
             return;
         }
     });

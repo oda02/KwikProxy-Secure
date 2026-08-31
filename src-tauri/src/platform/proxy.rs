@@ -18,8 +18,7 @@ use std::path::PathBuf;
 use winreg::{enums::*, RegKey};
 
 #[cfg(windows)]
-const INET_SETTINGS: &str =
-    r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+const INET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
 const BACKUP_DIR: &str = "KwikProxy Secure";
 const BACKUP_FILE: &str = "proxy_backup.json";
@@ -27,6 +26,15 @@ const BACKUP_FILE: &str = "proxy_backup.json";
 /// Снимок настроек системного прокси для backup/restore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyBackup {
+    /// Unique connect attempt that created this backup. Legacy backups have
+    /// no owner and can be restored by an explicit disconnect/recovery, but
+    /// must never be consumed by a failed, unrelated connect attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    /// Exact value published by this attempt. Rollback refuses to overwrite
+    /// registry state if another application changed it in the meantime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_proxy_server: Option<String>,
     /// Значение `ProxyEnable` (0/1). None — ключ отсутствовал.
     pub proxy_enable: Option<u32>,
     /// Значение `ProxyServer`. None — ключ отсутствовал.
@@ -61,22 +69,24 @@ fn read_current_proxy_state() -> Result<ProxyBackup> {
         .context("не удалось открыть Internet Settings в реестре")?;
 
     Ok(ProxyBackup {
+        attempt_id: None,
+        published_proxy_server: None,
         proxy_enable: key.get_value("ProxyEnable").ok(),
         proxy_server: key.get_value("ProxyServer").ok(),
         proxy_override: key.get_value("ProxyOverride").ok(),
     })
 }
 
-/// Сохранить backup в файл (создаёт папку если нужно). Тихо игнорирует
-/// ошибки IO — backup это страховка, не критичный путь.
-fn save_backup(backup: &ProxyBackup) {
-    let Some(path) = backup_path() else { return };
+/// Сохранить backup до registry publication. Ошибка записи fail-closed:
+/// без устойчивого ownership marker системный proxy не меняется.
+fn save_backup(backup: &ProxyBackup) -> Result<()> {
+    let path = backup_path().context("LOCALAPPDATA is unavailable")?;
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).context("create proxy backup directory")?;
     }
-    if let Ok(json) = serde_json::to_string_pretty(backup) {
-        let _ = std::fs::write(&path, json);
-    }
+    let json = serde_json::to_vec_pretty(backup).context("serialize proxy backup")?;
+    std::fs::write(&path, json).context("write proxy backup")?;
+    Ok(())
 }
 
 /// Удалить backup-файл (best-effort). Вызывается после успешного restore.
@@ -104,48 +114,97 @@ pub fn read_backup() -> Option<ProxyBackup> {
 /// Перед перезаписью значений сохраняет оригиналы в backup-файл. Если в
 /// момент `clear_system_proxy` (или `restore_from_backup` после краша)
 /// мы находим backup — восстанавливаем точно эти значения.
-pub fn set_system_proxy(socks_port: u16, http_port: u16) -> Result<()> {
+pub fn set_system_proxy_owned(socks_port: u16, http_port: u16, attempt_id: &str) -> Result<()> {
     #[cfg(windows)]
     {
+        if attempt_id.is_empty() {
+            anyhow::bail!("proxy publication requires a non-empty attempt id");
+        }
         // 9.D: сохраняем текущее состояние ДО изменений, чтобы пережить
         // краш приложения. Если backup уже есть (например, мы apply-нули
         // прокси, а пользователь вызвал set ещё раз) — не перезаписываем,
         // чтобы не потерять оригинал.
-        if !has_pending_backup() {
-            if let Ok(snapshot) = read_current_proxy_state() {
-                save_backup(&snapshot);
-            }
+        if has_pending_backup() {
+            anyhow::bail!(
+                "proxy backup from another connection is pending; recover it before connecting"
+            );
         }
-
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let (key, _) = hkcu
-            .create_subkey(INET_SETTINGS)
-            .context("не удалось открыть Internet Settings в реестре")?;
-
-        // Формат строки: "protocol=host:port;..."
         let proxy_server = format!(
             "socks=127.0.0.1:{socks_port};http=127.0.0.1:{http_port};https=127.0.0.1:{http_port}"
         );
-        key.set_value("ProxyServer", &proxy_server)
-            .context("ProxyServer")?;
-        key.set_value("ProxyEnable", &1u32)
-            .context("ProxyEnable")?;
-        // Bypass: локальные адреса и LAN не идут через прокси
-        key.set_value(
-            "ProxyOverride",
-            &"localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;\
-              172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;\
-              172.29.*;172.30.*;172.31.*;192.168.*;<local>",
-        )
-        .context("ProxyOverride")?;
+        let mut snapshot = read_current_proxy_state()?;
+        snapshot.attempt_id = Some(attempt_id.to_string());
+        snapshot.published_proxy_server = Some(proxy_server.clone());
+        save_backup(&snapshot)?;
+
+        let publication = (|| -> Result<()> {
+            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+            let (key, _) = hkcu
+                .create_subkey(INET_SETTINGS)
+                .context("не удалось открыть Internet Settings в реестре")?;
+
+            // Формат строки: "protocol=host:port;..."
+            key.set_value("ProxyServer", &proxy_server)
+                .context("ProxyServer")?;
+            key.set_value("ProxyEnable", &1u32).context("ProxyEnable")?;
+            // Bypass: локальные адреса и LAN не идут через прокси
+            key.set_value(
+                "ProxyOverride",
+                &"localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;\
+                  172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;\
+                  172.29.*;172.30.*;172.31.*;192.168.*;<local>",
+            )
+            .context("ProxyOverride")?;
+            notify_proxy_settings_changed()
+        })();
+        if let Err(publication_error) = publication {
+            if let Err(restore_error) = apply_backup(&snapshot) {
+                anyhow::bail!(
+                    "proxy publication failed ({publication_error:#}); immediate restore also failed ({restore_error:#})"
+                );
+            }
+            delete_backup();
+            return Err(publication_error);
+        }
 
         Ok(())
     }
 
     #[cfg(not(windows))]
     {
-        let _ = (socks_port, http_port);
+        let _ = (socks_port, http_port, attempt_id);
         Ok(()) // на macOS/Linux — заглушка, реализуем при портировании
+    }
+}
+
+/// Roll back only the system-proxy publication owned by `attempt_id`.
+/// Absence or a different/legacy marker is a successful no-op.
+pub fn clear_system_proxy_owned(attempt_id: &str) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let Some(backup) = read_backup() else {
+            return Ok(false);
+        };
+        if backup.attempt_id.as_deref() != Some(attempt_id) {
+            return Ok(false);
+        }
+        let published = backup
+            .published_proxy_server
+            .as_deref()
+            .context("attempt-owned proxy backup lacks its publication value")?;
+        if read_proxy_enable() != Some(1) || read_proxy_server().as_deref() != Some(published) {
+            anyhow::bail!(
+                "system proxy changed after this connect attempt; refusing to overwrite foreign state"
+            );
+        }
+        apply_backup(&backup)?;
+        delete_backup();
+        Ok(true)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = attempt_id;
+        Ok(false)
     }
 }
 
@@ -242,6 +301,21 @@ fn write_proxy_disabled() -> Result<()> {
     key.set_value("ProxyEnable", &0u32).context("ProxyEnable")?;
     let _ = key.delete_value("ProxyServer");
     let _ = key.delete_value("ProxyOverride");
+    notify_proxy_settings_changed()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn notify_proxy_settings_changed() -> Result<()> {
+    use windows_sys::Win32::Networking::WinInet::{
+        InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+    };
+    for option in [INTERNET_OPTION_SETTINGS_CHANGED, INTERNET_OPTION_REFRESH] {
+        if unsafe { InternetSetOptionW(std::ptr::null_mut(), option, std::ptr::null_mut(), 0) } == 0
+        {
+            anyhow::bail!("InternetSetOptionW({option}) failed");
+        }
+    }
     Ok(())
 }
 
@@ -373,5 +447,37 @@ fn apply_backup(backup: &ProxyBackup) -> Result<()> {
             let _ = key.delete_value("ProxyOverride");
         }
     }
+    notify_proxy_settings_changed()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_backup_has_no_attempt_owner() {
+        let backup: ProxyBackup =
+            serde_json::from_str(r#"{"proxy_enable":0,"proxy_server":null,"proxy_override":null}"#)
+                .unwrap();
+        assert_eq!(backup.attempt_id, None);
+    }
+
+    #[test]
+    fn attempt_owner_roundtrips() {
+        let backup = ProxyBackup {
+            attempt_id: Some("attempt-a".into()),
+            published_proxy_server: Some("http=127.0.0.1:30000".into()),
+            proxy_enable: Some(0),
+            proxy_server: None,
+            proxy_override: None,
+        };
+        let json = serde_json::to_string(&backup).unwrap();
+        let decoded: ProxyBackup = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.attempt_id.as_deref(), Some("attempt-a"));
+        assert_eq!(
+            decoded.published_proxy_server.as_deref(),
+            Some("http=127.0.0.1:30000")
+        );
+    }
 }

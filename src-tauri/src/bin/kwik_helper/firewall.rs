@@ -138,7 +138,7 @@ pub async fn enable(
     allow_app_paths: Vec<PathBuf>,
     block_dns: bool,
     allow_dns_ips: Vec<String>,
-    tun_interface_index: Option<u32>,
+    tun_interface: Option<super::tun::OwnedTunInterface>,
     strict_mode: bool,
     force_disable_ipv6: bool,
 ) -> Result<()> {
@@ -149,7 +149,7 @@ pub async fn enable(
             allow_app_paths,
             block_dns,
             allow_dns_ips,
-            tun_interface_index,
+            tun_interface,
             strict_mode,
             force_disable_ipv6,
         )
@@ -165,7 +165,7 @@ fn enable_blocking(
     allow_app_paths: Vec<PathBuf>,
     block_dns: bool,
     allow_dns_ips: Vec<String>,
-    tun_interface_index: Option<u32>,
+    tun_interface: Option<super::tun::OwnedTunInterface>,
     strict_mode: bool,
     force_disable_ipv6: bool,
 ) -> Result<()> {
@@ -176,7 +176,7 @@ fn enable_blocking(
         allow_app_paths.len(),
         block_dns,
         allow_dns_ips.len(),
-        tun_interface_index,
+        tun_interface,
         strict_mode,
         force_disable_ipv6,
     ));
@@ -397,10 +397,11 @@ fn enable_blocking(
         //
         // На слое ALE_AUTH_CONNECT работает только `IP_LOCAL_INTERFACE`
         // (UINT64 LUID), а не `INTERFACE_INDEX` (UINT32 — он только на
-        // IPPACKET-слоях). Резолвим ifIndex → LUID через IpHelper API.
-        if let Some(if_idx) = tun_interface_index {
-            match super::routing::luid_from_index(if_idx) {
-                Ok(luid) => {
+        // IPPACKET-слоях). Alias/index/LUID were already resolved and
+        // cross-checked atomically by the privileged TUN ownership gate.
+        if let Some(interface) = tun_interface {
+            let if_idx = interface.if_index;
+            let luid = interface.luid;
                     // 14.D: при force_disable_ipv6 пропускаем TUN allow на v6.
                     // Если приложение шлёт v6-пакет в TUN, он упирается в
                     // base block-all v6 (нет allow для v6 LUID) и блокируется.
@@ -425,13 +426,6 @@ fn enable_blocking(
                         "[wfp-killswitch] TUN-interface allow added (ifIndex={if_idx}, luid=0x{luid:016x}, v6={})",
                         !force_disable_ipv6,
                     ));
-                }
-                Err(e) => {
-                    hlog(&format!(
-                        "[wfp-killswitch] luid_from_index({if_idx}) failed: {e:#} — TUN allow пропущен"
-                    ));
-                }
-            }
         }
 
         // ── DNS leak protection (этап 13.D step B) ──────────────────

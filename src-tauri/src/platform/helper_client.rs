@@ -35,7 +35,10 @@ const PIPE_NAME: &str = r"\\.\pipe\KwikProxySecure.Helper.v14";
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_BYTES: usize = 1400 * 1024;
 const MAX_REQUEST_BYTES: usize = 1536 * 1024;
-const IO_TIMEOUT: Duration = Duration::from_secs(8);
+// StartTunnel readiness is bounded at 10 seconds and may perform a further
+// bounded child cleanup before replying. Keep the outer transport deadline
+// comfortably beyond that complete request transaction.
+const IO_TIMEOUT: Duration = Duration::from_secs(20);
 const MANIFEST_KEY: &str = r"SOFTWARE\KwikProxySecure";
 const MANIFEST_VALUE: &str = "ManifestV1";
 
@@ -531,6 +534,11 @@ mod tests {
             r#"{"cmd":"start_tunnel","config_yaml":"mixed-port: 7890","allow_lan":false}"#
         );
         assert!(!json.contains("path"));
+    }
+
+    #[test]
+    fn pipe_deadline_covers_privileged_readiness_and_cleanup() {
+        assert!(IO_TIMEOUT > Duration::from_secs(10 + 3));
     }
 
     #[test]

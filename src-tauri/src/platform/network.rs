@@ -20,8 +20,8 @@ pub fn get_default_route_interface_name() -> Option<String> {
     use std::mem;
     use windows_sys::Win32::Foundation::NO_ERROR;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToAlias, FreeMibTable,
-        GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
+        ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToAlias, FreeMibTable, GetIpForwardTable2,
+        MIB_IPFORWARD_TABLE2,
     };
     use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
     use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN, SOCKADDR_INET};
@@ -63,12 +63,13 @@ pub fn get_default_route_interface_name() -> Option<String> {
             return None;
         }
         let mut alias_buf = [0u16; 256];
-        if ConvertInterfaceLuidToAlias(&luid, alias_buf.as_mut_ptr(), alias_buf.len())
-            != NO_ERROR
-        {
+        if ConvertInterfaceLuidToAlias(&luid, alias_buf.as_mut_ptr(), alias_buf.len()) != NO_ERROR {
             return None;
         }
-        let len = alias_buf.iter().position(|&c| c == 0).unwrap_or(alias_buf.len());
+        let len = alias_buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(alias_buf.len());
         let alias = String::from_utf16_lossy(&alias_buf[..len]);
         if alias.is_empty() {
             None
@@ -106,17 +107,14 @@ fn is_foreign_default_route(
     physical_interface: Option<u32>,
     kwik_tun_gateway: u32,
 ) -> bool {
-    if prefix_len > 1
-        || next_hop == kwik_tun_gateway
-        || Some(interface_index) == physical_interface
+    if prefix_len > 1 || next_hop == kwik_tun_gateway || Some(interface_index) == physical_interface
     {
         return false;
     }
-    // A Wintun default is commonly on-link (0.0.0.0 next hop). It is
-    // foreign when Windows also exposes a distinct physical gateway route.
-    // If no physical route can be identified, stay fail-open for detection
-    // rather than falsely blocking a machine whose real uplink is on-link.
-    next_hop != 0 || physical_interface.is_some()
+    // An on-link /0 or /1 is not ownership evidence: Hyper-V, cellular,
+    // policy routes and ordinary point-to-point uplinks can all create one.
+    // Only a route with an explicit non-product gateway is actionable here.
+    next_hop != 0
 }
 
 #[cfg(windows)]
@@ -125,8 +123,8 @@ pub fn detect_routing_conflicts() -> Vec<String> {
     use std::mem;
     use windows_sys::Win32::Foundation::NO_ERROR;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToAlias, FreeMibTable,
-        GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
+        ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToAlias, FreeMibTable, GetIpForwardTable2,
+        MIB_IPFORWARD_TABLE2,
     };
     use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
     use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN, SOCKADDR_INET};
@@ -254,9 +252,21 @@ mod conflict_tests {
     const KWIK_GATEWAY: u32 = 0x0100_12C6;
 
     #[test]
-    fn foreign_on_link_default_is_a_conflict() {
-        assert!(is_foreign_default_route(0, 0, 27, Some(14), KWIK_GATEWAY));
+    fn on_link_defaults_are_advisory_not_hard_conflicts() {
+        assert!(!is_foreign_default_route(0, 0, 27, Some(14), KWIK_GATEWAY));
+        assert!(!is_foreign_default_route(1, 0, 27, Some(14), KWIK_GATEWAY));
         assert!(!is_foreign_default_route(0, 0, 14, Some(14), KWIK_GATEWAY));
+    }
+
+    #[test]
+    fn explicit_foreign_gateway_on_distinct_interface_is_a_conflict() {
+        assert!(is_foreign_default_route(
+            0,
+            0x0101_A8C0,
+            27,
+            Some(14),
+            KWIK_GATEWAY,
+        ));
     }
 
     #[test]
@@ -305,10 +315,7 @@ pub fn has_orphan_tun_adapters() -> bool {
                 .position(|&c| c == 0)
                 .unwrap_or(row.Alias.len());
             let alias = String::from_utf16_lossy(&row.Alias[..alias_len]);
-            if alias
-                .to_ascii_lowercase()
-                .starts_with("kwikproxy-secure-")
-            {
+            if alias.to_ascii_lowercase().starts_with("kwikproxy-secure-") {
                 found = true;
                 break;
             }
@@ -356,8 +363,8 @@ pub fn list_routing_table() -> Vec<RouteEntry> {
     use std::mem;
     use windows_sys::Win32::Foundation::NO_ERROR;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToAlias, FreeMibTable,
-        GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
+        ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToAlias, FreeMibTable, GetIpForwardTable2,
+        MIB_IPFORWARD_TABLE2,
     };
     use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
     use windows_sys::Win32::Networking::WinSock::{
@@ -368,43 +375,44 @@ pub fn list_routing_table() -> Vec<RouteEntry> {
 
     // Кеш ifIndex → alias чтобы не дёргать ConvertInterfaceLuid* на каждый
     // route (одна и та же сетевая карта обычно засветится в 5+ маршрутах).
-    let mut alias_cache: std::collections::HashMap<u32, String> =
-        std::collections::HashMap::new();
+    let mut alias_cache: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
 
-    let resolve_alias = |if_idx: u32,
-                         cache: &mut std::collections::HashMap<u32, String>|
-     -> String {
-        if let Some(s) = cache.get(&if_idx) {
-            return s.clone();
-        }
-        unsafe {
-            let mut luid: NET_LUID_LH = mem::zeroed();
-            if ConvertInterfaceIndexToLuid(if_idx, &mut luid) != 0 {
-                let s = format!("if{if_idx}");
-                cache.insert(if_idx, s.clone());
-                return s;
+    let resolve_alias =
+        |if_idx: u32, cache: &mut std::collections::HashMap<u32, String>| -> String {
+            if let Some(s) = cache.get(&if_idx) {
+                return s.clone();
             }
-            let mut buf = [0u16; 256];
-            if ConvertInterfaceLuidToAlias(&luid, buf.as_mut_ptr(), buf.len()) != NO_ERROR {
-                let s = format!("if{if_idx}");
+            unsafe {
+                let mut luid: NET_LUID_LH = mem::zeroed();
+                if ConvertInterfaceIndexToLuid(if_idx, &mut luid) != 0 {
+                    let s = format!("if{if_idx}");
+                    cache.insert(if_idx, s.clone());
+                    return s;
+                }
+                let mut buf = [0u16; 256];
+                if ConvertInterfaceLuidToAlias(&luid, buf.as_mut_ptr(), buf.len()) != NO_ERROR {
+                    let s = format!("if{if_idx}");
+                    cache.insert(if_idx, s.clone());
+                    return s;
+                }
+                let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                let s = String::from_utf16_lossy(&buf[..len]);
+                let s = if s.is_empty() {
+                    format!("if{if_idx}")
+                } else {
+                    s
+                };
                 cache.insert(if_idx, s.clone());
-                return s;
+                s
             }
-            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-            let s = String::from_utf16_lossy(&buf[..len]);
-            let s = if s.is_empty() { format!("if{if_idx}") } else { s };
-            cache.insert(if_idx, s.clone());
-            s
-        }
-    };
+        };
 
     // ── IPv4 ─────────────────────────────────────────────────────────────
     unsafe {
         let mut fwd_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
         if GetIpForwardTable2(AF_INET, &mut fwd_ptr) == NO_ERROR && !fwd_ptr.is_null() {
             let fwd = &*fwd_ptr;
-            let entries =
-                std::slice::from_raw_parts(fwd.Table.as_ptr(), fwd.NumEntries as usize);
+            let entries = std::slice::from_raw_parts(fwd.Table.as_ptr(), fwd.NumEntries as usize);
             for e in entries {
                 let prefix_len = e.DestinationPrefix.PrefixLength;
                 let dest = &e.DestinationPrefix.Prefix;
@@ -459,8 +467,7 @@ pub fn list_routing_table() -> Vec<RouteEntry> {
         let mut fwd_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
         if GetIpForwardTable2(AF_INET6, &mut fwd_ptr) == NO_ERROR && !fwd_ptr.is_null() {
             let fwd = &*fwd_ptr;
-            let entries =
-                std::slice::from_raw_parts(fwd.Table.as_ptr(), fwd.NumEntries as usize);
+            let entries = std::slice::from_raw_parts(fwd.Table.as_ptr(), fwd.NumEntries as usize);
             for e in entries {
                 let prefix_len = e.DestinationPrefix.PrefixLength;
                 let dest = &e.DestinationPrefix.Prefix;

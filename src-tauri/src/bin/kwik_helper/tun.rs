@@ -19,7 +19,7 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use windows_sys::Win32::Foundation::NO_ERROR;
 use windows_sys::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
 
@@ -41,7 +41,7 @@ const IF_OPER_STATUS_UP: i32 = 1;
 pub async fn current_tun_interface_index(
     expect_tun: bool,
     expected_alias: Option<String>,
-) -> Option<u32> {
+) -> Result<Option<OwnedTunInterface>> {
     if !expect_tun {
         // Proxy-режим: TUN-адаптера быть не должно. Если от прошлой
         // TUN-сессии остался stale owned adapter (Mihomo умер
@@ -50,51 +50,89 @@ pub async fn current_tun_interface_index(
         // мёртвым LUID, FwpmFilterAdd0 валит транзакцию целиком.
         // Просто возвращаем None, никакого scan'а.
         hlog("[helper-tun] current_tun_interface_index: proxy-режим, TUN-поиск пропущен");
-        return None;
+        return Ok(None);
     }
-    let expected_alias = expected_alias?;
+    let expected_alias =
+        expected_alias.ok_or_else(|| anyhow!("TUN mode requires an exact session-owned alias"))?;
     if !expected_alias.starts_with(TUN_NAME_PREFIX) {
-        return None;
+        bail!("TUN alias does not use the reserved product prefix");
     }
     hlog("[helper-tun] current_tun_interface_index: TUN-режим, ищем активный адаптер");
     let max_attempts = 50;
     for attempt in 0..max_attempts {
         let alias = expected_alias.clone();
-        let res = tokio::task::spawn_blocking(move || find_owned_tun_interface_index(&alias)).await;
-        if let Ok(Some(idx)) = res {
+        let found = tokio::task::spawn_blocking(move || find_owned_tun_interface(&alias))
+            .await
+            .map_err(|error| anyhow!("owned TUN lookup task failed: {error}"))??;
+        if let Some(interface) = found {
             hlog(&format!(
-                "[helper-tun] TUN-адаптер найден после {}мс retry, ifIndex={idx}",
-                attempt * 100
+                "[helper-tun] TUN-адаптер найден после {}мс retry, ifIndex={}, luid=0x{:016x}",
+                attempt * 100,
+                interface.if_index,
+                interface.luid,
             ));
-            return Some(idx);
+            return Ok(Some(interface));
         }
         if attempt + 1 < max_attempts {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
     hlog("[helper-tun] TUN-адаптер не появился за 5с retry — kill-switch без TUN allow!");
-    None
+    bail!("exact active session-owned TUN adapter did not appear within 5 seconds")
 }
 
 /// Кандидат-адаптер: индекс + alias + description (для логов).
 #[derive(Debug, Clone)]
 struct TunCandidate {
     if_index: u32,
+    luid: u64,
     alias: String,
     description: String,
 }
 
 /// Synchronous lookup based only on the reserved product alias.
-fn find_owned_tun_interface_index(expected_alias: &str) -> Option<u32> {
-    let candidates = scan_owned_interfaces();
-    let candidate = candidates
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnedTunInterface {
+    pub if_index: u32,
+    pub luid: u64,
+}
+
+fn find_owned_tun_interface(expected_alias: &str) -> Result<Option<OwnedTunInterface>> {
+    let candidates = scan_owned_interfaces()?;
+    let mut matches = candidates
         .iter()
-        .find(|candidate| candidate.alias == expected_alias)?;
+        .filter(|candidate| candidate.alias == expected_alias);
+    let Some(candidate) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        bail!("multiple active interfaces share the exact session-owned TUN alias");
+    }
+    let converted_luid = routing::luid_from_index(candidate.if_index)?;
+    let identity = verify_candidate_identity(candidate, converted_luid)?;
     hlog(&format!(
         "[helper-tun] exact owned adapter found: ifIndex={} alias={:?} desc={:?}",
         candidate.if_index, candidate.alias, candidate.description
     ));
-    Some(candidate.if_index)
+    Ok(Some(identity))
+}
+
+fn verify_candidate_identity(
+    candidate: &TunCandidate,
+    converted_luid: u64,
+) -> Result<OwnedTunInterface> {
+    if candidate.if_index == 0 || candidate.luid == 0 || converted_luid != candidate.luid {
+        bail!(
+            "TUN alias/index/LUID identity changed during lookup (ifIndex={}, rowLuid=0x{:016x}, convertedLuid=0x{:016x})",
+            candidate.if_index,
+            candidate.luid,
+            converted_luid,
+        );
+    }
+    Ok(OwnedTunInterface {
+        if_index: candidate.if_index,
+        luid: candidate.luid,
+    })
 }
 
 /// Single ownership-safe readiness observation. Unlike
@@ -106,19 +144,19 @@ pub async fn owned_tun_interface_ready(expected_alias: &str) -> bool {
         return false;
     }
     let alias = expected_alias.to_string();
-    tokio::task::spawn_blocking(move || find_owned_tun_interface_index(&alias).is_some())
+    tokio::task::spawn_blocking(move || find_owned_tun_interface(&alias).is_ok_and(|v| v.is_some()))
         .await
         .unwrap_or(false)
 }
 
 /// Enumerate only adapters bearing this fork's reserved alias prefix.
-fn scan_owned_interfaces() -> Vec<TunCandidate> {
+fn scan_owned_interfaces() -> Result<Vec<TunCandidate>> {
     let mut result = Vec::new();
     let mut table_ptr: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
     let ret = unsafe { GetIfTable2(&mut table_ptr) };
     if ret != NO_ERROR || table_ptr.is_null() {
         hlog(&format!("[helper-tun] GetIfTable2 → код {ret}"));
-        return result;
+        bail!("GetIfTable2 failed with code {ret}");
     }
 
     let table = unsafe { &*table_ptr };
@@ -136,6 +174,7 @@ fn scan_owned_interfaces() -> Vec<TunCandidate> {
         if alias_match {
             result.push(TunCandidate {
                 if_index: entry.InterfaceIndex,
+                luid: unsafe { entry.InterfaceLuid.Value },
                 alias,
                 description,
             });
@@ -155,7 +194,7 @@ fn scan_owned_interfaces() -> Vec<TunCandidate> {
     }
 
     unsafe { FreeMibTable(table_ptr as *mut _) };
-    result
+    Ok(result)
 }
 
 /// `[u16; N]` с возможным null-terminator → `String`. Обрезает до
@@ -226,5 +265,23 @@ mod tests {
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
         assert!(!"kwik-old".starts_with(TUN_NAME_PREFIX));
+    }
+
+    #[test]
+    fn exact_alias_index_luid_gate_rejects_identity_drift() {
+        let candidate = TunCandidate {
+            if_index: 42,
+            luid: 0x1234,
+            alias: "kwikproxy-secure-owned".into(),
+            description: "Wintun".into(),
+        };
+        assert_eq!(
+            verify_candidate_identity(&candidate, 0x1234).unwrap(),
+            OwnedTunInterface {
+                if_index: 42,
+                luid: 0x1234,
+            }
+        );
+        assert!(verify_candidate_identity(&candidate, 0x9999).is_err());
     }
 }

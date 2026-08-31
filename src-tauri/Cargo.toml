@@ -81,6 +81,7 @@ windows-sys = { version = "0.59", features = [
     # Используется только в helper'е — но features в windows-sys
     # глобальные на крейт, поэтому объявляем здесь.
     "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_Networking_WinInet",
     "Win32_Networking_WinSock",
     "Win32_System_Console",
     "Win32_System_Com",

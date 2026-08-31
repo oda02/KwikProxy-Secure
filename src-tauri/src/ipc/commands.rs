@@ -54,12 +54,14 @@ fn extract_server_host(entry: &ProxyEntry) -> Option<String> {
             .raw
             .get("proxies")
             .and_then(|v| v.as_array())
-            .and_then(|arr| arr.iter().find_map(|p| {
-                p.get("server")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-            }));
+            .and_then(|arr| {
+                arr.iter().find_map(|p| {
+                    p.get("server")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                })
+            });
     }
     if entry.protocol != "xray-json" {
         if entry.server.is_empty() {
@@ -187,21 +189,16 @@ pub async fn fetch_subscription(
         .filter(|s| !s.is_empty());
     let effective_hwid = match explicit_hwid {
         Some(value) => value.to_string(),
-        None if send => crate::config::hwid::for_subscription(&hwid.0, &url)
-            .map_err(|e| e.to_string())?,
+        None if send => {
+            crate::config::hwid::for_subscription(&hwid.0, &url).map_err(|e| e.to_string())?
+        }
         None => String::new(),
     };
 
     let ua = user_agent.unwrap_or_default();
 
     let trusted_socks_port = mihomo.trusted_subscription_proxy_port();
-    let (servers, meta) = fetch_and_parse(
-        &url,
-        &effective_hwid,
-        &ua,
-        send,
-        trusted_socks_port,
-    )
+    let (servers, meta) = fetch_and_parse(&url, &effective_hwid, &ua, send, trusted_socks_port)
         .await
         .map_err(|e| e.to_string())?;
     Ok(SubscriptionResult { servers, meta })
@@ -301,19 +298,73 @@ async fn rollback_connect(
     mihomo: &MihomoState,
     mihomo_api: &vpn::MihomoApiState,
     ks_ctx: &KillSwitchState,
-) {
+    proxy_attempt_id: &str,
+    expect_tunnel: bool,
+    cleanup_helper: bool,
+) -> Result<(), String> {
     vpn::diagnostics::record("connect_rollback", "started", "post_spawn_failure");
+    let mut errors = Vec::new();
     // Each stop is ownership-scoped: the local state owns only our sidecar,
     // and helper MihomoStop is authenticated/session-bound. No foreign VPN
     // process, adapter or proxy executable is selected by name.
-    let _ = platform::helper_client::mihomo_stop().await;
-    let _ = platform::helper_client::kill_switch_disable().await;
+    if cleanup_helper {
+        if let Err(error) = platform::helper_client::mihomo_stop().await {
+            errors.push(format!("stop protected Mihomo: {error:#}"));
+        }
+        if let Err(error) = platform::helper_client::kill_switch_disable().await {
+            errors.push(format!("disable kill switch: {error:#}"));
+        }
+    }
+    if cleanup_helper && expect_tunnel {
+        match platform::helper_client::tunnel_status().await {
+            Ok(false) => {}
+            Ok(true) => errors.push("protected Mihomo is still running after rollback".into()),
+            Err(error) => errors.push(format!("verify protected Mihomo stopped: {error:#}")),
+        }
+    }
     mihomo.mark_helper_spawned(false);
-    let _ = mihomo.stop();
-    let _ = platform::proxy::clear_system_proxy();
+    if let Err(error) = mihomo.stop() {
+        errors.push(format!("stop local Mihomo: {error}"));
+    }
+    match platform::proxy::clear_system_proxy_owned(proxy_attempt_id) {
+        Ok(_) => mihomo.clear_proxy_attempt(proxy_attempt_id),
+        Err(error) => errors.push(format!("restore attempt-owned system proxy: {error:#}")),
+    }
     mihomo_api.clear();
     *ks_ctx.0.lock().await = None;
-    vpn::diagnostics::record("connect_rollback", "ok", "owned_state_cleared");
+    if errors.is_empty() {
+        vpn::diagnostics::record("connect_rollback", "ok", "verified_owned_state_cleared");
+        Ok(())
+    } else {
+        vpn::diagnostics::record("connect_rollback", "error", "cleanup_incomplete");
+        Err(errors.join("; "))
+    }
+}
+
+fn append_rollback_error(primary: String, rollback: Result<(), String>) -> String {
+    match rollback {
+        Ok(()) => primary,
+        Err(cleanup) => format!("{primary}; rollback incomplete: {cleanup}"),
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::append_rollback_error;
+
+    #[test]
+    fn cleanup_failures_are_not_reported_as_success() {
+        assert_eq!(
+            append_rollback_error("connect failed".into(), Ok(())),
+            "connect failed"
+        );
+        let message = append_rollback_error(
+            "connect failed".into(),
+            Err("protected Mihomo is still running".into()),
+        );
+        assert!(message.contains("rollback incomplete"));
+        assert!(message.contains("still running"));
+    }
 }
 
 /// Подключиться к серверу с указанным индексом в режиме `mode`.
@@ -325,7 +376,8 @@ async fn rollback_connect(
 /// `allow_lan` — если `Some(true)`, inbound слушает 0.0.0.0 вместо 127.0.0.1.
 ///
 /// Автоматически находит свободные порты начиная с 1080/1087.
-#[allow(clippy::too_many_arguments)] // IPC-команда: Tauri маппит каждый аргумент по имени из фронта — struct сломал бы вызовы
+#[allow(clippy::too_many_arguments)]
+// IPC-команда: Tauri маппит каждый аргумент по имени из фронта — struct сломал бы вызовы
 #[tauri::command]
 pub async fn connect(
     server_index: usize,
@@ -374,6 +426,7 @@ pub async fn connect(
     // именно gap. После накопления логов — оптимизируем узкое место
     // (warmup, helper round-trip, tun_start, и т.д.).
     let connect_start = std::time::Instant::now();
+    let proxy_attempt_id = uuid::Uuid::new_v4().to_string();
     let stamp = |label: &str| {
         let elapsed = connect_start.elapsed().as_millis();
         eprintln!("[connect-timing][+{elapsed}ms] {label}");
@@ -385,8 +438,9 @@ pub async fn connect(
     // или есть half-default routes), молча чистим перед connect. Иначе
     // следующий xray встретит «сломанную» среду и сам сломается.
     if platform::proxy::is_proxy_pointing_to_us() {
-        let _ = platform::proxy::force_clear_system_proxy();
-        stamp("preflight: cleared orphan proxy");
+        platform::proxy::clear_system_proxy()
+            .map_err(|error| format!("restore previous proxy publication: {error:#}"))?;
+        stamp("preflight: restored orphan proxy backup");
     }
 
     // Клонируем ProxyEntry, чтобы сразу освободить lock на список серверов
@@ -465,9 +519,7 @@ pub async fn connect(
     // как полный mihomo-profile (в URI-режиме TUN запрещён — см. валидацию
     // выше).
     let (socks_port, http_port) = {
-        let auth_pair = socks_auth
-            .as_ref()
-            .map(|(u, p)| (u.as_str(), p.as_str()));
+        let auth_pair = socks_auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
         // 8.D: per-process правила. Mihomo получает их через
         // PROCESS-NAME matcher. Xray-ветка ниже их игнорирует —
         // на Windows нет нативной поддержки в Xray (требует kernel-driver,
@@ -568,8 +620,19 @@ pub async fn connect(
 
             if let Err(error) = platform::helper_client::start_tunnel(cfg.yaml.clone(), lan).await {
                 vpn::diagnostics::record("tun_readiness", "error", "helper_rejected");
-                rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
-                return Err(format!("helper.start_tunnel: {error}"));
+                let rollback = rollback_connect(
+                    &mihomo,
+                    &mihomo_api,
+                    &ks_ctx,
+                    &proxy_attempt_id,
+                    tun_mode,
+                    tun_mode,
+                )
+                .await;
+                return Err(append_rollback_error(
+                    format!("helper.start_tunnel: {error}"),
+                    rollback,
+                ));
             }
             mihomo.mark_helper_spawned(true);
             // mixed_port запоминаем для is_xray_running и др.
@@ -578,8 +641,16 @@ pub async fn connect(
                 Err(error) => {
                     let message = format!("mutex: {error}");
                     drop(error);
-                    rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
-                    return Err(message);
+                    let rollback = rollback_connect(
+                        &mihomo,
+                        &mihomo_api,
+                        &ks_ctx,
+                        &proxy_attempt_id,
+                        tun_mode,
+                        tun_mode,
+                    )
+                    .await;
+                    return Err(append_rollback_error(message, rollback));
                 }
             }
             vpn::diagnostics::record("tun_readiness", "ok", "helper_ready");
@@ -590,8 +661,16 @@ pub async fn connect(
                 .await
             {
                 vpn::diagnostics::record("proxy_readiness", "error", "sidecar_not_ready");
-                rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
-                return Err(error);
+                let rollback = rollback_connect(
+                    &mihomo,
+                    &mihomo_api,
+                    &ks_ctx,
+                    &proxy_attempt_id,
+                    tun_mode,
+                    false,
+                )
+                .await;
+                return Err(append_rollback_error(error, rollback));
             }
         }
 
@@ -610,10 +689,20 @@ pub async fn connect(
 
     match mode.as_str() {
         "proxy" => {
-            if let Err(error) = mihomo.set_system_proxy_if_running(socks_port, http_port) {
+            if let Err(error) =
+                mihomo.set_system_proxy_if_running(socks_port, http_port, &proxy_attempt_id)
+            {
                 vpn::diagnostics::record("system_proxy", "error", "publication_failed");
-                rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
-                return Err(error);
+                let rollback = rollback_connect(
+                    &mihomo,
+                    &mihomo_api,
+                    &ks_ctx,
+                    &proxy_attempt_id,
+                    tun_mode,
+                    false,
+                )
+                .await;
+                return Err(append_rollback_error(error, rollback));
             }
             vpn::diagnostics::record("system_proxy", "ok", "published");
             stamp("system proxy set");
@@ -625,8 +714,19 @@ pub async fn connect(
             stamp("tun: built-in TUN — движок сам поднимает WinTUN-адаптер");
         }
         other => {
-            rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
-            return Err(format!("неизвестный режим: {other}"));
+            let rollback = rollback_connect(
+                &mihomo,
+                &mihomo_api,
+                &ks_ctx,
+                &proxy_attempt_id,
+                tun_mode,
+                tun_mode,
+            )
+            .await;
+            return Err(append_rollback_error(
+                format!("неизвестный режим: {other}"),
+                rollback,
+            ));
         }
     }
 
@@ -640,20 +740,28 @@ pub async fn connect(
         // DNS уйдёт через VPN-туннель, а его ещё нет (helper-сервис в SYSTEM
         // получит маршруты позже). Если IP в host_str — lookup_host вернёт
         // его как есть.
-        let server_ips: Vec<String> =
-            tokio::net::lookup_host(format!("{server_host}:0"))
-                .await
-                .map(|iter| iter.map(|sa| sa.ip().to_string()).collect())
-                .unwrap_or_default();
+        let server_ips: Vec<String> = tokio::net::lookup_host(format!("{server_host}:0"))
+            .await
+            .map(|iter| iter.map(|sa| sa.ip().to_string()).collect())
+            .unwrap_or_default();
         if server_ips.is_empty() {
             // Fallback — может быть literal IP без формата host:port.
             // Пробуем парсить напрямую.
             if server_host.parse::<std::net::IpAddr>().is_ok() {
                 // ОК
             } else {
-                rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
-                return Err(format!(
-                    "kill switch: не удалось резолвить server_host={server_host}"
+                let rollback = rollback_connect(
+                    &mihomo,
+                    &mihomo_api,
+                    &ks_ctx,
+                    &proxy_attempt_id,
+                    tun_mode,
+                    tun_mode,
+                )
+                .await;
+                return Err(append_rollback_error(
+                    format!("kill switch: не удалось резолвить server_host={server_host}"),
+                    rollback,
                 ));
             }
         }
@@ -667,8 +775,19 @@ pub async fn connect(
         // — у нас не было ensure_running).
         if !tun_mode {
             if let Err(e) = platform::helper_bootstrap::ensure_running().await {
-                rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
-                return Err(format!("kill switch: helper-сервис недоступен: {e}"));
+                let rollback = rollback_connect(
+                    &mihomo,
+                    &mihomo_api,
+                    &ks_ctx,
+                    &proxy_attempt_id,
+                    tun_mode,
+                    false,
+                )
+                .await;
+                return Err(append_rollback_error(
+                    format!("kill switch: helper-сервис недоступен: {e}"),
+                    rollback,
+                ));
             }
         }
         // 13.D step B: DNS-leak protection. В TUN-режиме разрешаем
@@ -698,8 +817,19 @@ pub async fn connect(
         {
             // При ошибке откатываем всё — интернет НЕ должен оставаться
             // в полу-заблокированном состоянии.
-            rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
-            return Err(format!("kill switch не поднялся: {e}"));
+            let rollback = rollback_connect(
+                &mihomo,
+                &mihomo_api,
+                &ks_ctx,
+                &proxy_attempt_id,
+                tun_mode,
+                true,
+            )
+            .await;
+            return Err(append_rollback_error(
+                format!("kill switch не поднялся: {e}"),
+                rollback,
+            ));
         }
 
         // Сохраняем контекст для live-toggle — пользователь может
@@ -776,7 +906,9 @@ pub async fn disconnect(
 
     // 3. Движок Mihomo (если не запущен — stop() no-op) + system proxy.
     let mihomo_err = mihomo.stop().err();
-    let proxy_err = platform::proxy::clear_system_proxy().err().map(|e| e.to_string());
+    let proxy_err = platform::proxy::clear_system_proxy()
+        .err()
+        .map(|e| e.to_string());
 
     if let Some(e) = mihomo_err {
         return Err(e);
@@ -956,10 +1088,7 @@ pub async fn get_recovery_state() -> RecoveryState {
         // присутствует, либо прокси указывает на нас. Если ничего из
         // этого нет — was_crashed = false (даже если на самом деле
         // был краш в прошлый раз — нам нечего восстанавливать).
-        was_crashed: proxy_backup_present
-            || proxy_orphan
-            || tun_orphan
-            || orphan_wfp_filters,
+        was_crashed: proxy_backup_present || proxy_orphan || tun_orphan || orphan_wfp_filters,
         proxy_orphan,
         proxy_backup_present,
         tun_orphan,
@@ -1181,13 +1310,17 @@ pub async fn autostart_is_enabled() -> bool {
 /// Включить автозапуск приложения с системой (создаёт task ONLOGON).
 #[tauri::command]
 pub async fn autostart_enable() -> Result<(), String> {
-    platform::autostart::enable().await.map_err(|e| e.to_string())
+    platform::autostart::enable()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Выключить автозапуск (удаляет task).
 #[tauri::command]
 pub async fn autostart_disable() -> Result<(), String> {
-    platform::autostart::disable().await.map_err(|e| e.to_string())
+    platform::autostart::disable()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Return only the pseudonym for the supplied subscription origin.  The
@@ -1228,9 +1361,7 @@ pub async fn read_xray_log() -> Result<String, String> {
 /// сервера: время отклика в мс или `None`, если адрес не извлекается /
 /// сервер не ответил за 2.5 секунды.
 #[tauri::command]
-pub async fn ping_servers(
-    sub: State<'_, SubscriptionState>,
-) -> Result<Vec<Option<u32>>, String> {
+pub async fn ping_servers(sub: State<'_, SubscriptionState>) -> Result<Vec<Option<u32>>, String> {
     let entries = sub.snapshot().0;
 
     let futures = entries.iter().map(ping_entry);
@@ -1312,7 +1443,7 @@ async fn resolve_ipv4(host: &str, port: u16) -> Option<std::net::Ipv4Addr> {
 ///
 /// Содержимое:
 /// - `app-info.txt` — версия клиента, OS, CARGO_PKG_VERSION;
-/// - `xray-stderr.log` — последние 32 КБ логов Xray (если есть);
+/// - `connection-lifecycle.log` — bounded credential-free app/helper stages;
 /// - `competing-vpns.txt` — список найденных параллельных VPN-клиентов;
 /// - `recovery-state.json` — текущее состояние orphan-ресурсов;
 /// - `proxy-backup.json` — сохранённый backup системного прокси (если есть).
@@ -1321,7 +1452,7 @@ async fn resolve_ipv4(host: &str, port: u16) -> Option<std::net::Ipv4Addr> {
 /// Возвращает абсолютный путь — UI показывает в toast с кнопкой
 /// «открыть папку» через `tauri-plugin-opener::reveal_item_in_dir`.
 #[tauri::command]
-pub fn export_diagnostics() -> Result<String, String> {
+pub async fn export_diagnostics() -> Result<String, String> {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
     use zip::write::SimpleFileOptions;
@@ -1338,6 +1469,11 @@ pub fn export_diagnostics() -> Result<String, String> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let zip_path = docs.join(format!("kwikproxy-secure-diagnostics-{ts}.zip"));
+
+    let app_lifecycle = vpn::diagnostics::recent().unwrap_or_default();
+    let helper_lifecycle = platform::helper_client::read_diagnostics()
+        .await
+        .unwrap_or_default();
 
     let file = std::fs::File::create(&zip_path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipWriter::new(file);
@@ -1356,28 +1492,21 @@ pub fn export_diagnostics() -> Result<String, String> {
         std::env::consts::ARCH,
         ts,
     );
-    zip.start_file("app-info.txt", opts).map_err(|e| e.to_string())?;
+    zip.start_file("app-info.txt", opts)
+        .map_err(|e| e.to_string())?;
     zip.write_all(info.as_bytes()).map_err(|e| e.to_string())?;
 
-    // 2. xray-stderr.log (последние 32 КБ)
-    let xray_log = std::env::temp_dir()
-        .join("KwikProxy Secure")
-        .join("xray-stderr.log");
-    if xray_log.is_file() {
-        if let Ok(mut f) = std::fs::File::open(&xray_log) {
-            use std::io::{Read, Seek, SeekFrom};
-            if let Ok(meta) = f.metadata() {
-                let max = 32 * 1024;
-                let start = meta.len().saturating_sub(max);
-                let _ = f.seek(SeekFrom::Start(start));
-                let mut buf = Vec::new();
-                if f.read_to_end(&mut buf).is_ok() {
-                    let _ = zip.start_file("xray-stderr.log", opts);
-                    let _ = zip.write_all(&buf);
-                }
-            }
-        }
-    }
+    // 2. Safe structured lifecycle diagnostics. Raw engine output is not
+    // exported because it can contain subscription hosts, provider URLs or
+    // other user configuration.
+    let lifecycle = format!(
+        "=== application lifecycle ===\n{}\n=== protected helper lifecycle ===\n{}\n",
+        app_lifecycle, helper_lifecycle,
+    );
+    zip.start_file("connection-lifecycle.log", opts)
+        .map_err(|e| e.to_string())?;
+    zip.write_all(lifecycle.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     // 3. competing-vpns.txt
     let competing = platform::processes::detect_competing_vpns();
@@ -1423,10 +1552,7 @@ pub fn export_diagnostics() -> Result<String, String> {
                 if path.extension().and_then(|s| s.to_str()) != Some("txt") {
                     continue;
                 }
-                let modified = entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok();
+                let modified = entry.metadata().and_then(|m| m.modified()).ok();
                 if let Some(t) = modified {
                     if t < week_ago {
                         continue;
@@ -1518,14 +1644,9 @@ pub async fn mihomo_delay_test(
     // cdn-cgi/trace — лёгкий 200 OK от Cloudflare, не подвержен
     // throttle'у других сервисов; 5s timeout ловит только реально
     // живые узлы.
-    vpn::mihomo_api::delay_test(
-        &ep,
-        &name,
-        "https://cp.cloudflare.com/generate_204",
-        5000,
-    )
-    .await
-    .map_err(|e| e.to_string())
+    vpn::mihomo_api::delay_test(&ep, &name, "https://cp.cloudflare.com/generate_204", 5000)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// #3 per-app UX: список запущенных процессов (имя + полный путь) для
@@ -1637,11 +1758,7 @@ use crate::config::routing_store::{
 /// Получить snapshot всех профилей и id активного. Один вызов на UI-mount.
 #[tauri::command]
 pub fn routing_list(state: State<'_, RoutingStoreState>) -> RoutingStoreSnapshot {
-    state
-        .inner
-        .lock()
-        .map(|g| g.snapshot())
-        .unwrap_or_default()
+    state.inner.lock().map(|g| g.snapshot()).unwrap_or_default()
 }
 
 /// Добавить статический профиль из base64/JSON-строки. Возвращает id.
@@ -1670,7 +1787,9 @@ pub async fn routing_add_static_from_url(
     url: String,
     state: State<'_, RoutingStoreState>,
 ) -> Result<String, String> {
-    let profile = fetch_profile_from_url(&url).await.map_err(|e| e.to_string())?;
+    let profile = fetch_profile_from_url(&url)
+        .await
+        .map_err(|e| e.to_string())?;
     let id = state
         .inner
         .lock()
@@ -1689,7 +1808,9 @@ pub async fn routing_add_url(
     interval_hours: u32,
     state: State<'_, RoutingStoreState>,
 ) -> Result<String, String> {
-    let profile = fetch_profile_from_url(&url).await.map_err(|e| e.to_string())?;
+    let profile = fetch_profile_from_url(&url)
+        .await
+        .map_err(|e| e.to_string())?;
     let canonical = canonicalize_github_blob(&url);
     let id = {
         let mut g = state.inner.lock().map_err(|e| e.to_string())?;
@@ -1708,10 +1829,7 @@ pub async fn routing_add_url(
 
 /// Удалить профиль. Если он был активным — активный сбрасывается.
 #[tauri::command]
-pub fn routing_remove(
-    id: String,
-    state: State<'_, RoutingStoreState>,
-) -> Result<(), String> {
+pub fn routing_remove(id: String, state: State<'_, RoutingStoreState>) -> Result<(), String> {
     state
         .inner
         .lock()
@@ -1750,7 +1868,9 @@ pub async fn routing_refresh(
     match entry.source {
         ProfileSource::Static => Ok(()),
         ProfileSource::Autorouting { url, .. } => {
-            let profile = fetch_profile_from_url(&url).await.map_err(|e| e.to_string())?;
+            let profile = fetch_profile_from_url(&url)
+                .await
+                .map_err(|e| e.to_string())?;
             state
                 .inner
                 .lock()

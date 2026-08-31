@@ -47,6 +47,9 @@ pub struct MihomoState {
     /// Explicitly trusted no-auth loopback SOCKS port for subscription
     /// refreshes. Set only after a successful proxy-mode/non-LAN connect.
     subscription_proxy_port: Mutex<Option<u16>>,
+    /// Connect-attempt identity that owns the currently published WinINet
+    /// proxy backup. The process monitor may restore only this exact marker.
+    proxy_attempt_id: Mutex<Option<String>>,
     /// 13.L: mihomo запущен helper'ом (built-in TUN). Set/cleared в
     /// connect/disconnect, влияет только на `is_running()`.
     helper_spawned: AtomicBool,
@@ -59,6 +62,7 @@ impl MihomoState {
             current_pid: Mutex::new(None),
             mixed_port: Mutex::new(7890),
             subscription_proxy_port: Mutex::new(None),
+            proxy_attempt_id: Mutex::new(None),
             helper_spawned: AtomicBool::new(false),
         }
     }
@@ -203,6 +207,7 @@ impl MihomoState {
                             let _ = f.flush();
                         }
                         let state = app_handle.state::<MihomoState>();
+                        let mut proxy_attempt = state.proxy_attempt_id.lock().ok();
                         let is_current = state
                             .current_pid
                             .lock()
@@ -217,9 +222,19 @@ impl MihomoState {
                             }
                             app_handle.state::<super::MihomoApiState>().clear();
                             super::diagnostics::record("proxy_child", "error", "unexpected_exit");
-                            // Сбрасываем system proxy только если упал актуальный процесс
-                            // (см. xray.rs — та же защита от race при быстром реконнекте).
-                            let _ = crate::platform::proxy::clear_system_proxy();
+                            if let Some(attempt_id) =
+                                proxy_attempt.as_mut().and_then(|attempt| attempt.take())
+                            {
+                                if crate::platform::proxy::clear_system_proxy_owned(&attempt_id)
+                                    .is_err()
+                                {
+                                    super::diagnostics::record(
+                                        "system_proxy",
+                                        "error",
+                                        "monitor_restore_failed",
+                                    );
+                                }
+                            }
                         } else {
                             eprintln!(
                                 "[mihomo] pid={my_pid} устаревший — не трогаем state нового процесса"
@@ -240,6 +255,7 @@ impl MihomoState {
             // controller/proxy state. Normal termination and explicit stop
             // clear current_pid first, making this block a no-op.
             let state = app_handle.state::<MihomoState>();
+            let mut proxy_attempt = state.proxy_attempt_id.lock().ok();
             let is_current = state
                 .current_pid
                 .lock()
@@ -255,7 +271,16 @@ impl MihomoState {
                 }
                 app_handle.state::<super::MihomoApiState>().clear();
                 super::diagnostics::record("proxy_monitor", "error", "event_stream_lost");
-                let _ = crate::platform::proxy::clear_system_proxy();
+                if let Some(attempt_id) = proxy_attempt.as_mut().and_then(|attempt| attempt.take())
+                {
+                    if crate::platform::proxy::clear_system_proxy_owned(&attempt_id).is_err() {
+                        super::diagnostics::record(
+                            "system_proxy",
+                            "error",
+                            "monitor_restore_failed",
+                        );
+                    }
+                }
             }
         });
 
@@ -270,13 +295,28 @@ impl MihomoState {
         &self,
         socks_port: u16,
         http_port: u16,
+        attempt_id: &str,
     ) -> Result<(), String> {
+        let mut proxy_attempt = self
+            .proxy_attempt_id
+            .lock()
+            .map_err(|e| format!("mutex: {e}"))?;
         let child = self.child.lock().map_err(|e| format!("mutex: {e}"))?;
         if child.is_none() {
             return Err("Mihomo exited before system proxy publication".to_string());
         }
-        crate::platform::proxy::set_system_proxy(socks_port, http_port)
-            .map_err(|error| error.to_string())
+        crate::platform::proxy::set_system_proxy_owned(socks_port, http_port, attempt_id)
+            .map_err(|error| error.to_string())?;
+        *proxy_attempt = Some(attempt_id.to_string());
+        Ok(())
+    }
+
+    pub fn clear_proxy_attempt(&self, attempt_id: &str) {
+        if let Ok(mut current) = self.proxy_attempt_id.lock() {
+            if current.as_deref() == Some(attempt_id) {
+                *current = None;
+            }
+        }
     }
 
     /// Остановить Mihomo. Если не запущен — no-op.
