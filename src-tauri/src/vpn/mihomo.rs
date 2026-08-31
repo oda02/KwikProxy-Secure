@@ -339,8 +339,18 @@ impl MihomoState {
         if child.is_none() {
             return Err("Mihomo exited before system proxy publication".to_string());
         }
-        crate::platform::proxy::set_system_proxy_owned(socks_port, http_port, attempt_id)
-            .map_err(|error| error.to_string())?;
+        if let Err(error) =
+            crate::platform::proxy::set_system_proxy_owned(socks_port, http_port, attempt_id)
+        {
+            // Publication can fail after registry writes (for example while
+            // notifying WinINet), and its immediate restore can also fail.
+            // Preserve the exact attempt in memory whenever its durable marker
+            // remains, so rollback restores before stopping this listener.
+            if crate::platform::proxy::has_pending_backup_for_attempt(attempt_id) {
+                *proxy_attempt = Some(attempt_id.to_string());
+            }
+            return Err(error.to_string());
+        }
         *proxy_attempt = Some(attempt_id.to_string());
         Ok(())
     }
