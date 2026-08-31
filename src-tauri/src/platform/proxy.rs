@@ -6,9 +6,11 @@
 //! Backup/restore (9.D): перед перезаписью значений мы сохраняем оригиналы
 //! `ProxyEnable` / `ProxyServer` / `ProxyOverride` в JSON-файл
 //! `%LOCALAPPDATA%\KwikProxy Secure\proxy_backup.json`. Restore requires the
-//! exact attempt token; every field must still equal either that attempt's
-//! publication or its saved original. This makes interrupted per-field restore
-//! retryable without granting authority over foreign changes. Если приложение
+//! exact attempt token. An exact saved-original state is accepted as an
+//! idempotent success; an unrelated state is preserved and releases the local
+//! listener only when WinINet no longer points at our published endpoint. This
+//! makes interrupted per-field restore retryable without granting authority
+//! over foreign changes. Если приложение
 //! крашнется в режиме proxy и не успеет очистить — на старте next-run-а мы
 //! детектим backup-файл и предлагаем пользователю восстановить.
 
@@ -50,6 +52,21 @@ enum FailedPublicationField {
     ForeignConflict,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestorePlan {
+    /// Another VPN (or a previous retry) already restored the exact snapshot.
+    AlreadyOriginal,
+    /// Every changed field is still either our publication or its original,
+    /// so field-wise compare-before-write recovery is safe.
+    RestoreOwnedFields,
+    /// A foreign state replaced our endpoint. Never overwrite it; merely
+    /// release the stale ownership marker so the local listener can stop.
+    PreserveForeignState,
+    /// Foreign fields exist but WinINet is still actively using our endpoint.
+    /// Stopping the listener would strand clients on a dead loopback proxy.
+    ManualResolutionRequired,
+}
+
 fn classify_failed_publication_field<T: PartialEq>(
     current: &Option<T>,
     original: &Option<T>,
@@ -61,6 +78,52 @@ fn classify_failed_publication_field<T: PartialEq>(
         FailedPublicationField::RestoreOwnedValue
     } else {
         FailedPublicationField::ForeignConflict
+    }
+}
+
+fn exact_proxy_state_matches(left: &ProxyBackup, right: &ProxyBackup) -> bool {
+    left.proxy_enable == right.proxy_enable
+        && left.proxy_server == right.proxy_server
+        && left.proxy_override == right.proxy_override
+}
+
+fn points_to_published_endpoint(current: &ProxyBackup, backup: &ProxyBackup) -> bool {
+    current.proxy_enable == Some(1)
+        && backup
+            .published_proxy_server
+            .as_deref()
+            .is_some_and(|published| current.proxy_server.as_deref() == Some(published))
+}
+
+fn plan_restore(current: &ProxyBackup, backup: &ProxyBackup) -> RestorePlan {
+    if exact_proxy_state_matches(current, backup) {
+        return RestorePlan::AlreadyOriginal;
+    }
+
+    let published_enable = Some(1u32);
+    let actions = [
+        classify_failed_publication_field(
+            &current.proxy_enable,
+            &backup.proxy_enable,
+            &published_enable,
+        ),
+        classify_failed_publication_field(
+            &current.proxy_server,
+            &backup.proxy_server,
+            &backup.published_proxy_server,
+        ),
+        classify_failed_publication_field(
+            &current.proxy_override,
+            &backup.proxy_override,
+            &backup.published_proxy_override,
+        ),
+    ];
+    if !actions.contains(&FailedPublicationField::ForeignConflict) {
+        RestorePlan::RestoreOwnedFields
+    } else if points_to_published_endpoint(current, backup) {
+        RestorePlan::ManualResolutionRequired
+    } else {
+        RestorePlan::PreserveForeignState
     }
 }
 
@@ -242,6 +305,40 @@ fn restore_owned_publication(backup: &ProxyBackup, expected_attempt: Option<&str
         .context("proxy backup has no exact published bypass value")?;
 
     let current = read_current_proxy_state()?;
+    match plan_restore(&current, backup) {
+        RestorePlan::AlreadyOriginal => {
+            // Idempotent success: another VPN or an earlier retry already put
+            // back the exact saved state. In particular, do not open the
+            // registry key for writing and do not emit a redundant WinINet
+            // refresh that could race the application which restored it.
+            let revalidated = read_current_proxy_state()?;
+            if !exact_proxy_state_matches(&revalidated, backup) {
+                anyhow::bail!("system proxy changed while confirming an already-restored state");
+            }
+            delete_backup()?;
+            return Ok(true);
+        }
+        RestorePlan::PreserveForeignState => {
+            // The active proxy endpoint is no longer ours. Preserve all
+            // foreign values byte-for-byte, but release the stale marker so
+            // the now-unreferenced local Mihomo listener can be stopped.
+            let revalidated = read_current_proxy_state()?;
+            if !exact_proxy_state_matches(&revalidated, &current)
+                || points_to_published_endpoint(&revalidated, backup)
+            {
+                anyhow::bail!("system proxy changed while preserving foreign state");
+            }
+            delete_backup()?;
+            return Ok(true);
+        }
+        RestorePlan::ManualResolutionRequired => {
+            anyhow::bail!(
+                "system proxy still points to this KwikProxy endpoint, but other proxy fields were changed by another application; refusing to overwrite foreign state or stop its live listener. Disable or change the system proxy in Windows, then press Disconnect again"
+            );
+        }
+        RestorePlan::RestoreOwnedFields => {}
+    }
+
     let published_enable = Some(1u32);
     let published_server = Some(published_server.to_string());
     let published_override = Some(published_override.to_string());
@@ -260,11 +357,8 @@ fn restore_owned_publication(backup: &ProxyBackup, expected_attempt: Option<&str
         &backup.proxy_override,
         &published_override,
     );
-    if [enable_action, server_action, override_action]
-        .contains(&FailedPublicationField::ForeignConflict)
-    {
-        anyhow::bail!("system proxy changed concurrently; refusing to overwrite foreign state");
-    }
+    debug_assert!(![enable_action, server_action, override_action]
+        .contains(&FailedPublicationField::ForeignConflict));
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (key, _) = hkcu
@@ -467,6 +561,28 @@ pub fn discard_backup() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn owned_backup() -> ProxyBackup {
+        ProxyBackup {
+            attempt_id: Some("attempt-a".into()),
+            published_proxy_server: Some("http=127.0.0.1:56800".into()),
+            published_proxy_override: Some(KWIK_PROXY_OVERRIDE.into()),
+            proxy_enable: Some(1),
+            proxy_server: Some("http=127.0.0.1:10808".into()),
+            proxy_override: Some("<local>".into()),
+        }
+    }
+
+    fn state(enable: u32, server: &str, bypass: &str) -> ProxyBackup {
+        ProxyBackup {
+            attempt_id: None,
+            published_proxy_server: None,
+            published_proxy_override: None,
+            proxy_enable: Some(enable),
+            proxy_server: Some(server.into()),
+            proxy_override: Some(bypass.into()),
+        }
+    }
+
     #[test]
     fn legacy_backup_has_no_attempt_owner() {
         let backup: ProxyBackup =
@@ -561,5 +677,52 @@ mod tests {
             ]
         );
         assert!(!actions.contains(&FailedPublicationField::ForeignConflict));
+    }
+
+    #[test]
+    fn published_state_is_restored_to_saved_snapshot() {
+        let backup = owned_backup();
+        let current = state(
+            1,
+            backup.published_proxy_server.as_deref().unwrap(),
+            backup.published_proxy_override.as_deref().unwrap(),
+        );
+        assert_eq!(
+            plan_restore(&current, &backup),
+            RestorePlan::RestoreOwnedFields
+        );
+    }
+
+    #[test]
+    fn exact_saved_snapshot_is_idempotent_success_without_registry_restore() {
+        let backup = owned_backup();
+        let current = state(1, "http=127.0.0.1:10808", "<local>");
+        assert_eq!(
+            plan_restore(&current, &backup),
+            RestorePlan::AlreadyOriginal
+        );
+        assert!(!points_to_published_endpoint(&current, &backup));
+    }
+
+    #[test]
+    fn foreign_endpoint_is_preserved_and_local_listener_may_stop() {
+        let backup = owned_backup();
+        let current = state(1, "http=127.0.0.1:20808", "foreign-bypass");
+        assert_eq!(
+            plan_restore(&current, &backup),
+            RestorePlan::PreserveForeignState
+        );
+        assert!(!points_to_published_endpoint(&current, &backup));
+    }
+
+    #[test]
+    fn foreign_fields_require_manual_resolution_while_owned_endpoint_is_live() {
+        let backup = owned_backup();
+        let current = state(1, "http=127.0.0.1:56800", "foreign-bypass");
+        assert_eq!(
+            plan_restore(&current, &backup),
+            RestorePlan::ManualResolutionRequired
+        );
+        assert!(points_to_published_endpoint(&current, &backup));
     }
 }
