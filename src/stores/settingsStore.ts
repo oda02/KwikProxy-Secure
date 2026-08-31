@@ -36,6 +36,7 @@ export type Engine = "mihomo";
  * - **comment** — необязательная заметка пользователя для UI.
  */
 export type AppRuleAction = "proxy" | "direct" | "block";
+export type DefaultTraffic = "auto" | "vpn" | "direct";
 export type AppRule = {
   exe: string;
   action: AppRuleAction;
@@ -146,6 +147,12 @@ export type Settings = {
    *  пользователи которые не хотят split-routing не увидят неожиданного
    *  поведения. */
   autoApplyMinimalRuRules: boolean;
+
+  /** Куда направлять трафик, который не совпал с app/profile/provider
+   *  правилами. `auto` сохраняет семантику routing-профиля/подписки;
+   *  `vpn` и `direct` — явные override. Direct несовместим со strict
+   *  kill switch. */
+  defaultTraffic: DefaultTraffic;
 
   /** DNS leak protection (этап 13.D step B). Если on — при активном
    *  kill-switch блокируется весь :53/UDP+TCP кроме нашего VPN-DNS.
@@ -366,6 +373,7 @@ const DEFAULTS: Settings = {
   killSwitch: false,
   killSwitchStrict: false,
   autoApplyMinimalRuRules: false,
+  defaultTraffic: "auto",
   dnsLeakProtection: false,
   forceDisableIpv6: false,
   ipv6: false,
@@ -399,6 +407,19 @@ const DEFAULTS: Settings = {
 const KEY = "kwikproxy-secure.settings.v1";
 const HWID_OPT_IN_KEY = "kwikproxy-secure.privacy.hwid-opt-in.v1";
 
+/** Runtime/persistence boundary for the routing fallback. Unknown values
+ *  (including settings from older builds where the field was absent) retain
+ *  legacy provider/profile semantics through `auto`. Strict kill switch
+ *  cannot truthfully offer an explicit DIRECT fallback. */
+export function normalizeDefaultTraffic(
+  value: unknown,
+  strictKillSwitch: boolean
+): DefaultTraffic {
+  if (value === "vpn") return "vpn";
+  if (value === "direct") return strictKillSwitch ? "vpn" : "direct";
+  return "auto";
+}
+
 const load = (): Settings => {
   try {
     const raw = localStorage.getItem(KEY);
@@ -428,6 +449,10 @@ const load = (): Settings => {
     if (["midnight", "sunset", "sand"].includes(merged.theme as string)) {
       merged.theme = "dark";
     }
+    merged.defaultTraffic = normalizeDefaultTraffic(
+      parsed.defaultTraffic,
+      merged.killSwitch && merged.killSwitchStrict
+    );
     return merged;
   } catch {
     return DEFAULTS;
@@ -451,6 +476,21 @@ export const useSettingsStore = create<Store>((setState, get) => ({
   ...load(),
   set: (key, value) => {
     const next: Settings = { ...get(), [key]: value };
+    if (key === "defaultTraffic") {
+      next.defaultTraffic = normalizeDefaultTraffic(
+        value,
+        next.killSwitch && next.killSwitchStrict
+      );
+    }
+    // Enforce the cross-setting invariant no matter which toggle changed or
+    // whether the value came from a backup/deep-link rather than this UI.
+    if (
+      next.killSwitch &&
+      next.killSwitchStrict &&
+      next.defaultTraffic === "direct"
+    ) {
+      next.defaultTraffic = "vpn";
+    }
     if (key === "sendHwid") {
       try {
         if (value === true) localStorage.setItem(HWID_OPT_IN_KEY, "1");

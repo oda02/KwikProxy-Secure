@@ -15,7 +15,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "prepare-bundle": "node scripts/prepare-bundle.mjs",
-    "test:unit": "node --experimental-strip-types --test tests/asyncControl.test.ts tests/toastStore.test.ts",
+    "test:unit": "node --experimental-strip-types --test tests/asyncControl.test.ts tests/defaultTraffic.test.ts tests/toastStore.test.ts",
     "tauri:bundle": "npm run prepare-bundle && tauri build"
   },
   "dependencies": {

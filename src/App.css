@@ -2639,6 +2639,29 @@ input, textarea { font: inherit; cursor: text; }
   margin-top: 4px;
   max-width: 320px;
 }
+.routing-fallback-select {
+  flex: 0 0 148px;
+  width: 148px;
+}
+.routing-fallback-note {
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--bg-2);
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.routing-fallback-note.is-warning {
+  border-color: rgba(251, 191, 36, 0.4);
+  background: rgba(120, 72, 10, 0.18);
+  color: var(--fg);
+}
+:root[data-theme="light"] .routing-fallback-note.is-warning {
+  border-color: rgba(161, 98, 7, 0.35);
+  background: rgba(254, 243, 199, 0.72);
+  color: #57330a;
+}
 
 .input-num {
   width: 80px;

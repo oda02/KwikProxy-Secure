@@ -163,6 +163,7 @@ fn sanitize_servers_for_cache(mut servers: Vec<ProxyEntry>) -> Result<Vec<ProxyE
                 use_builtin_tun: false,
                 tun_device: None,
                 routing_profile: None,
+                default_traffic: mihomo_config::DefaultTraffic::Auto,
                 ipv6: false,
                 custom_dns: None,
             };
@@ -184,6 +185,7 @@ fn sanitize_servers_for_cache(mut servers: Vec<ProxyEntry>) -> Result<Vec<ProxyE
                 None,
                 &[],
                 None,
+                mihomo_config::DefaultTraffic::Vpn,
                 false,
                 None,
                 false,

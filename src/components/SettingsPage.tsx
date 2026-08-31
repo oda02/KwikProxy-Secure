@@ -13,6 +13,7 @@ import {
   useSettingsStore,
   type AppRule,
   type AppRuleAction,
+  type DefaultTraffic,
   type SortMode,
   type Theme,
 } from "../stores/settingsStore";
@@ -788,6 +789,58 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
               <div className="settings-row-hint" style={{ marginBottom: 12 }}>
                 {t("settings.routing.intro")}
               </div>
+              <section className="settings-section">
+                <div className="settings-section-title">
+                  {t("settings.routing.defaultTraffic.title")}
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <div className="settings-row-label">
+                      {t("settings.routing.defaultTraffic.label")}
+                    </div>
+                    <div className="settings-row-hint">
+                      {t("settings.routing.defaultTraffic.hint")}
+                    </div>
+                  </div>
+                  <SoftSelect
+                    className="routing-fallback-select"
+                    ariaLabel={t("settings.routing.defaultTraffic.label")}
+                    value={s.defaultTraffic}
+                    onChange={(v) =>
+                      s.set("defaultTraffic", v as DefaultTraffic)
+                    }
+                    options={[
+                      {
+                        value: "auto",
+                        label: t("settings.routing.defaultTraffic.options.auto"),
+                      },
+                      {
+                        value: "vpn",
+                        label: t("settings.routing.defaultTraffic.options.vpn"),
+                      },
+                      ...(!s.killSwitch || !s.killSwitchStrict
+                        ? [
+                            {
+                              value: "direct",
+                              label: t(
+                                "settings.routing.defaultTraffic.options.direct"
+                              ),
+                            },
+                          ]
+                        : []),
+                    ]}
+                  />
+                </div>
+                <div
+                  className={`routing-fallback-note${
+                    s.killSwitch && s.killSwitchStrict ? " is-warning" : ""
+                  }`}
+                >
+                  {s.killSwitch && s.killSwitchStrict
+                    ? t("settings.routing.defaultTraffic.strictHint")
+                    : t("settings.routing.defaultTraffic.captureHint")}
+                </div>
+              </section>
               <RoutingProfilesPanel />
               <section className="settings-section">
                 <div className="settings-section-title">{t("settings.routing.autoTemplate.title")}</div>

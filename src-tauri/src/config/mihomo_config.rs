@@ -80,6 +80,33 @@ pub struct AppRule {
     pub comment: Option<String>,
 }
 
+/// User-selected action for traffic that matched no earlier rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultTraffic {
+    Auto,
+    Vpn,
+    Direct,
+}
+
+impl DefaultTraffic {
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        match value.unwrap_or("auto") {
+            "auto" => Ok(Self::Auto),
+            "vpn" => Ok(Self::Vpn),
+            "direct" => Ok(Self::Direct),
+            other => bail!("invalid default traffic target: {other}"),
+        }
+    }
+
+    fn explicit_target(self, proxy_target: &str) -> Option<&str> {
+        match self {
+            Self::Auto => None,
+            Self::Vpn => Some(proxy_target),
+            Self::Direct => Some("DIRECT"),
+        }
+    }
+}
+
 /// Результат генерации: YAML-текст + порт `mixed-port` (SOCKS5 + HTTP).
 pub struct MihomoConfig {
     pub yaml: String,
@@ -101,6 +128,7 @@ pub fn build(
     socks_auth: Option<(&str, &str)>,
     app_rules: &[AppRule],
     routing_profile: Option<&super::routing_profile::RoutingProfile>,
+    default_traffic: DefaultTraffic,
     // 13.L + TUN-для-URI: если `true`, добавляем `tun:` секцию — mihomo
     // сам поднимает WinTUN-адаптер для URI/base64-серверов (раньше TUN
     // работал только для full mihomo-profile подписок).
@@ -242,17 +270,27 @@ pub fn build(
     }
 
     // 11.F: правила из routing-профиля. block — первый (override любого
-    // direct/proxy), потом direct, потом proxy. После — MATCH с дефолтом
-    // от GlobalProxy.
-    let default_action = if let Some(p) = routing_profile {
+    // direct/proxy), потом direct, потом proxy. Финальный MATCH задаётся
+    // отдельным пользовательским fallback и не зависит от наличия профиля.
+    if let Some(p) = routing_profile {
         // URI-путь: outbound — proxy-group с именем "PROXY" (см. выше),
         // поэтому target для proxy-правил — литерал "PROXY".
         for r in mihomo_rules_from_profile(p, "PROXY") {
             rules.push(Value::String(r));
         }
-        if p.global_proxy.0 { "PROXY" } else { "DIRECT" }
-    } else {
-        "PROXY"
+    }
+    let default_action = match default_traffic {
+        DefaultTraffic::Auto => routing_profile
+            .map(|profile| {
+                if profile.global_proxy.0 {
+                    "PROXY"
+                } else {
+                    "DIRECT"
+                }
+            })
+            .unwrap_or("PROXY"),
+        DefaultTraffic::Vpn => "PROXY",
+        DefaultTraffic::Direct => "DIRECT",
     };
     // Базовые DIRECT для приватных/локальных диапазонов — ПЕРЕД MATCH, чтобы
     // LAN/loopback/link-local не уходили в туннель (иначе со `strict-route`
@@ -388,6 +426,45 @@ fn detect_proxy_target(root: &Mapping) -> String {
         return (*name).to_string();
     }
     "GLOBAL".to_string()
+}
+
+/// Rewrite provider catch-all targets for an explicit user override. Every
+/// MATCH/FINAL is normalized because Mihomo reaches the first one; specific
+/// provider rules stay in place. If none exists, append one after all rules.
+fn normalize_terminal_default(
+    root: &mut Mapping,
+    default_traffic: DefaultTraffic,
+    proxy_target: &str,
+) -> Result<()> {
+    let rules = root
+        .entry(Value::String("rules".into()))
+        .or_insert_with(|| Value::Sequence(Vec::new()))
+        .as_sequence_mut()
+        .context("full profile rules must be a sequence")?;
+    let target = default_traffic
+        .explicit_target(proxy_target)
+        .context("auto traffic fallback must not be normalized")?;
+    let mut found = false;
+    for rule in rules.iter_mut() {
+        let Some(raw) = rule.as_str() else { continue };
+        let head = raw
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_uppercase();
+        if head == "MATCH" || head == "FINAL" {
+            // The first catch-all is the one Mihomo reaches. Normalize every
+            // catch-all so malformed/multi-terminal provider input cannot
+            // silently defeat the explicit user override.
+            *rule = Value::String(format!("{head},{target}"));
+            found = true;
+        }
+    }
+    if !found {
+        rules.push(Value::String(format!("MATCH,{target}")));
+    }
+    Ok(())
 }
 
 fn is_safe_rule_token(value: &str) -> bool {
@@ -1291,6 +1368,9 @@ pub struct FullYamlPatch<'a> {
     /// `GlobalProxy` профиля в full-profile-режиме не переопределяет
     /// финальное правило (только явные rule'ы). `None` → без изменений.
     pub routing_profile: Option<&'a super::routing_profile::RoutingProfile>,
+    /// Fallback for unmatched traffic. `Auto` preserves the provider's
+    /// original terminal rule (or its absence); explicit values override it.
+    pub default_traffic: DefaultTraffic,
     /// #4: если `true` — принудительно включаем IPv6 (root + dns), даже
     /// если провайдер выставил false. `false` → провайдерский выбор не
     /// трогаем (наш дефолт — не навязывать).
@@ -1814,6 +1894,13 @@ pub fn patch_full_yaml(raw_yaml: &str, patch: &FullYamlPatch) -> Result<MihomoCo
         }
     }
 
+    // The provider's proxy group is detected before this rewrite and remains
+    // the target for app/profile `proxy` rules. Only the catch-all rule is
+    // changed; all specific provider rules retain their order and targets.
+    if patch.default_traffic != DefaultTraffic::Auto {
+        normalize_terminal_default(root, patch.default_traffic, &proxy_target)?;
+    }
+
     // mode=rule по умолчанию (если провайдер забыл) — иначе mihomo
     // войдёт в global mode (всё через PROXY) и наши rules не сработают.
     if !root.contains_key("mode") {
@@ -1918,6 +2005,7 @@ mod patch_tests {
             use_builtin_tun: false,
             tun_device: None,
             routing_profile: None,
+            default_traffic: DefaultTraffic::Auto,
             ipv6: false,
             custom_dns: None,
         }
@@ -2033,6 +2121,129 @@ rules:
             rules[0].as_str(),
             Some("PROCESS-NAME,browser.exe,provider-main")
         );
+    }
+
+    #[test]
+    fn full_profile_auto_preserves_provider_terminal_and_absence() {
+        let with_terminal = r#"
+proxies: []
+proxy-groups: [{name: provider-main, type: select, proxies: []}]
+rules: ['DOMAIN-SUFFIX,example.com,DIRECT', 'FINAL,provider-main']
+"#;
+        let cfg = patch_full_yaml(with_terminal, &base_patch()).unwrap();
+        let value: Value = serde_yaml::from_str(&cfg.yaml).unwrap();
+        let rules = value.as_mapping().unwrap()["rules"].as_sequence().unwrap();
+        assert_eq!(rules.last().and_then(Value::as_str), Some("FINAL,provider-main"));
+
+        let without_terminal = "proxies: []\nrules: ['DOMAIN,example.com,DIRECT']\n";
+        let cfg = patch_full_yaml(without_terminal, &base_patch()).unwrap();
+        let value: Value = serde_yaml::from_str(&cfg.yaml).unwrap();
+        let rules = value.as_mapping().unwrap()["rules"].as_sequence().unwrap();
+        assert_eq!(rules.len(), 1, "auto must not invent a provider fallback");
+    }
+
+    #[test]
+    fn full_profile_explicit_direct_keeps_proxy_app_target_and_specific_rules() {
+        let yaml = r#"
+proxies: []
+proxy-groups: [{name: provider-main, type: select, proxies: []}]
+rules:
+  - DOMAIN-SUFFIX,provider.example,provider-main
+  - MATCH,provider-main
+"#;
+        let apps = vec![AppRule {
+            exe: "browser.exe".into(),
+            action: "proxy".into(),
+            comment: None,
+        }];
+        let mut patch = base_patch();
+        patch.app_rules = &apps;
+        patch.default_traffic = DefaultTraffic::Direct;
+        let cfg = patch_full_yaml(yaml, &patch).unwrap();
+        let value: Value = serde_yaml::from_str(&cfg.yaml).unwrap();
+        let rules: Vec<&str> = value.as_mapping().unwrap()["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(rules[0], "PROCESS-NAME,browser.exe,provider-main");
+        assert!(rules.contains(&"DOMAIN-SUFFIX,provider.example,provider-main"));
+        assert_eq!(rules.last().copied(), Some("MATCH,DIRECT"));
+    }
+
+    #[test]
+    fn full_profile_vpn_restores_provider_group_and_normalizes_all_catchalls() {
+        let yaml = r#"
+proxies: []
+proxy-groups: [{name: provider-main, type: select, proxies: []}]
+rules:
+  - MATCH,DIRECT
+  - DOMAIN,unreachable.example,DIRECT
+  - FINAL,DIRECT
+"#;
+        let mut patch = base_patch();
+        patch.default_traffic = DefaultTraffic::Vpn;
+        let cfg = patch_full_yaml(yaml, &patch).unwrap();
+        let value: Value = serde_yaml::from_str(&cfg.yaml).unwrap();
+        let rules: Vec<&str> = value.as_mapping().unwrap()["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(rules[0], "MATCH,provider-main");
+        assert_eq!(rules[1], "DOMAIN,unreachable.example,DIRECT");
+        assert_eq!(rules[2], "FINAL,provider-main");
+    }
+
+    #[test]
+    fn explicit_full_profile_fallback_is_appended_when_provider_has_none() {
+        let yaml = "proxies: []\nproxy-groups: [{name: main, type: select, proxies: []}]\nrules: ['DOMAIN,example.com,DIRECT']\n";
+        let mut patch = base_patch();
+        patch.default_traffic = DefaultTraffic::Direct;
+        let cfg = patch_full_yaml(yaml, &patch).unwrap();
+        let value: Value = serde_yaml::from_str(&cfg.yaml).unwrap();
+        let rules = value.as_mapping().unwrap()["rules"].as_sequence().unwrap();
+        assert_eq!(rules.last().and_then(Value::as_str), Some("MATCH,DIRECT"));
+    }
+
+    #[test]
+    fn uri_auto_preserves_profile_default_while_explicit_vpn_overrides_it() {
+        use crate::config::routing_profile::{BoolString, RoutingProfile};
+        let entry = ProxyEntry {
+            name: "local-socks".into(),
+            protocol: "socks".into(),
+            server: "1.1.1.1".into(),
+            port: 1080,
+            raw: serde_json::json!({}),
+            engine_compat: vec!["mihomo".into()],
+        };
+        let profile = RoutingProfile {
+            global_proxy: BoolString(false),
+            ..Default::default()
+        };
+        let generate = |fallback| {
+            build(
+                &entry,
+                31_000,
+                "127.0.0.1",
+                None,
+                None,
+                &[],
+                Some(&profile),
+                fallback,
+                false,
+                None,
+                false,
+                None,
+                31_001,
+                "secret",
+            )
+            .unwrap()
+        };
+        assert!(generate(DefaultTraffic::Auto).yaml.contains("MATCH,DIRECT"));
+        assert!(generate(DefaultTraffic::Vpn).yaml.contains("MATCH,PROXY"));
     }
 
     /// 8.F: external-controller перезаписывается нашим (для mihomo_api).

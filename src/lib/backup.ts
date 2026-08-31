@@ -79,6 +79,7 @@ const SETTINGS_WHITELIST: Array<keyof Settings> = [
   "killSwitch",
   "killSwitchStrict",
   "autoApplyMinimalRuRules",
+  "defaultTraffic",
   "dnsLeakProtection",
   "forceDisableIpv6",
   "ipv6",

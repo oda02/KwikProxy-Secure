@@ -394,6 +394,7 @@ export const useVpnStore = create<VpnState>((set, get) => ({
           useSettingsStore.getState().killSwitchStrict;
         const autoApplyMinimalRuRules =
           useSettingsStore.getState().autoApplyMinimalRuRules;
+        const defaultTraffic = useSettingsStore.getState().defaultTraffic;
         const dnsLeakProtection =
           useSettingsStore.getState().dnsLeakProtection;
         const forceDisableIpv6 =
@@ -473,6 +474,7 @@ export const useVpnStore = create<VpnState>((set, get) => ({
                 killSwitchStrict,
                 forceDisableIpv6,
                 autoApplyMinimalRuRules,
+                defaultTraffic,
                 appRules,
                 ipv6,
                 customDns,

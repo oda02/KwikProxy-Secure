@@ -390,7 +390,7 @@
     "appRules": {
       "title": "app rules",
       "tunWarning": "app rules in TUN mode only work when the subscription delivers a full mihomo-config (server type mihomo-profile). For URI servers (vless/vmess/trojan/hy2/...) in TUN, rules are not applied — switch the mode to proxy.",
-      "intro": "rules of the form «<exe> → action» are applied by the engine to processes by their executable file name. for example, send telegram through the VPN while routing steam direct. the exe name is taken from task manager (telegram.exe, steam.exe).",
+      "intro": "these rules have the highest priority. in TUN mode Mihomo reliably identifies the originating process; in system proxy mode a rule only applies when that app uses the Windows proxy. the exe name is taken from task manager (telegram.exe, steam.exe).",
       "actionTitles": {
         "proxy": "through VPN",
         "direct": "direct, bypasses VPN",
@@ -549,7 +549,19 @@
       }
     },
     "routing": {
-      "intro": "routing profiles decide which domains/IPs go through the VPN, which go direct, and which are blocked. rules are applied to Mihomo on connect. for mihomo-profile configs from the subscription (with their own routing) — they are NOT applied (subscription wins)",
+      "intro": "app rules are applied first, followed by the active routing profile and subscription rules. the setting below only controls traffic that matched no rule. changes apply on the next connection",
+      "defaultTraffic": {
+        "title": "default traffic",
+        "label": "when no rule matches",
+        "hint": "specific app and profile rules keep priority over this choice",
+        "options": {
+          "auto": "follow profile/subscription",
+          "vpn": "through VPN",
+          "direct": "direct (bypass VPN)"
+        },
+        "captureHint": "Per-app routing works reliably in TUN mode because Mihomo can identify the originating process. System proxy mode only covers apps that honor the Windows system proxy; the engine cannot see direct connections from other apps.",
+        "strictHint": "Strict kill switch forbids all Direct traffic. Explicit Direct fallback is unavailable; in «follow profile/subscription» mode, provider, profile and app Direct rules are still blocked."
+      },
       "autoTemplate": {
         "title": "auto-template",
         "label": "«minimal RU rules» when no profile is selected",
