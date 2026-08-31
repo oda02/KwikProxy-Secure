@@ -4,7 +4,7 @@
 //! referenced files/directories with ACLs. The helper never accepts paths
 //! from the pipe client.
 
-use std::ffi::c_void;
+use std::ffi::{c_void, OsStr};
 use std::io::{Read, Seek, SeekFrom};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
@@ -1326,6 +1326,60 @@ pub fn cleanup_runtime_after_uninstall(installation: &Installation) -> Result<()
     Ok(())
 }
 
+fn keep_for_nsis_uninstaller(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.eq_ignore_ascii_case("kwik-helper-x86_64-pc-windows-msvc.exe")
+        || name.eq_ignore_ascii_case("uninstall.exe")
+}
+
+/// Installer-only removal of the protected Program Files payload after the
+/// service has stopped and SCM deletion is verified. The helper is executing
+/// from this tree, so it leaves only itself and NSIS' uninstaller; elevated
+/// NSIS deletes those two names after `nsExec` observes helper process exit.
+///
+/// Every other entry, including legacy filenames from older packages, is
+/// removed with the same bounded no-follow walker used for ProgramData. A
+/// reparse point is unlinked as a name and is never traversed.
+pub fn cleanup_install_tree_for_uninstaller(installation: &Installation) -> Result<()> {
+    validate_sid_text(&installation.owner_sid)?;
+    let program_files = canonical_dir(known_program_files()?)?;
+    let expected_install = canonical_dir(program_files.join("KwikProxy Secure"))?;
+    if !same_path(&expected_install, &installation.install_dir) {
+        bail!("refusing installer cleanup outside the fixed Program Files root");
+    }
+
+    let install_guard = open_directory_no_reparse(&installation.install_dir, false)?;
+    verify_runtime_acl(install_guard.0, &installation.owner_sid)
+        .context("verify protected install root before uninstall cleanup")?;
+
+    let entries = std::fs::read_dir(&installation.install_dir)?
+        .take(258)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    if entries.len() > 256 {
+        bail!("protected install cleanup entry bound exceeded");
+    }
+    let mut budget = 32_768usize;
+    for entry in entries {
+        if keep_for_nsis_uninstaller(&entry.file_name()) {
+            continue;
+        }
+        remove_bounded_tree_no_follow(&entry.path(), 12, &mut budget)?;
+    }
+
+    // Fail closed unless only the two explicitly handed-off NSIS names remain.
+    for entry in std::fs::read_dir(&installation.install_dir)? {
+        let entry = entry?;
+        if !keep_for_nsis_uninstaller(&entry.file_name()) {
+            bail!(
+                "protected install payload remains after cleanup: {}",
+                entry.file_name().to_string_lossy()
+            );
+        }
+    }
+    drop(install_guard);
+    Ok(())
+}
+
 /// Corrupt-manifest uninstall fallback. It never consults manifest paths and
 /// never leaves the exact `%ProgramData%\KwikProxy Secure\runtime` root.
 /// Only SID/GUID-shaped leaves are considered, with hard depth/entry bounds.
@@ -1797,5 +1851,22 @@ mod tests {
     fn authenticated_client_guard_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AuthenticatedClient>();
+    }
+
+    #[test]
+    fn nsis_cleanup_reserves_only_exact_handoff_names() {
+        assert!(keep_for_nsis_uninstaller(OsStr::new(
+            "kwik-helper-x86_64-pc-windows-msvc.exe"
+        )));
+        assert!(keep_for_nsis_uninstaller(OsStr::new("UNINSTALL.EXE")));
+        for stale in [
+            "vpn-client.exe",
+            "kwik_helper.exe",
+            "kwik-helper.exe",
+            "resources",
+            "uninstall.exe.bak",
+        ] {
+            assert!(!keep_for_nsis_uninstaller(OsStr::new(stale)));
+        }
     }
 }

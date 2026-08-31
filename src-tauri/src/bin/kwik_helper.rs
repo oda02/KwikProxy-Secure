@@ -10,6 +10,7 @@
 //! CLI:
 //!   kwik-helper install      — установить и запустить сервис (нужен UAC)
 //!   kwik-helper uninstall    — остановить и удалить сервис (нужен UAC)
+//!   kwik-helper uninstall-for-installer — плюс bounded Program Files cleanup
 //!   kwik-helper service      — точка входа SCM, не вызывать руками
 
 #[cfg(windows)]
@@ -40,6 +41,7 @@ fn main() {
     let result: anyhow::Result<()> = match cmd {
         "install" => kwik_helper::service::install(),
         "uninstall" => kwik_helper::service::uninstall(),
+        "uninstall-for-installer" => kwik_helper::service::uninstall_for_installer(),
         "service" => kwik_helper::service::run_as_service(),
         "debug" => run_debug_foreground(),
         // 13.D EMERGENCY: восстанавливает интернет если kill-switch

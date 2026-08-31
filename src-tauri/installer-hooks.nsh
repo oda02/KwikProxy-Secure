@@ -20,6 +20,28 @@
   ${EndIf}
 !macroend
 
+; The helper process has exited when nsExec returns, but antivirus/indexing can
+; briefly retain a sharing handle. Retry only the one canonical executable and
+; fail closed if it is still present. Never queue deletion for reboot: a
+; successful uninstall must leave the next clean install unambiguously safe.
+!macro KWIK_SECURE_DELETE_HELPER_BOUNDED RESULT
+  StrCpy ${RESULT} 1
+  StrCpy $3 0
+  ${Do}
+    ClearErrors
+    Delete "${KWIK_SECURE_HELPER}"
+    ${IfNot} ${FileExists} "${KWIK_SECURE_HELPER}"
+      StrCpy ${RESULT} 0
+      ${ExitDo}
+    ${EndIf}
+    IntOp $3 $3 + 1
+    ${If} $3 >= 20
+      ${ExitDo}
+    ${EndIf}
+    Sleep 100
+  ${Loop}
+!macroend
+
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro KWIK_SECURE_REQUIRE_FIXED_INSTALL_ROOT
 
@@ -28,6 +50,14 @@
   ; Never remove a known-good service before NSIS has safely committed files.
   ${If} ${FileExists} "${KWIK_SECURE_HELPER}"
     MessageBox MB_ICONSTOP "In-place upgrade is disabled for this security preview. The existing protected service was left untouched. Uninstall KwikProxy Secure explicitly, then run this installer as a clean install."
+    Abort
+  ${EndIf}
+
+  ; SetOutPath has created an empty directory for a genuinely clean install.
+  ; Any entry here is therefore stale/partial protected state. Do not merge a
+  ; new trusted payload into it or execute anything found there.
+  ${If} ${FileExists} "$INSTDIR\*.*"
+    MessageBox MB_ICONSTOP "The fixed KwikProxy Secure installation directory is not empty. Installation is aborted without executing or replacing its contents. Complete the prior uninstall (or have an administrator remove the verified stale directory), then retry."
     Abort
   ${EndIf}
 
@@ -87,12 +117,29 @@
 !macro NSIS_HOOK_PREUNINSTALL
   !insertmacro KWIK_SECURE_REQUIRE_FIXED_INSTALL_ROOT
 
+  ; Tauri invokes PREUNINSTALL before its own running-app check. Run the same
+  ; gate before removing SCM/manifest state; the later template check remains
+  ; useful as a race re-check.
+  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
+
   ${If} ${FileExists} "${KWIK_SECURE_HELPER}"
     DetailPrint "Removing the installer-managed KwikProxy Secure helper..."
-    nsExec::ExecToLog '"${KWIK_SECURE_HELPER}" uninstall'
+    ; This installer-only command first removes SCM/ProgramData state, then
+    ; prunes the handle-verified fixed Program Files tree without following
+    ; reparse points. It intentionally hands only itself and uninstall.exe
+    ; back to NSIS.
+    nsExec::ExecToLog '"${KWIK_SECURE_HELPER}" uninstall-for-installer'
     Pop $0
     ${If} $0 != 0
       MessageBox MB_ICONSTOP "The KwikProxy Secure helper could not be removed safely (exit $0). Uninstall is aborted before deleting privileged files."
+      SetErrorLevel 2
+      Abort
+    ${EndIf}
+
+    !insertmacro KWIK_SECURE_DELETE_HELPER_BOUNDED $1
+    ${If} $1 != 0
+      MessageBox MB_ICONSTOP "The protected KwikProxy Secure helper is still in use. Uninstall did not complete; close security/indexing tools that may hold the file and retry."
+      SetErrorLevel 2
       Abort
     ${EndIf}
   ${Else}
@@ -100,8 +147,22 @@
     ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Services\${KWIK_SECURE_SERVICE}" "ImagePath"
     ${IfNot} ${Errors}
       MessageBox MB_ICONSTOP "The KwikProxy Secure SYSTEM service still exists, but its protected helper binary is missing. Uninstall is aborted before deleting any remaining privileged files."
+      SetErrorLevel 2
       Abort
     ${EndIf}
   ${EndIf}
   DeleteRegKey HKLM "SOFTWARE\KwikProxySecure"
+!macroend
+
+!macro NSIS_HOOK_POSTUNINSTALL
+  ; The helper already verified/pruned the protected tree, and the stock Tauri
+  ; template has now deleted uninstall.exe and attempted to remove $INSTDIR.
+  ; Do not let an unchecked Delete/RMDir report success with a protected root
+  ; (or any canonical payload) still present.
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR") i.r3'
+  ${If} $3 != -1
+    MessageBox MB_ICONSTOP "KwikProxy Secure uninstall is incomplete because its protected installation directory still exists. Do not reinstall yet; retry uninstall with administrator rights."
+    SetErrorLevel 2
+    Abort
+  ${EndIf}
 !macroend

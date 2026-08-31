@@ -460,6 +460,17 @@ pub fn install() -> Result<()> {
 }
 
 pub fn uninstall() -> Result<()> {
+    uninstall_impl(false)
+}
+
+/// NSIS-only variant: after verified SCM/runtime cleanup, securely prune the
+/// protected install tree to the helper executable and `uninstall.exe`.
+/// NSIS deletes those final two names only after this process has exited.
+pub fn uninstall_for_installer() -> Result<()> {
+    uninstall_impl(true)
+}
+
+fn uninstall_impl(prune_install_tree: bool) -> Result<()> {
     validate_helper_location()?;
     // Load before service removal while the protected manifest still exists.
     // A damaged/missing manifest must not prevent repair/uninstall of SCM state.
@@ -484,6 +495,13 @@ pub fn uninstall() -> Result<()> {
         if let Err(error) = security::cleanup_product_runtime_after_uninstall() {
             eprintln!("[uninstall] bounded corrupt-manifest cleanup incomplete: {error:#}");
         }
+    }
+    if prune_install_tree {
+        let installation = installation.as_ref().context(
+            "installer cleanup requires the exact protected manifest; service was removed but Program Files payload was left fail-closed",
+        )?;
+        security::cleanup_install_tree_for_uninstaller(installation)
+            .context("prune protected Program Files payload for NSIS handoff")?;
     }
     println!("сервис «{SERVICE_NAME}» удалён");
     Ok(())
