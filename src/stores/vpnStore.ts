@@ -12,6 +12,7 @@ import {
   stopAndReconcile,
   type BackendStopResult,
 } from "../lib/asyncControl";
+import { requiresProxyRestoreConfirmation } from "../lib/proxyRestore";
 
 /** Anti-DPI опции в формате camelCase, который Rust десериализует через
  *  serde(rename_all = "camelCase") в struct AntiDpiOptions. */
@@ -238,9 +239,21 @@ class BackendCleanupFailure extends Error {
   }
 }
 
-const cleanupBackendConnection = (): Promise<BackendStopResult> =>
+class ProxyRestoreCancelled extends Error {
+  constructor(readonly observedRunning: boolean | null) {
+    super(i18n.t("vpnStore.proxyRestore.cancelledMessage"));
+    this.name = "ProxyRestoreCancelled";
+  }
+}
+
+const cleanupBackendConnection = (
+  forceProxyRestore = false
+): Promise<BackendStopResult> =>
   stopAndReconcile(
-    () => invoke("disconnect"),
+    () =>
+      invoke(
+        forceProxyRestore ? "disconnect_force_restore_proxy" : "disconnect"
+      ),
     () => invoke<boolean>("is_xray_running")
   );
 
@@ -616,9 +629,26 @@ export const useVpnStore = create<VpnState>((set, get) => ({
     const disconnectAttempt = connectionAttempts.cancel();
     set({ status: "stopping", errorMessage: null });
     try {
-      const cleanup = await connectionLifecycle.runExclusive(
+      let cleanup = await connectionLifecycle.runExclusive(
         cleanupBackendConnection
       );
+      if (
+        (!cleanup.stopped || !cleanup.cleanupSucceeded) &&
+        requiresProxyRestoreConfirmation(cleanup.error)
+      ) {
+        // The backend kept Mihomo alive, so Windows cannot be stranded on a
+        // dead loopback proxy. It revalidates the exact attempt token and
+        // owned endpoint again after this prompt before allowing the write.
+        const confirmed = window.confirm(
+          i18n.t("vpnStore.proxyRestore.confirmMessage")
+        );
+        if (!confirmed) {
+          throw new ProxyRestoreCancelled(cleanup.observedRunning);
+        }
+        cleanup = await connectionLifecycle.runExclusive(() =>
+          cleanupBackendConnection(true)
+        );
+      }
       if (!cleanup.stopped || !cleanup.cleanupSucceeded) {
         throw new BackendCleanupFailure(
           "VPN disconnect failed",
@@ -643,7 +673,9 @@ export const useVpnStore = create<VpnState>((set, get) => ({
       if (connectionAttempts.isCurrent(disconnectAttempt)) {
         const message = e instanceof Error ? e.message : String(e);
         const positivelyRunning =
-          e instanceof BackendCleanupFailure && e.observedRunning === true;
+          (e instanceof BackendCleanupFailure ||
+            e instanceof ProxyRestoreCancelled) &&
+          e.observedRunning === true;
         set({
           status: positivelyRunning ? "running" : "error",
           ...(!positivelyRunning
@@ -658,8 +690,11 @@ export const useVpnStore = create<VpnState>((set, get) => ({
           errorMessage: message,
         });
         showToast({
-          kind: "error",
-          title: i18n.t("vpnStore.connectError.title"),
+          kind: e instanceof ProxyRestoreCancelled ? "warning" : "error",
+          title:
+            e instanceof ProxyRestoreCancelled
+              ? i18n.t("vpnStore.proxyRestore.cancelledTitle")
+              : i18n.t("vpnStore.connectError.title"),
           message,
           durationMs: 8000,
         });

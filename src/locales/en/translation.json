@@ -271,6 +271,11 @@
       "title": "VPN conflict",
       "message": "active VPN on interface: {{list}}.\nDisconnect it before connecting."
     },
+    "proxyRestore": {
+      "confirmMessage": "Another VPN changed the system proxy after KwikProxy connected, but Windows is still using KwikProxy's local proxy.\n\nChoose OK to restore the settings snapshot saved before connecting. This will overwrite proxy address and bypass-list changes made since then by another VPN or manually.\n\nChoose Cancel to overwrite nothing and leave KwikProxy running.",
+      "cancelledTitle": "disconnect cancelled",
+      "cancelledMessage": "Proxy settings were not changed; KwikProxy was left running."
+    },
     "staleSelection": {
       "title": "no server selected",
       "message": "the server list changed — pick a server again."
