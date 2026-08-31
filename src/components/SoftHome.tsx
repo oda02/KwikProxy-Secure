@@ -181,6 +181,7 @@ export function SoftHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // переключении НЕ нужен; он делается один раз при добавлении и далее
   // только по кнопке «обновить» / авто-обновлению.
   const activate = async (id: string) => {
+    if (isBusy) return;
     if (id !== primaryId) {
       const targetBeforeCommit = useSubscriptionStore
         .getState()
@@ -261,7 +262,9 @@ export function SoftHome({ onOpenSettings }: { onOpenSettings: () => void }) {
         <SoftDock
           onLeft={onOpenSettings}
           onCenter={() => {}}
-          onRight={() => setSheet("add")}
+          onRight={() => {
+            if (!isBusy) setSheet("add");
+          }}
           centerOn={false}
           centerDisabled
         />
@@ -353,7 +356,7 @@ export function SoftHome({ onOpenSettings }: { onOpenSettings: () => void }) {
             type="button"
             className={`soft-iconbtn${loading ? " is-spin" : ""}`}
             title="Обновить подписку"
-            disabled={loading}
+            disabled={loading || isBusy}
             onClick={() => void fetchSubscription()}
           >
             <RefreshIcon />
@@ -399,6 +402,7 @@ export function SoftHome({ onOpenSettings }: { onOpenSettings: () => void }) {
                   type="button"
                   className="soft-row"
                   data-sel={sel}
+                  disabled={isBusy}
                   onClick={() => selectServer(i)}
                 >
                   <span className="soft-row-check" aria-hidden />
@@ -418,7 +422,9 @@ export function SoftHome({ onOpenSettings }: { onOpenSettings: () => void }) {
       <SoftDock
         onLeft={onOpenSettings}
         onCenter={toggle}
-        onRight={() => setSheet("add")}
+        onRight={() => {
+          if (!isBusy) setSheet("add");
+        }}
         centerOn={isRunning}
         centerDisabled={!isRunning && selectedIndex === null}
       />
@@ -430,6 +436,7 @@ export function SoftHome({ onOpenSettings }: { onOpenSettings: () => void }) {
           onAdd={() => setSheet("add")}
           onClose={closeSheet}
           closing={closing}
+          disabled={isBusy}
         />
       )}
       {sheet === "add" && <AddSheet onClose={() => setSheet(null)} />}
@@ -515,12 +522,14 @@ function PickSheet({
   onAdd,
   onClose,
   closing,
+  disabled,
 }: {
   activeId: string | null;
   onPick: (id: string) => void;
   onAdd: () => void;
   onClose: () => void;
   closing?: boolean;
+  disabled?: boolean;
 }) {
   const subscriptions = useSubscriptionStore((s) => s.subscriptions);
   const removeSubscription = useSubscriptionStore((s) => s.removeSubscription);
@@ -543,6 +552,7 @@ function PickSheet({
                 <button
                   type="button"
                   className="soft-pick-main"
+                  disabled={disabled}
                   onClick={() => onPick(s.id)}
                 >
                   <span className="soft-pick-head">
@@ -562,6 +572,7 @@ function PickSheet({
                     <button
                       type="button"
                       className="is-danger"
+                      disabled={disabled}
                       onClick={() => {
                         setConfirmId(null);
                         void removeSubscription(s.id);
@@ -575,6 +586,7 @@ function PickSheet({
                     type="button"
                     className="soft-pick-del"
                     title="Удалить подписку"
+                    disabled={disabled}
                     onClick={() => setConfirmId(s.id)}
                   >
                     <TrashIcon />
@@ -584,7 +596,7 @@ function PickSheet({
             );
           })}
         </div>
-        <button type="button" className="soft-bs-add" onClick={onAdd}>
+        <button type="button" className="soft-bs-add" disabled={disabled} onClick={onAdd}>
           <PlusIcon />
           <span>добавить подписку</span>
         </button>

@@ -4,7 +4,10 @@ import { effectiveUserAgent, useSettingsStore, type Engine } from "./settingsSto
 import { findSelectedIndexByName, useVpnStore } from "./vpnStore";
 import i18n from "../i18n";
 import { showToast } from "./toastStore";
-import { AsyncMutex } from "../lib/asyncControl";
+import {
+  AsyncMutex,
+  publishRequiredTombstone,
+} from "../lib/asyncControl";
 
 export type ProxyEntry = {
   name: string;
@@ -503,27 +506,22 @@ const commitPrimaryToRust = async (
   const current = state.subscriptions.find((item) => item.id === id);
   if (state.primaryId !== id || current?.url !== url) return null;
   const generation = ++nextRuntimeGeneration;
-  try {
-    const sessionEpoch = await ensureRuntimeEpoch();
-    const beforeCommit = useSubscriptionStore.getState();
-    const beforePrimary = beforeCommit.subscriptions.find((item) => item.id === id);
-    if (beforeCommit.primaryId !== id || beforePrimary?.url !== url) return null;
-    const committed = await invoke<boolean>("set_servers", {
-      sessionEpoch,
-      primaryId: id,
-      servers,
-      meta: serializeMeta(meta),
-      generation,
-    });
-    if (!committed) return null;
-    const afterCommit = useSubscriptionStore.getState();
-    const afterPrimary = afterCommit.subscriptions.find((item) => item.id === id);
-    if (afterCommit.primaryId !== id || afterPrimary?.url !== url) return null;
-    return { sessionEpoch, primaryId: id, generation };
-  } catch (e) {
-    console.warn("[subscription] set_servers failed:", e);
-    return null;
-  }
+  const sessionEpoch = await ensureRuntimeEpoch();
+  const beforeCommit = useSubscriptionStore.getState();
+  const beforePrimary = beforeCommit.subscriptions.find((item) => item.id === id);
+  if (beforeCommit.primaryId !== id || beforePrimary?.url !== url) return null;
+  const committed = await invoke<boolean>("set_servers", {
+    sessionEpoch,
+    primaryId: id,
+    servers,
+    meta: serializeMeta(meta),
+    generation,
+  });
+  if (!committed) return null;
+  const afterCommit = useSubscriptionStore.getState();
+  const afterPrimary = afterCommit.subscriptions.find((item) => item.id === id);
+  if (afterCommit.primaryId !== id || afterPrimary?.url !== url) return null;
+  return { sessionEpoch, primaryId: id, generation };
 };
 
 const pushPrimaryToRust = (
@@ -532,29 +530,52 @@ const pushPrimaryToRust = (
   servers: ProxyEntry[],
   meta: SubscriptionMeta | null
 ): Promise<SubscriptionRuntimeReceipt | null> =>
-  primaryRuntimeMutex.runExclusive(() =>
-    commitPrimaryToRust(id, url, servers, meta)
-  );
-
-const clearRustRuntime = (): Promise<void> =>
   primaryRuntimeMutex.runExclusive(async () => {
-    const state = useSubscriptionStore.getState();
-    const primaryId = state.primaryId;
-    if (!primaryId) return;
-    const generation = ++nextRuntimeGeneration;
     try {
-      const sessionEpoch = await ensureRuntimeEpoch();
-      await invoke("set_servers", {
-        sessionEpoch,
-        primaryId,
-        servers: [],
-        meta: null,
-        generation,
-      });
+      return await commitPrimaryToRust(id, url, servers, meta);
     } catch (error) {
-      console.warn("[subscription] runtime clear failed:", error);
+      console.warn("[subscription] set_servers failed:", error);
+      return null;
     }
   });
+
+const clearRustRuntime = (primaryId: string): Promise<void> =>
+  primaryRuntimeMutex.runExclusive(async () => {
+    const generation = ++nextRuntimeGeneration;
+    const sessionEpoch = await ensureRuntimeEpoch();
+    const committed = await invoke<boolean>("set_servers", {
+      sessionEpoch,
+      primaryId,
+      servers: [],
+      meta: null,
+      generation,
+    });
+    if (!committed) {
+      throw new Error(
+        `set_servers rejected runtime tombstone for subscription ${primaryId}`
+      );
+    }
+  });
+
+const restoreVpnSelectionWhenStable = (selectedIndex: number): void => {
+  const status = useVpnStore.getState().status;
+  if (status === "starting" || status === "stopping") return;
+  useVpnStore.setState({ selectedIndex });
+};
+
+const requireVpnStopped = (operation: string): void => {
+  const vpn = useVpnStore.getState();
+  if (vpn.status === "stopped") return;
+  throw new Error(
+    vpn.errorMessage || `VPN cleanup did not finish before ${operation}`
+  );
+};
+
+const requireVpnTransitionStable = (operation: string): void => {
+  const status = useVpnStore.getState().status;
+  if (status !== "starting" && status !== "stopping") return;
+  throw new Error(`Cannot ${operation} while the VPN connection is changing`);
+};
 
 const genId = (): string => {
   // Безопасный uuid v4 без external crypto.randomUUID для старых runtime'ов.
@@ -596,6 +617,7 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
   // ─── Multi-subscription methods (0.3.0+) ─────────────────────────────
 
   async addSubscription(url) {
+    requireVpnTransitionStable("add a subscription");
     const trimmed = url.trim();
     if (!trimmed) throw new Error("empty URL");
 
@@ -689,6 +711,14 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
     const sub = subs.find((s) => s.id === id);
     if (!sub) return;
     const wasPrimary = get().primaryId === id;
+    const vpn = useVpnStore.getState();
+    if (!wasPrimary) {
+      requireVpnTransitionStable("remove a subscription");
+    }
+    if (wasPrimary && vpn.status !== "stopped") {
+      await vpn.disconnect();
+      requireVpnStopped("subscription removal");
+    }
 
     // Удаляем keyring entries (и legacy keys если был primary).
     await Promise.all([
@@ -716,6 +746,8 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
   },
 
   async setPrimaryId(id) {
+    const vpnStatus = useVpnStore.getState().status;
+    if (vpnStatus === "starting" || vpnStatus === "stopping") return false;
     const sub = get().subscriptions.find((s) => s.id === id);
     if (!sub) return false;
     set({
@@ -873,11 +905,11 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
         // Restore selectedIndex по сохранённому имени (как и в legacy fetch).
         const restoredIndex = findSelectedIndexByName(tagged);
         if (restoredIndex >= 0) {
-          useVpnStore.setState({ selectedIndex: restoredIndex });
+          restoreVpnSelectionWhenStable(restoredIndex);
         } else if (tagged.length === 1) {
           // Auto-select единственной записи (full-mihomo «профиль») —
           // без него сетка локаций не отрисуется после смены подписки.
-          useVpnStore.setState({ selectedIndex: 0 });
+          restoreVpnSelectionWhenStable(0);
         }
       }
       // Авто-пинг для этой sub.
@@ -1341,9 +1373,9 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
         // важно для mihomo-passthrough.
         const restoredIndex = findSelectedIndexByName(servers);
         if (restoredIndex >= 0) {
-          useVpnStore.setState({ selectedIndex: restoredIndex });
+          restoreVpnSelectionWhenStable(restoredIndex);
         } else if (servers.length === 1) {
-          useVpnStore.setState({ selectedIndex: 0 });
+          restoreVpnSelectionWhenStable(0);
         }
         // Метаданные кешируются параллельно — могут отсутствовать если
         // сервер их не присылал.
@@ -1374,21 +1406,24 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
   },
 
   async deleteSubscription() {
+    // Capture the backend identity before any await. The mutex may be held by
+    // an in-flight connect; reading primaryId inside that mutex would see null
+    // after local reset and silently skip the required tombstone.
+    const runtimePrimaryId = get().primaryId;
     // 0.2.4: полное удаление подписки. Если VPN активен — сначала
     // тушим (без него выбранный сервер «висит» в ядре, но в UI его
     // уже нет). После очистки экран должен вернуться к Welcome.
     const vpn = useVpnStore.getState();
-    if (vpn.status === "running") {
-      try {
-        await vpn.disconnect();
-      } catch {
-        // продолжаем удаление — даже если disconnect упал, чистка
-        // важнее (state восстановится сам через refresh).
-      }
+    if (vpn.status !== "stopped") {
+      await vpn.disconnect();
+      requireVpnStopped("subscription deletion");
     }
 
     // Runtime snapshot живёт в памяти; per-subscription offline cache ниже
     // удаляется отдельными DPAPI-командами вместе с keyring credentials.
+    // Publish and await the empty generation before clearing primaryId or
+    // credentials. A failure aborts local deletion with the exact IPC error.
+    await publishRequiredTombstone(runtimePrimaryId, clearRustRuntime);
 
     // 1. Удаляем URL и override-HWID из keyring (legacy + per-id для
      //    каждой подписки в multi-state).
@@ -1412,10 +1447,6 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
     } catch {
       // приватный режим — игнорируем
     }
-    // Rust runtime-state тоже обнуляем — иначе orphan-серверы прошлой
-    // подписки останутся в памяти до рестарта.
-    void clearRustRuntime();
-
     // 3. Сбрасываем in-memory state (multi + legacy) и selectedIndex в vpnStore.
     set({
       subscriptions: [],

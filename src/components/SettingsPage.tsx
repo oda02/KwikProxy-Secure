@@ -2120,37 +2120,68 @@ function ResetBlock({ onAfterReset }: { onAfterReset: () => void }) {
   const { t } = useTranslation();
   type Pending = null | "settings" | "all";
   const [pending, setPending] = useState<Pending>(null);
+  const [resetBusy, setResetBusy] = useState(false);
   const disconnect = useVpnStore((s) => s.disconnect);
   const deleteSubscription = useSubscriptionStore((s) => s.deleteSubscription);
   const settings = useSettingsStore();
 
-  const doResetSettings = () => {
-    settings.reset();
-    setPending(null);
-    onAfterReset();
+  const doResetSettings = async () => {
+    if (resetBusy) return;
+    setResetBusy(true);
+    try {
+      const status = useVpnStore.getState().status;
+      if (status === "starting" || status === "stopping") {
+        await disconnect();
+        const vpn = useVpnStore.getState();
+        if (vpn.status !== "stopped") {
+          throw new Error(
+            vpn.errorMessage || "VPN cleanup did not finish before settings reset"
+          );
+        }
+      }
+      settings.reset();
+      setPending(null);
+      onAfterReset();
+    } catch (error) {
+      showToast({
+        kind: "error",
+        title: t("settings.reset.title"),
+        message: String(error),
+      });
+    } finally {
+      setResetBusy(false);
+    }
   };
 
   const doResetAll = async () => {
+    if (resetBusy) return;
+    setResetBusy(true);
     try {
       await disconnect();
-    } catch {
-      // вне зависимости от результата чистим локальные данные
-    }
-    await deleteSubscription();
-    try {
-      for (let i = localStorage.length - 1; i >= 0; i -= 1) {
-        const key = localStorage.key(i);
-        if (key?.startsWith("kwikproxy-secure.")) {
-          localStorage.removeItem(key);
+      await deleteSubscription();
+      try {
+        for (let i = localStorage.length - 1; i >= 0; i -= 1) {
+          const key = localStorage.key(i);
+          if (key?.startsWith("kwikproxy-secure.")) {
+            localStorage.removeItem(key);
+          }
         }
+      } catch {
+        // приватный режим
       }
-    } catch {
-      // приватный режим
+      settings.reset();
+      onAfterReset();
+      // перезагрузим страницу чтобы Zustand-stores переинициализировались
+      window.location.reload();
+    } catch (error) {
+      showToast({
+        kind: "error",
+        title: t("settings.reset.title"),
+        message: String(error),
+      });
+    } finally {
+      setResetBusy(false);
     }
-    settings.reset();
-    onAfterReset();
-    // перезагрузим страницу чтобы Zustand-stores переинициализировались
-    window.location.reload();
   };
 
   return (
@@ -2192,6 +2223,7 @@ function ResetBlock({ onAfterReset }: { onAfterReset: () => void }) {
             type="button"
             onClick={doResetSettings}
             className="btn-danger"
+            disabled={resetBusy}
           >
             {t("settings.reset.confirmSettingsBtn")}
           </button>
@@ -2214,6 +2246,7 @@ function ResetBlock({ onAfterReset }: { onAfterReset: () => void }) {
             type="button"
             onClick={doResetAll}
             className="btn-danger"
+            disabled={resetBusy}
           >
             {t("settings.reset.confirmAllBtn")}
           </button>

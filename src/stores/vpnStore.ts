@@ -4,7 +4,12 @@ import i18n from "../i18n";
 import { useSettingsStore } from "./settingsStore";
 import { useSubscriptionStore } from "./subscriptionStore";
 import { showToast } from "./toastStore";
-import { AsyncSingleFlight } from "../lib/asyncControl";
+import {
+  AsyncMutex,
+  AsyncSingleFlight,
+  AttemptEpoch,
+  isSameConnectionSelection,
+} from "../lib/asyncControl";
 
 /** Anti-DPI опции в формате camelCase, который Rust десериализует через
  *  serde(rename_all = "camelCase") в struct AntiDpiOptions. */
@@ -198,6 +203,8 @@ export const findSelectedIndexByName = (
  *  — это чисто внутренний мьютекс, перерисовка UI на него не нужна. */
 let switchingServer = false;
 const connectSingleFlight = new AsyncSingleFlight();
+const connectionLifecycle = new AsyncMutex();
+const connectionAttempts = new AttemptEpoch();
 
 class ConnectFailure extends Error {
   constructor(
@@ -210,6 +217,17 @@ class ConnectFailure extends Error {
   }
 }
 
+class ConnectCancelled extends Error {
+  constructor() {
+    super("Connection attempt was cancelled");
+    this.name = "ConnectCancelled";
+  }
+}
+
+const cleanupBackendConnection = async (): Promise<void> => {
+  await invoke("disconnect");
+};
+
 export const useVpnStore = create<VpnState>((set, get) => ({
   status: "stopped",
   errorMessage: null,
@@ -221,8 +239,12 @@ export const useVpnStore = create<VpnState>((set, get) => ({
   socksPassword: null,
   connectedAt: null,
 
-  setMode: (mode) => set({ mode }),
+  setMode: (mode) => {
+    if (["starting", "stopping"].includes(get().status)) return;
+    set({ mode });
+  },
   selectServer: (index) => {
+    if (["starting", "stopping"].includes(get().status)) return;
     const prev = get().selectedIndex;
     set({ selectedIndex: index });
     // Persist (subscriptionId, name) пары для восстановления после
@@ -291,6 +313,9 @@ export const useVpnStore = create<VpnState>((set, get) => ({
 
   connect() {
     return connectSingleFlight.run(async () => {
+      const attempt = connectionAttempts.begin();
+      let backendStarted = false;
+      let backendCleaned = false;
       const { selectedIndex, mode } = get();
       set({ status: "starting", errorMessage: null });
 
@@ -333,6 +358,9 @@ export const useVpnStore = create<VpnState>((set, get) => ({
             "warning"
           );
         }
+        if (!connectionAttempts.isCurrent(attempt)) {
+          throw new ConnectCancelled();
+        }
 
         const allowLan = useSettingsStore.getState().allowLan;
         const tunMasking = useSettingsStore.getState().tunMasking;
@@ -369,6 +397,11 @@ export const useVpnStore = create<VpnState>((set, get) => ({
         // используем primary, иначе settings.engine.
         const subStore = useSubscriptionStore.getState();
         const selectedServer = subStore.servers[selectedIndex];
+        const selectionSnapshot = {
+          primaryId: subStore.primaryId,
+          selectedIndex,
+          server: selectedServer,
+        };
         const sourceId = selectedServer?.subscriptionId ?? subStore.primaryId;
         // Mihomo-only: движок всегда Mihomo. getEffectiveEngine тоже возвращает
         // "mihomo"; передаём его в connect для совместимости IPC-контракта.
@@ -383,32 +416,75 @@ export const useVpnStore = create<VpnState>((set, get) => ({
           async (runtimeReceipt) => {
             const currentSubscriptions = useSubscriptionStore.getState();
             if (
-              currentSubscriptions.primaryId !== runtimeReceipt.primaryId ||
-              get().selectedIndex !== selectedIndex
+              runtimeReceipt.primaryId !== selectionSnapshot.primaryId ||
+              !isSameConnectionSelection(selectionSnapshot, {
+                primaryId: currentSubscriptions.primaryId,
+                selectedIndex: get().selectedIndex,
+                server: currentSubscriptions.servers[selectedIndex],
+              })
             ) {
               throw new ConnectFailure(
                 i18n.t("vpnStore.connectError.selectionChanged"),
                 i18n.t("vpnStore.connectError.title")
               );
             }
-            return await invoke<ConnectResult>("connect", {
-              serverIndex: selectedIndex,
-              subscriptionEpoch: runtimeReceipt.sessionEpoch,
-              subscriptionId: runtimeReceipt.primaryId,
-              subscriptionGeneration: runtimeReceipt.generation,
-              mode,
-              engine,
-              allowLan,
-              antiDpi,
-              tunMasking,
-              killSwitch,
-              dnsLeakProtection,
-              killSwitchStrict,
-              forceDisableIpv6,
-              autoApplyMinimalRuRules,
-              appRules,
-              ipv6,
-              customDns,
+            return await connectionLifecycle.runExclusive(async () => {
+              if (!connectionAttempts.isCurrent(attempt)) {
+                throw new ConnectCancelled();
+              }
+              backendStarted = true;
+              const response = await invoke<ConnectResult>("connect", {
+                serverIndex: selectedIndex,
+                subscriptionEpoch: runtimeReceipt.sessionEpoch,
+                subscriptionId: runtimeReceipt.primaryId,
+                subscriptionGeneration: runtimeReceipt.generation,
+                mode,
+                engine,
+                allowLan,
+                antiDpi,
+                tunMasking,
+                killSwitch,
+                dnsLeakProtection,
+                killSwitchStrict,
+                forceDisableIpv6,
+                autoApplyMinimalRuRules,
+                appRules,
+                ipv6,
+                customDns,
+              });
+              const afterConnect = useSubscriptionStore.getState();
+              if (!connectionAttempts.isCurrent(attempt)) {
+                await cleanupBackendConnection();
+                backendCleaned = true;
+                throw new ConnectCancelled();
+              }
+              if (
+                runtimeReceipt.primaryId !== selectionSnapshot.primaryId ||
+                !isSameConnectionSelection(selectionSnapshot, {
+                  primaryId: afterConnect.primaryId,
+                  selectedIndex: get().selectedIndex,
+                  server: afterConnect.servers[selectedIndex],
+                })
+              ) {
+                await cleanupBackendConnection();
+                backendCleaned = true;
+                throw new ConnectFailure(
+                  i18n.t("vpnStore.connectError.selectionChanged"),
+                  i18n.t("vpnStore.connectError.title")
+                );
+              }
+              // The validation and visible state transition are synchronous:
+              // disconnect/selection changes cannot interleave between them.
+              set({
+                status: "running",
+                socksPort: response.socks_port,
+                httpPort: response.http_port,
+                socksUsername: response.socks_username ?? null,
+                socksPassword: response.socks_password ?? null,
+                connectedAt: Date.now(),
+                errorMessage: null,
+              });
+              return response;
             });
           }
         );
@@ -418,15 +494,6 @@ export const useVpnStore = create<VpnState>((set, get) => ({
             i18n.t("vpnStore.connectError.title")
           );
         }
-        set({
-          status: "running",
-          socksPort: result.socks_port,
-          httpPort: result.http_port,
-          socksUsername: result.socks_username ?? null,
-          socksPassword: result.socks_password ?? null,
-          connectedAt: Date.now(),
-          errorMessage: null,
-        });
         // 8.F: для mihomo-движка применяем сохранённые пользователем
         // preferredMihomoNodes (см. ProxiesPanel — клик по ноде до connect
         // запоминает её как предпочитаемую). external-controller только
@@ -437,6 +504,7 @@ export const useVpnStore = create<VpnState>((set, get) => ({
         if (engine === "mihomo") {
           const preferred = useSettingsStore.getState().preferredMihomoNodes;
           for (const [group, name] of Object.entries(preferred)) {
+            if (!connectionAttempts.isCurrent(attempt)) break;
             try {
               await invoke("mihomo_select_proxy", { group, name });
             } catch {
@@ -445,6 +513,16 @@ export const useVpnStore = create<VpnState>((set, get) => ({
           }
         }
       } catch (e) {
+        if (!connectionAttempts.isCurrent(attempt) || e instanceof ConnectCancelled) {
+          if (backendStarted && !backendCleaned) {
+            try {
+              await connectionLifecycle.runExclusive(cleanupBackendConnection);
+            } catch (cleanupError) {
+              console.warn("[vpn] cancelled connect cleanup failed:", cleanupError);
+            }
+          }
+          return;
+        }
         const message = e instanceof Error ? e.message : String(e);
         set({ status: "error", errorMessage: message });
         showToast({
@@ -461,9 +539,16 @@ export const useVpnStore = create<VpnState>((set, get) => ({
   },
 
   async disconnect() {
+    const disconnectAttempt = connectionAttempts.cancel();
     set({ status: "stopping", errorMessage: null });
     try {
-      await invoke("disconnect");
+      await connectionLifecycle.runExclusive(async () => {
+        await invoke("disconnect");
+      });
+      // A disconnect→connect caller (server switch, network change, reset)
+      // must not accidentally join the cancelled single-flight promise.
+      await connectSingleFlight.waitForIdle();
+      if (!connectionAttempts.isCurrent(disconnectAttempt)) return;
       set({
         status: "stopped",
         socksPort: null,
@@ -474,6 +559,7 @@ export const useVpnStore = create<VpnState>((set, get) => ({
         errorMessage: null,
       });
     } catch (e) {
+      if (!connectionAttempts.isCurrent(disconnectAttempt)) return;
       set({ status: "error", errorMessage: String(e) });
     }
   },

@@ -302,6 +302,9 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Set-Location $env:SOURCE_ROOT
 
+          & npm run test:unit --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw "frontend unit tests failed with exit code $LASTEXITCODE" }
+
           & npm run build --ignore-scripts
           if ($LASTEXITCODE -ne 0) { throw "frontend build failed with exit code $LASTEXITCODE" }
 
