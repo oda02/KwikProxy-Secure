@@ -14,16 +14,40 @@ fn macro_body(name: &str) -> &'static str {
     &rest[..end]
 }
 
+fn modeled_root_is_dirty(entries: &[&str]) -> bool {
+    entries.iter().any(|name| *name != "." && *name != "..")
+}
+
 #[test]
 fn clean_install_guard_still_rejects_existing_protected_state() {
     let preinstall = macro_body("NSIS_HOOK_PREINSTALL");
     assert!(preinstall.contains("${FileExists} \"${KWIK_SECURE_HELPER}\""));
-    assert!(preinstall.contains("${FileExists} \"$INSTDIR\\*.*\""));
+    assert!(preinstall.contains("KWIK_SECURE_CHECK_INSTALL_ROOT_EMPTY"));
     assert!(preinstall.contains("$SYSDIR\\sc.exe\" query ${KWIK_SECURE_SERVICE}"));
     assert!(preinstall.contains("$0 != 1060"));
     assert!(preinstall.contains("RegOpenKeyExW"));
     assert!(preinstall.contains("0x20119"));
     assert!(preinstall.contains("SOFTWARE\\KwikProxySecure"));
+}
+
+#[test]
+fn explicit_root_enumeration_accepts_only_dot_entries() {
+    assert!(!modeled_root_is_dirty(&[]));
+    assert!(!modeled_root_is_dirty(&[".", ".."]));
+    assert!(modeled_root_is_dirty(&[".", "..", "uninstall.exe"]));
+
+    let check = macro_body("KWIK_SECURE_CHECK_INSTALL_ROOT_EMPTY");
+    assert!(check.contains("FindFirst"));
+    assert!(check.contains("FindNext"));
+    assert!(check.contains("FindClose"));
+    assert!(check.contains("\"$1\" != \".\""));
+    assert!(check.contains("\"$1\" != \"..\""));
+    assert!(check.contains("$2 >= 512"));
+    assert!(check.contains("$1 == 2"));
+    assert!(check.contains("$1 != 18"));
+    assert_eq!(check.matches("FindFirst").count(), 1);
+    assert_eq!(check.matches("FindClose").count(), 1);
+    assert!(!check.contains("${FileExists}"));
 }
 
 #[test]
@@ -50,7 +74,7 @@ fn uninstall_cannot_succeed_with_protected_payload_left_behind() {
     let postuninstall = macro_body("NSIS_HOOK_POSTUNINSTALL");
     assert!(postuninstall.contains("GetFileAttributesW"));
     assert!(postuninstall.contains("$INSTDIR"));
-    assert!(postuninstall.contains("${FileExists} \"$INSTDIR\\*.*\""));
+    assert!(postuninstall.contains("KWIK_SECURE_CHECK_INSTALL_ROOT_EMPTY"));
     assert!(postuninstall.contains("SetErrorLevel 2"));
     assert!(postuninstall.contains("Abort"));
 

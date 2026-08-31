@@ -44,6 +44,51 @@
   ${Loop}
 !macroend
 
+; SetOutPath creates the fixed root before PREINSTALL. Enumerate it explicitly:
+; NSIS wildcard existence checks also match `.`/`..` and therefore
+; rejects a genuinely empty directory. This macro ignores only those two exact
+; names, bounds iteration, closes every valid search handle, and treats an
+; unexpected enumeration failure as non-empty/fail-closed.
+!macro KWIK_SECURE_CHECK_INSTALL_ROOT_EMPTY RESULT
+  StrCpy ${RESULT} 1
+  ClearErrors
+  FindFirst $0 $1 "$INSTDIR\*"
+  ${If} ${Errors}
+    System::Call 'kernel32::GetLastError() i.r1'
+    ${If} $1 == 2
+    ${OrIf} $1 == 18
+      ; An existing directory with no first entry is also empty.
+      StrCpy ${RESULT} 0
+    ${EndIf}
+  ${Else}
+    StrCpy ${RESULT} 0
+    StrCpy $2 0
+    ${Do}
+      ${If} "$1" != "."
+      ${AndIf} "$1" != ".."
+        StrCpy ${RESULT} 1
+        ${ExitDo}
+      ${EndIf}
+      IntOp $2 $2 + 1
+      ${If} $2 >= 512
+        StrCpy ${RESULT} 1
+        ${ExitDo}
+      ${EndIf}
+      ClearErrors
+      FindNext $0 $1
+      ${If} ${Errors}
+        System::Call 'kernel32::GetLastError() i.r1'
+        ${If} $1 != 18
+          ; ERROR_NO_MORE_FILES (18) is the only successful termination.
+          StrCpy ${RESULT} 1
+        ${EndIf}
+        ${ExitDo}
+      ${EndIf}
+    ${Loop}
+    FindClose $0
+  ${EndIf}
+!macroend
+
 ; If helper provisioning failed before it could protect the root/write the
 ; manifest, the strict installer-only cleanup identity intentionally does not
 ; exist. Recovery is still safe after independently proving that neither SCM
@@ -79,7 +124,8 @@
   ; SetOutPath has created an empty directory for a genuinely clean install.
   ; Any entry here is therefore stale/partial protected state. Do not merge a
   ; new trusted payload into it or execute anything found there.
-  ${If} ${FileExists} "$INSTDIR\*.*"
+  !insertmacro KWIK_SECURE_CHECK_INSTALL_ROOT_EMPTY $3
+  ${If} $3 != 0
     MessageBox MB_ICONSTOP "The fixed KwikProxy Secure installation directory is not empty. Installation is aborted without executing or replacing its contents. Complete the prior uninstall (or have an administrator remove the verified stale directory), then retry."
     Abort
   ${EndIf}
@@ -255,9 +301,11 @@
   ${Loop}
   System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR") i.r4'
   ${If} $4 != -1
-  ${AndIf} ${FileExists} "$INSTDIR\*.*"
-    MessageBox MB_ICONSTOP "KwikProxy Secure uninstall is incomplete because its protected installation directory still exists. Do not reinstall yet; retry uninstall with administrator rights."
-    SetErrorLevel 2
-    Abort
+    !insertmacro KWIK_SECURE_CHECK_INSTALL_ROOT_EMPTY $5
+    ${If} $5 != 0
+      MessageBox MB_ICONSTOP "KwikProxy Secure uninstall is incomplete because its protected installation directory still contains files. Do not reinstall yet; retry uninstall with administrator rights."
+      SetErrorLevel 2
+      Abort
+    ${EndIf}
   ${EndIf}
 !macroend
