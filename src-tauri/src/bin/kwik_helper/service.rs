@@ -180,6 +180,7 @@ mod tests {
         MIHOMO_FILENAME, UI_FILENAME, WINTUN_FILENAME,
     };
     use std::path::Path;
+    use tokio::net::windows::named_pipe::ServerOptions;
     use windows_service::service::ServiceState;
 
     #[test]
@@ -225,6 +226,27 @@ mod tests {
                 >= super::pipe::RPC_DRAIN_TIMEOUT + super::SHUTDOWN_CLEANUP_TIMEOUT
         );
         assert!(super::SERVICE_STATE_TIMEOUT >= super::SERVICE_STOP_TIMEOUT);
+    }
+
+    #[test]
+    fn entered_current_thread_runtime_allows_sync_named_pipe_creation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let pipe_name = format!(
+            r"\\.\pipe\KwikProxySecure.RuntimeContextTest.{}",
+            std::process::id()
+        );
+
+        let pipe = super::with_runtime_entered(&runtime, || {
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&pipe_name)
+        })
+        .expect("named pipe must bind while the current-thread runtime is entered");
+
+        drop(pipe);
     }
 }
 
@@ -485,6 +507,11 @@ fn my_service_main(_arguments: Vec<OsString>) {
     }
 }
 
+fn with_runtime_entered<T>(runtime: &tokio::runtime::Runtime, operation: impl FnOnce() -> T) -> T {
+    let _runtime_guard = runtime.enter();
+    operation()
+}
+
 fn service_loop() -> Result<()> {
     // Флаг shutdown, который выставит SCM при ServiceControl::Stop
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -570,8 +597,12 @@ fn service_loop() -> Result<()> {
             wait_hint: SERVICE_START_TIMEOUT,
             process_id: None,
         })?;
-        let prepared =
-            pipe::prepare_pipe_server().context("manifest/runtime/pipe readiness checks failed")?;
+        // NamedPipeServer construction registers its handle with Tokio's I/O
+        // driver even though the constructor itself is synchronous. block_on
+        // exits the runtime context after startup cleanup, so enter it again
+        // for this constructor and drop the guard before the next block_on.
+        let prepared = with_runtime_entered(&rt, pipe::prepare_pipe_server)
+            .context("manifest/runtime/pipe readiness checks failed")?;
         if shutdown.load(Ordering::SeqCst) {
             return Err(anyhow!("service stop requested before pipe publication"));
         }
