@@ -86,6 +86,7 @@
     "tunHint": "Through the VPN — all system traffic (intercepted at the adapter level). Nothing goes around the tunnel. Needs WinTUN."
   },
   "toaster": {
+    "regionLabel": "notifications",
     "dismissTitle": "click to dismiss"
   },
   "leakTest": {

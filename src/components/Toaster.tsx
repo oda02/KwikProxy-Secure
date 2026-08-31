@@ -15,22 +15,31 @@ export function Toaster() {
   if (toasts.length === 0) return null;
 
   return (
-    <div className="toaster">
+    <div className="toaster" role="region" aria-label={t("toaster.regionLabel")}>
       {toasts.map((toast) => (
-        <button
+        <div
           key={toast.id}
-          type="button"
           className={`toast toast-${toast.kind}`}
-          onClick={() => dismiss(toast.id)}
-          title={t("toaster.dismissTitle")}
+          role={toast.kind === "error" ? "alert" : "status"}
         >
-          {toast.title && <div className="toast-title">{toast.title}</div>}
-          <div className="toast-message">
-            {toast.message.split("\n").map((line, i) => (
-              <div key={i}>{line}</div>
-            ))}
+          <div className="toast-content">
+            {toast.title && <div className="toast-title">{toast.title}</div>}
+            <div className="toast-message">
+              {toast.message.split("\n").map((line, i) => (
+                <div key={i}>{line}</div>
+              ))}
+            </div>
           </div>
-        </button>
+          <button
+            type="button"
+            className="toast-dismiss"
+            onClick={() => dismiss(toast.id)}
+            title={t("toaster.dismissTitle")}
+            aria-label={t("toaster.dismissTitle")}
+          >
+            <span aria-hidden="true">&times;</span>
+          </button>
+        </div>
       ))}
     </div>
   );

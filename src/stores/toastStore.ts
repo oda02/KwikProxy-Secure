@@ -9,7 +9,7 @@ export type Toast = {
   title?: string;
   /** Основной текст. Поддерживается «\n» для второй строки. */
   message: string;
-  /** Через сколько мс автоматически уйдёт. По умолчанию 5000. 0 — не уходит. */
+  /** Через сколько мс автоматически уйдёт. Ошибки видны 10 с, остальные 5 с. 0 — не уходит. */
   durationMs: number;
 };
 
@@ -22,6 +22,7 @@ type ToastStore = {
 };
 
 let nextId = 1;
+const MAX_VISIBLE_TOASTS = 3;
 
 export const useToastStore = create<ToastStore>((set, get) => ({
   toasts: [],
@@ -32,9 +33,17 @@ export const useToastStore = create<ToastStore>((set, get) => ({
       kind: input.kind,
       title: input.title,
       message: input.message,
-      durationMs: input.durationMs ?? 5000,
+      durationMs: input.durationMs ?? (input.kind === "error" ? 10_000 : 5_000),
     };
-    set({ toasts: [...get().toasts, toast] });
+    // Repeated backend failures used to produce a translucent wall of identical
+    // messages. Keep the newest occurrence and bound the visible stack.
+    const withoutDuplicate = get().toasts.filter(
+      (item) =>
+        item.kind !== toast.kind ||
+        item.title !== toast.title ||
+        item.message !== toast.message
+    );
+    set({ toasts: [...withoutDuplicate, toast].slice(-MAX_VISIBLE_TOASTS) });
     if (toast.durationMs > 0) {
       window.setTimeout(() => {
         get().dismiss(id);
