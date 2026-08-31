@@ -94,6 +94,7 @@ export class MutationFence {
 
 export type BackendStopResult = {
   stopped: boolean;
+  cleanupSucceeded: boolean;
   observedRunning: boolean | null;
   error: unknown | null;
 };
@@ -114,22 +115,30 @@ export async function stopAndReconcile(
     // The stop call can change backend state, so an observation from the
     // previous attempt is no longer evidence about the final state.
     observedRunning = null;
+    let stopSucceeded = false;
     try {
       await stop();
+      stopSucceeded = true;
     } catch (error) {
       firstError ??= error;
     }
     try {
       observedRunning = await isRunning();
-      if (!observedRunning) {
-        return { stopped: true, observedRunning: false, error: firstError };
+      if (!observedRunning && stopSucceeded) {
+        return {
+          stopped: true,
+          cleanupSucceeded: true,
+          observedRunning: false,
+          error: firstError,
+        };
       }
     } catch (error) {
       firstError ??= error;
     }
   }
   return {
-    stopped: false,
+    stopped: observedRunning === false,
+    cleanupSucceeded: false,
     observedRunning,
     error: firstError ?? new Error("backend remained running after cleanup"),
   };
@@ -144,6 +153,45 @@ export async function publishAfterCommit<T>(
   if (receipt === null) return null;
   publish(receipt);
   return receipt;
+}
+
+/** Delete sequentially and restore already deleted entries on any failure. */
+export async function deleteWithRollback<T>(
+  entries: readonly T[],
+  remove: (entry: T) => Promise<void>,
+  restore: (entry: T) => Promise<void>
+): Promise<void> {
+  try {
+    for (const entry of entries) {
+      await remove(entry);
+    }
+  } catch (error) {
+    const rollbackErrors: unknown[] = [];
+    // The failing remove may have committed remotely before its response was
+    // lost. Restore the complete pre-snapshot, not only acknowledged deletes.
+    for (const entry of [...entries].reverse()) {
+      try {
+        await restore(entry);
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      throw new Error(
+        `${String(error)}; credential rollback failed: ${rollbackErrors
+          .map(String)
+          .join("; ")}`
+      );
+    }
+    throw error;
+  }
+}
+
+export function choosePersistedById<T extends { id: string }>(
+  entries: readonly T[],
+  persistedId: string | null
+): T | undefined {
+  return entries.find((entry) => entry.id === persistedId) ?? entries[0];
 }
 
 export type ConnectionSelection<T> = {

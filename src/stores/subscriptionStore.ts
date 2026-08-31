@@ -7,6 +7,8 @@ import { showToast } from "./toastStore";
 import {
   AsyncMutex,
   MutationFence,
+  choosePersistedById,
+  deleteWithRollback,
   publishAfterCommit,
   publishRequiredTombstone,
 } from "../lib/asyncControl";
@@ -325,29 +327,16 @@ const saveToStorage = (key: string, value: string) => {
 /** Записать значение в Windows Credential Manager. Возвращает true при
  *  успехе. Ошибки не критичны — на платформах без keyring (или приватных
  *  пользователях) тихо проваливаемся. */
-const keyringSetRaw = async (key: string, value: string): Promise<boolean> => {
-  try {
-    await invoke("secure_storage_set", { key, value });
-    return true;
-  } catch {
-    return false;
-  }
+const keyringSetRaw = async (key: string, value: string): Promise<void> => {
+  await invoke("secure_storage_set", { key, value });
 };
 
 const keyringGetRaw = async (key: string): Promise<string> => {
-  try {
-    return await invoke<string>("secure_storage_get", { key });
-  } catch {
-    return "";
-  }
+  return await invoke<string>("secure_storage_get", { key });
 };
 
 const keyringDeleteRaw = async (key: string): Promise<void> => {
-  try {
-    await invoke("secure_storage_delete", { key });
-  } catch {
-    // ignore
-  }
+  await invoke("secure_storage_delete", { key });
 };
 
 const keyringSet = (key: string, value: string): Promise<boolean> => {
@@ -355,7 +344,8 @@ const keyringSet = (key: string, value: string): Promise<boolean> => {
   if (epoch === null) return Promise.resolve(false);
   return credentialMutationMutex.runExclusive(async () => {
     if (!credentialMutationFence.allows(epoch)) return false;
-    return await keyringSetRaw(key, value);
+    await keyringSetRaw(key, value);
+    return true;
   });
 };
 
@@ -364,7 +354,11 @@ const keyringGet = (key: string): Promise<string> => {
   if (epoch === null) return Promise.resolve("");
   return credentialMutationMutex.runExclusive(async () => {
     if (!credentialMutationFence.allows(epoch)) return "";
-    return await keyringGetRaw(key);
+    try {
+      return await keyringGetRaw(key);
+    } catch {
+      return "";
+    }
   });
 };
 
@@ -376,6 +370,105 @@ const keyringDelete = (key: string): Promise<void> => {
     await keyringDeleteRaw(key);
   });
 };
+
+const queueCredentialMutation = (mutation: Promise<unknown>): void => {
+  void mutation.catch((error) => {
+    console.warn("[subscription] credential mutation failed:", error);
+    showToast({
+      kind: "error",
+      title: "Credential storage update failed",
+      message: String(error),
+      durationMs: 8000,
+    });
+  });
+};
+
+type CredentialRecord = { key: string; value: string };
+type CredentialValue = { key: string; value: string | null };
+
+const snapshotCredentials = async (
+  keys: readonly string[]
+): Promise<CredentialRecord[]> => {
+  const entries: CredentialRecord[] = [];
+  for (const key of keys) {
+    const value = await keyringGetRaw(key);
+    if (value) entries.push({ key, value });
+  }
+  return entries;
+};
+
+const deleteCredentialsTransactional = (
+  entries: readonly CredentialRecord[]
+): Promise<void> =>
+  deleteWithRollback(
+    entries,
+    (entry) => keyringDeleteRaw(entry.key),
+    (entry) => keyringSetRaw(entry.key, entry.value)
+  );
+
+const deleteCredentialKeysTransactional = (
+  keys: readonly string[]
+): Promise<CredentialRecord[]> =>
+  credentialMutationMutex.runExclusive(async () => {
+    const entries = await snapshotCredentials(keys);
+    await deleteCredentialsTransactional(entries);
+    return entries;
+  });
+
+const restoreCredentialRecords = (
+  entries: readonly CredentialRecord[]
+): Promise<void> =>
+  credentialMutationMutex.runExclusive(async () => {
+    for (const entry of entries) {
+      await keyringSetRaw(entry.key, entry.value);
+    }
+  });
+
+const replaceCredentialsTransactional = (
+  updates: readonly CredentialValue[]
+): Promise<CredentialValue[]> =>
+  credentialMutationMutex.runExclusive(async () => {
+    const previous: CredentialValue[] = [];
+    for (const update of updates) {
+      const value = await keyringGetRaw(update.key);
+      previous.push({ key: update.key, value: value || null });
+    }
+    try {
+      for (const update of updates) {
+        if (update.value === null) await keyringDeleteRaw(update.key);
+        else await keyringSetRaw(update.key, update.value);
+      }
+    } catch (error) {
+      const rollbackErrors: unknown[] = [];
+      for (const entry of previous) {
+        try {
+          if (entry.value === null) await keyringDeleteRaw(entry.key);
+          else await keyringSetRaw(entry.key, entry.value);
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
+      if (rollbackErrors.length > 0) {
+        throw new Error(
+          `${String(error)}; credential replace rollback failed: ${rollbackErrors
+            .map(String)
+            .join("; ")}`
+        );
+      }
+      throw error;
+    }
+    return previous;
+  });
+
+const restoreCredentialValues = (
+  entries: readonly CredentialValue[]
+): Promise<void> =>
+  credentialMutationMutex.runExclusive(async () => {
+    for (const entry of entries) {
+      if (entry.value === null) await keyringDeleteRaw(entry.key);
+      else await keyringSetRaw(entry.key, entry.value);
+    }
+  });
 
 // Чистим устаревший ключ override-HWID. Версионирование выше уже отрезает
 // его от чтения, но удаляем для гигиены localStorage.
@@ -410,6 +503,7 @@ const loadTimestamp = (key: string): number | null => {
  *  `hwid_override:${id}`. На init читаем этот список → подгружаем по
  *  каждому id креды из keyring. */
 const SUBS_INDEX_KEY = "kwikproxy-secure.subscriptions.index.v1";
+const PRIMARY_ID_KEY = "kwikproxy-secure.subscriptions.primary.v1";
 
 const loadSubsIndex = (): string[] => {
   try {
@@ -422,11 +516,49 @@ const loadSubsIndex = (): string[] => {
   }
 };
 
-const saveSubsIndex = (ids: string[]) => {
+const saveSubsIndexStrict = (ids: string[]): void => {
+  localStorage.setItem(SUBS_INDEX_KEY, JSON.stringify(ids));
+};
+
+const loadPrimaryId = (): string | null => {
   try {
-    localStorage.setItem(SUBS_INDEX_KEY, JSON.stringify(ids));
+    return localStorage.getItem(PRIMARY_ID_KEY);
   } catch {
-    // приватный режим — не критично
+    return null;
+  }
+};
+
+const savePrimaryIdStrict = (id: string): void => {
+  localStorage.setItem(PRIMARY_ID_KEY, id);
+};
+
+const loadPrimaryIdStrict = (): string | null =>
+  localStorage.getItem(PRIMARY_ID_KEY);
+
+const restorePrimaryIdStrict = (id: string | null): void => {
+  if (id === null) localStorage.removeItem(PRIMARY_ID_KEY);
+  else localStorage.setItem(PRIMARY_ID_KEY, id);
+};
+
+const saveBootstrapIdentityStrict = (id: string): void => {
+  const previousIndex = localStorage.getItem(SUBS_INDEX_KEY);
+  const previousPrimary = localStorage.getItem(PRIMARY_ID_KEY);
+  try {
+    saveSubsIndexStrict([id]);
+    savePrimaryIdStrict(id);
+  } catch (error) {
+    try {
+      if (previousIndex === null) localStorage.removeItem(SUBS_INDEX_KEY);
+      else localStorage.setItem(SUBS_INDEX_KEY, previousIndex);
+      restorePrimaryIdStrict(previousPrimary);
+    } catch (rollbackError) {
+      throw new Error(
+        `${String(error)}; bootstrap identity rollback failed: ${String(
+          rollbackError
+        )}`
+      );
+    }
+    throw error;
   }
 };
 
@@ -445,6 +577,8 @@ const removeLegacyPlaintextCache = () => {
 let nextFetchGeneration = 0;
 let nextRuntimeGeneration = 0;
 const primaryRuntimeMutex = new AsyncMutex();
+const subscriptionMutationMutex = new AsyncMutex();
+const subscriptionSourceFence = new MutationFence();
 const fetchGenerations = new Map<string, number>();
 let runtimeEpochPromise: Promise<string> | null = null;
 
@@ -459,6 +593,16 @@ const ensureRuntimeEpoch = (): Promise<string> => {
   }
   return runtimeEpochPromise;
 };
+
+const runSubscriptionMutation = <T>(task: () => Promise<T>): Promise<T> =>
+  subscriptionMutationMutex.runExclusive(async () => {
+    const fence = subscriptionSourceFence.beginExclusive();
+    try {
+      return await task();
+    } finally {
+      subscriptionSourceFence.endExclusive(fence);
+    }
+  });
 
 const beginFetch = (id: string): number => {
   const generation = ++nextFetchGeneration;
@@ -613,22 +757,6 @@ const requireCredentialMutationAllowed = (operation: string): void => {
   throw new Error(`Cannot ${operation} while subscription deletion is active`);
 };
 
-const captureCredentialMutation = (operation: string): number => {
-  const snapshot = credentialMutationFence.snapshot();
-  if (snapshot === null) {
-    throw new Error(`Cannot ${operation} while subscription deletion is active`);
-  }
-  return snapshot;
-};
-
-const requireCredentialMutationCurrent = (
-  snapshot: number,
-  operation: string
-): void => {
-  if (credentialMutationFence.allows(snapshot)) return;
-  throw new Error(`${operation} was cancelled by subscription deletion`);
-};
-
 const genId = (): string => {
   // Безопасный uuid v4 без external crypto.randomUUID для старых runtime'ов.
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
@@ -650,191 +778,13 @@ const newSubscription = (url: string, hwid: string): Subscription => ({
   pings: [],
 });
 
-export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
-  // Multi-subscription (0.3.0+) — populated from `loadSecureCreds`.
-  subscriptions: [],
-  primaryId: null,
-
-  servers: [],
-  meta: null,
-  lastFetchedAt: loadTimestamp(LAST_FETCH_KEY),
-  pings: [],
-  pingsLoading: false,
-  loading: false,
-  error: null,
-  url: loadFromStorage(URL_KEY),
-  deviceHwid: "",
-  hwid: loadFromStorage(HWID_KEY),
-
-  // ─── Multi-subscription methods (0.3.0+) ─────────────────────────────
-
-  async addSubscription(url) {
-    requireCredentialMutationAllowed("add a subscription");
-    const credentialSnapshot = captureCredentialMutation("add a subscription");
-    requireVpnTransitionStable("add a subscription");
-    const trimmed = url.trim();
-    if (!trimmed) throw new Error("empty URL");
-
-    // 0.3.0: проверка дубликатов — сравниваем полный URL точно.
-    // Если уже есть такая же подписка, ничего не добавляем и показываем
-    // юзеру toast (возвращаем id существующей для callsite).
-    const dup = get().subscriptions.find((s) => s.url === trimmed);
-    if (dup) {
-      showToast({
-        kind: "warning",
-        title: i18n.t("toast.subscriptionDuplicate.title"),
-        message: i18n.t("toast.subscriptionDuplicate.message"),
-        durationMs: 4000,
-      });
-      return dup.id;
-    }
-    // Также проверяем legacy URL (на случай если subscriptions[] ещё не
-    // мигрирован — юзер пытается добавить тот же URL что в legacy).
-    if (get().url === trimmed && get().subscriptions.length === 0) {
-      showToast({
-        kind: "warning",
-        title: i18n.t("toast.subscriptionDuplicate.title"),
-        message: i18n.t("toast.subscriptionDuplicate.message"),
-        durationMs: 4000,
-      });
-      // Возвращаем placeholder id; при следующем fetchSubscription
-      // legacy замигрируется в subscriptions[0] и duplicate-check
-      // сработает в обычном виде.
-      return "__legacy_dup__";
-    }
-
-    // 0.3.0: если subscriptions пусты, но legacy URL уже есть (юзер
-    // ещё не делал hard-reload после миграции 0.3.0), сначала
-    // мигрируем legacy в subscriptions[0]. Без этого новая подписка
-    // становится primary и legacy URL «теряется» (его нет в массиве).
-    let existing = get().subscriptions;
-    if (existing.length === 0) {
-      const legacyUrl = get().url;
-      const legacyHwid = get().hwid;
-      if (legacyUrl.trim()) {
-        const legacyId = genId();
-        const legacySub: Subscription = {
-          id: legacyId,
-          url: legacyUrl,
-          hwid: legacyHwid,
-          meta: get().meta,
-          lastFetchedAt: get().lastFetchedAt,
-          loading: false,
-          error: null,
-          engineOverride: null,
-          servers: [],
-          pings: [],
-        };
-        await keyringSet(`${URL_KEYRING}:${legacyId}`, legacyUrl);
-        if (legacyHwid.trim()) {
-          await keyringSet(`${HWID_KEYRING}:${legacyId}`, legacyHwid);
-        }
-        requireCredentialMutationCurrent(
-          credentialSnapshot,
-          "subscription addition"
-        );
-        existing = [legacySub];
-        set({ subscriptions: existing, primaryId: legacyId });
-        saveSubsIndex([legacyId]);
-      }
-    }
-
-    const id = genId();
-    const sub = newSubscription(trimmed, "");
-    sub.id = id;
-    await keyringSet(`${URL_KEYRING}:${id}`, trimmed);
-    requireCredentialMutationCurrent(
-      credentialSnapshot,
-      "subscription addition"
-    );
-    const next = [...existing, sub];
-    set({ subscriptions: next });
-    // Если это вообще первая подписка (и legacy URL не было) —
-    // становится primary и legacy url синхронизируется.
-    if (existing.length === 0) {
-      set({ primaryId: id, url: trimmed });
-      await keyringSet(URL_KEYRING, trimmed);
-      requireCredentialMutationCurrent(
-        credentialSnapshot,
-        "subscription addition"
-      );
-    }
-    saveSubsIndex(next.map((s) => s.id));
-    // 0.3.0 Этап 6: fetch для любой подписки. Primary использует legacy
-    // fetchSubscription (синкнутся state.servers/meta для backward compat),
-    // non-primary — fetchSubscriptionById (хранит результаты только в
-    // sub'а; legacy state не трогается).
-    if (get().primaryId === id) {
-      await get().fetchSubscription();
-    } else {
-      await get().fetchSubscriptionById(id);
-    }
-    return id;
-  },
-
-  async removeSubscription(id) {
-    requireCredentialMutationAllowed("remove a subscription");
-    const credentialSnapshot = captureCredentialMutation(
-      "remove a subscription"
-    );
-    const subs = get().subscriptions;
-    const sub = subs.find((s) => s.id === id);
-    if (!sub) return;
-    const wasPrimary = get().primaryId === id;
-    const vpn = useVpnStore.getState();
-    if (!wasPrimary) {
-      requireVpnTransitionStable("remove a subscription");
-    }
-    if (wasPrimary && vpn.status !== "stopped") {
-      await vpn.disconnect();
-      requireVpnStopped("subscription removal");
-      requireCredentialMutationCurrent(
-        credentialSnapshot,
-        "subscription removal"
-      );
-    }
-
-    const remaining = subs.filter((s) => s.id !== id);
-    if (wasPrimary && remaining.length === 0) {
-      // deleteSubscription publishes and awaits the backend tombstone before
-      // deleting the last credentials/cache or clearing local primary state.
-      await get().deleteSubscription();
-      return;
-    }
-
-    if (wasPrimary) {
-      const switched = await get().setPrimaryId(remaining[0].id);
-      if (!switched) {
-        throw new Error("backend rejected the replacement primary subscription");
-      }
-    }
-
-    // The replacement primary is committed before old credentials disappear.
-    await Promise.all([
-      keyringDelete(`${URL_KEYRING}:${id}`),
-      keyringDelete(`${HWID_KEYRING}:${id}`),
-      deleteEncryptedCache(id),
-    ]);
-    requireCredentialMutationCurrent(
-      credentialSnapshot,
-      "subscription removal"
-    );
-
-    set({ subscriptions: remaining });
-    saveSubsIndex(remaining.map((s) => s.id));
-    if (wasPrimary) {
-      const next = remaining[0];
-      if (next.servers.length === 0) {
-        await get().fetchSubscriptionById(next.id);
-      }
-    }
-  },
-
-  async setPrimaryId(id) {
+export const useSubscriptionStore = create<SubscriptionStore>((set, get) => {
+  const setPrimaryIdUnlocked = async (id: string): Promise<boolean> => {
     if (useVpnStore.getState().status !== "stopped") return false;
     const before = get();
     const target = before.subscriptions.find((s) => s.id === id);
     if (!target) return false;
+    const persistedPrimaryBefore = loadPrimaryIdStrict();
 
     const receipt = await primaryRuntimeMutex.runExclusive(async () => {
       let latestTarget: Subscription | null = null;
@@ -862,9 +812,6 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
               currentTarget.meta
             );
           } catch (error) {
-            // The IPC transport can fail after the command was accepted.
-            // Restore the old backend snapshot before surfacing the exact
-            // original error.
             try {
               const rollback = rollbackTarget
                 ? await writeRuntimeSnapshot(
@@ -873,9 +820,7 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
                     rollbackTarget.meta
                   )
                 : await writeRuntimeSnapshot(id, [], null);
-              if (!rollback) {
-                throw new Error("backend rejected primary rollback");
-              }
+              if (!rollback) throw new Error("backend rejected primary rollback");
             } catch (rollbackError) {
               throw new Error(
                 `${String(error)}; backend rollback failed: ${String(rollbackError)}`
@@ -904,12 +849,59 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
             latestTarget = null;
             return null;
           }
+
+          // Persist legacy credentials + explicit primary before publishing
+          // locally. Any failure restores both persistence layers and backend.
+          let previousLegacy: CredentialValue[] | null = null;
+          try {
+            previousLegacy = await replaceCredentialsTransactional([
+              { key: URL_KEYRING, value: latestTarget.url },
+              {
+                key: HWID_KEYRING,
+                value: latestTarget.hwid.trim() ? latestTarget.hwid : null,
+              },
+            ]);
+            savePrimaryIdStrict(id);
+          } catch (error) {
+            const persistenceRollbackErrors: unknown[] = [];
+            if (previousLegacy) {
+              try {
+                await restoreCredentialValues(previousLegacy);
+              } catch (rollbackError) {
+                persistenceRollbackErrors.push(rollbackError);
+              }
+            }
+            try {
+              restorePrimaryIdStrict(persistedPrimaryBefore);
+            } catch (rollbackError) {
+              persistenceRollbackErrors.push(rollbackError);
+            }
+            const rollback = rollbackTarget
+              ? await writeRuntimeSnapshot(
+                  rollbackTarget.id,
+                  rollbackTarget.servers,
+                  rollbackTarget.meta
+                )
+              : await writeRuntimeSnapshot(id, [], null);
+            if (!rollback) {
+              persistenceRollbackErrors.push(
+                new Error("backend rejected primary persistence rollback")
+              );
+            }
+            latestTarget = null;
+            if (persistenceRollbackErrors.length > 0) {
+              throw new Error(
+                `${String(error)}; primary persistence rollback failed: ${persistenceRollbackErrors
+                  .map(String)
+                  .join("; ")}`
+              );
+            }
+            throw error;
+          }
           return committed;
         },
         () => {
           if (!latestTarget) return;
-          // Backend commit succeeded and the target is still valid. Publish
-          // the local view synchronously after that commit.
           set({
             primaryId: id,
             url: latestTarget.url,
@@ -933,11 +925,306 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
         }
       })
       .catch(() => {});
-    // Sync legacy keyring keys на новый primary.
-    await keyringSet(URL_KEYRING, published.url);
-    if (published.hwid.trim()) await keyringSet(HWID_KEYRING, published.hwid);
-    else await keyringDelete(HWID_KEYRING);
     return true;
+  };
+
+  const deleteSubscriptionUnlocked = async (): Promise<void> => {
+    requireCredentialMutationAllowed("delete subscriptions");
+    const vpn = useVpnStore.getState();
+    if (vpn.status !== "stopped") {
+      await vpn.disconnect();
+      requireVpnStopped("subscription deletion");
+    }
+
+    const deletionFence = credentialMutationFence.beginExclusive();
+    try {
+      await primaryRuntimeMutex.runExclusive(async () => {
+        // connect() publishes `starting` before it can enter this same runtime
+        // mutex. Recheck here so a connect that overtook the initial stop
+        // check cannot coexist with tombstone/credential destruction.
+        requireVpnStopped("subscription deletion finalization");
+        const runtimePrimaryId = get().primaryId;
+        const subscriptionsToDelete = [...get().subscriptions];
+        await publishRequiredTombstone(
+          runtimePrimaryId,
+          clearRustRuntimeUnlocked
+        );
+
+        // Cache deletion is fallible and irreversible. Run it before deleting
+        // Credential Manager source-of-truth so a cache error leaves enough
+        // persisted state for retry/recovery.
+        await Promise.all(
+          subscriptionsToDelete.map((s) => deleteEncryptedCache(s.id))
+        );
+
+        const credentialKeys = [
+          URL_KEYRING,
+          HWID_KEYRING,
+          ...subscriptionsToDelete.flatMap((s) => [
+            `${URL_KEYRING}:${s.id}`,
+            `${HWID_KEYRING}:${s.id}`,
+          ]),
+        ];
+        const deletedCredentials = await deleteCredentialKeysTransactional(
+          credentialKeys
+        );
+
+        const localKeys = [
+          LAST_FETCH_KEY,
+          "kwikproxy-secure.selectedServerName.v1",
+          SUBS_INDEX_KEY,
+          PRIMARY_ID_KEY,
+          SERVERS_CACHE_KEY,
+        ];
+        const previousLocal = new Map<string, string | null>();
+        try {
+          for (const key of localKeys) {
+            previousLocal.set(key, localStorage.getItem(key));
+          }
+          for (const key of localKeys) localStorage.removeItem(key);
+        } catch (error) {
+          const rollbackErrors: unknown[] = [];
+          try {
+            for (const [key, value] of previousLocal) {
+              if (value === null) localStorage.removeItem(key);
+              else localStorage.setItem(key, value);
+            }
+          } catch (rollbackError) {
+            rollbackErrors.push(rollbackError);
+          }
+          try {
+            await restoreCredentialRecords(deletedCredentials);
+          } catch (rollbackError) {
+            rollbackErrors.push(rollbackError);
+          }
+          if (rollbackErrors.length > 0) {
+            throw new Error(
+              `${String(error)}; deletion persistence rollback failed: ${rollbackErrors
+                .map(String)
+                .join("; ")}`
+            );
+          }
+          throw error;
+        }
+
+        set({
+          subscriptions: [],
+          primaryId: null,
+          servers: [],
+          meta: null,
+          pings: [],
+          lastFetchedAt: null,
+          url: "",
+          hwid: "",
+          error: null,
+        });
+        useVpnStore.setState({ selectedIndex: null });
+      });
+    } finally {
+      credentialMutationFence.endExclusive(deletionFence);
+    }
+
+    showToast({
+      kind: "success",
+      title: i18n.t("toast.subscriptionDeleted.title"),
+      message: i18n.t("toast.subscriptionDeleted.message"),
+      durationMs: 4000,
+    });
+  };
+
+  return ({
+  // Multi-subscription (0.3.0+) — populated from `loadSecureCreds`.
+  subscriptions: [],
+  primaryId: null,
+
+  servers: [],
+  meta: null,
+  lastFetchedAt: loadTimestamp(LAST_FETCH_KEY),
+  pings: [],
+  pingsLoading: false,
+  loading: false,
+  error: null,
+  url: loadFromStorage(URL_KEY),
+  deviceHwid: "",
+  hwid: loadFromStorage(HWID_KEY),
+
+  // ─── Multi-subscription methods (0.3.0+) ─────────────────────────────
+
+  async addSubscription(url) {
+    return await runSubscriptionMutation(async () => {
+      requireCredentialMutationAllowed("add a subscription");
+      requireVpnTransitionStable("add a subscription");
+      const trimmed = url.trim();
+      if (!trimmed) throw new Error("empty URL");
+
+      const initial = get();
+      const dup = initial.subscriptions.find((s) => s.url === trimmed);
+      if (dup) {
+        showToast({
+          kind: "warning",
+          title: i18n.t("toast.subscriptionDuplicate.title"),
+          message: i18n.t("toast.subscriptionDuplicate.message"),
+          durationMs: 4000,
+        });
+        return dup.id;
+      }
+      if (initial.url === trimmed && initial.subscriptions.length === 0) {
+        showToast({
+          kind: "warning",
+          title: i18n.t("toast.subscriptionDuplicate.title"),
+          message: i18n.t("toast.subscriptionDuplicate.message"),
+          durationMs: 4000,
+        });
+        return "__legacy_dup__";
+      }
+
+      let existing = initial.subscriptions;
+      const credentialUpdates: CredentialValue[] = [];
+      if (existing.length === 0 && initial.url.trim()) {
+        const legacyId = genId();
+        const legacySub: Subscription = {
+          id: legacyId,
+          url: initial.url,
+          hwid: initial.hwid,
+          meta: initial.meta,
+          lastFetchedAt: initial.lastFetchedAt,
+          loading: false,
+          error: null,
+          engineOverride: null,
+          servers: [],
+          pings: [],
+        };
+        existing = [legacySub];
+        credentialUpdates.push(
+          { key: `${URL_KEYRING}:${legacyId}`, value: legacySub.url },
+          {
+            key: `${HWID_KEYRING}:${legacyId}`,
+            value: legacySub.hwid.trim() ? legacySub.hwid : null,
+          }
+        );
+      }
+
+      const id = genId();
+      const sub = { ...newSubscription(trimmed, ""), id };
+      credentialUpdates.push({ key: `${URL_KEYRING}:${id}`, value: trimmed });
+      const next = [...existing, sub];
+      const nextPrimaryId = initial.primaryId ?? existing[0]?.id ?? id;
+      if (existing.length === 0) {
+        credentialUpdates.push({ key: URL_KEYRING, value: trimmed });
+      }
+
+      const previousIndex = localStorage.getItem(SUBS_INDEX_KEY);
+      const previousPrimary = localStorage.getItem(PRIMARY_ID_KEY);
+      const previousCredentials = await replaceCredentialsTransactional(
+        credentialUpdates
+      );
+      try {
+        saveSubsIndexStrict(next.map((s) => s.id));
+        savePrimaryIdStrict(nextPrimaryId);
+      } catch (error) {
+        const rollbackErrors: unknown[] = [];
+        try {
+          await restoreCredentialValues(previousCredentials);
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+        try {
+          if (previousIndex === null) localStorage.removeItem(SUBS_INDEX_KEY);
+          else localStorage.setItem(SUBS_INDEX_KEY, previousIndex);
+          restorePrimaryIdStrict(previousPrimary);
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+        if (rollbackErrors.length > 0) {
+          throw new Error(
+            `${String(error)}; subscription add rollback failed: ${rollbackErrors
+              .map(String)
+              .join("; ")}`
+          );
+        }
+        throw error;
+      }
+
+      set({
+        subscriptions: next,
+        ...(initial.subscriptions.length === 0
+          ? {
+              primaryId: nextPrimaryId,
+              url: existing.length === 0 ? trimmed : initial.url,
+            }
+          : {}),
+      });
+      if (get().primaryId === id) await get().fetchSubscription();
+      else await get().fetchSubscriptionById(id);
+      return id;
+    });
+  },
+
+  async removeSubscription(id) {
+    return await runSubscriptionMutation(async () => {
+      requireCredentialMutationAllowed("remove a subscription");
+      const initial = get();
+      const sub = initial.subscriptions.find((s) => s.id === id);
+      if (!sub) return;
+      const wasPrimary = initial.primaryId === id;
+      const vpn = useVpnStore.getState();
+      if (!wasPrimary) requireVpnTransitionStable("remove a subscription");
+      if (wasPrimary && vpn.status !== "stopped") {
+        await vpn.disconnect();
+        requireVpnStopped("subscription removal");
+      }
+
+      const current = get();
+      if (!current.subscriptions.some((s) => s.id === id)) return;
+      const remaining = current.subscriptions.filter((s) => s.id !== id);
+      if (wasPrimary && remaining.length === 0) {
+        await deleteSubscriptionUnlocked();
+        return;
+      }
+
+      if (wasPrimary) {
+        const switched = await setPrimaryIdUnlocked(remaining[0].id);
+        if (!switched) {
+          throw new Error(
+            "backend rejected the replacement primary subscription"
+          );
+        }
+      }
+
+      // Irreversible/fallible cache cleanup precedes source-of-truth secrets.
+      await deleteEncryptedCache(id);
+      const deletedCredentials = await deleteCredentialKeysTransactional([
+        `${URL_KEYRING}:${id}`,
+        `${HWID_KEYRING}:${id}`,
+      ]);
+
+      const latestRemaining = get().subscriptions.filter((s) => s.id !== id);
+      try {
+        saveSubsIndexStrict(latestRemaining.map((s) => s.id));
+      } catch (error) {
+        try {
+          await restoreCredentialRecords(deletedCredentials);
+        } catch (rollbackError) {
+          throw new Error(
+            `${String(error)}; subscription removal rollback failed: ${String(
+              rollbackError
+            )}`
+          );
+        }
+        throw error;
+      }
+      set({ subscriptions: latestRemaining });
+      if (wasPrimary) {
+        const next = latestRemaining[0];
+        if (next.servers.length === 0) {
+          await get().fetchSubscriptionById(next.id);
+        }
+      }
+    });
+  },
+
+  async setPrimaryId(id) {
+    return await runSubscriptionMutation(() => setPrimaryIdUnlocked(id));
   },
 
   async ensurePrimaryRuntimeReady() {
@@ -1121,7 +1408,10 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
   // ─── Legacy API (sync'ится с primary subscription) ───────────────────
 
   setUrl: (url) => {
-    if (credentialMutationFence.isBlocked()) return;
+    if (
+      credentialMutationFence.isBlocked() ||
+      subscriptionSourceFence.isBlocked()
+    ) return;
     set({
       url,
       deviceHwid: "",
@@ -1162,16 +1452,19 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
         // Error is already surfaced by deleteEncryptedCache.
       });
       void pushPrimaryToRust(primaryId, url, [], null);
-      void keyringSet(`${URL_KEYRING}:${primaryId}`, url);
+      queueCredentialMutation(keyringSet(`${URL_KEYRING}:${primaryId}`, url));
     }
     // Чувствительные значения пишем в Windows Credential Manager.
     // localStorage больше НЕ используется как источник правды — оставляем
     // пустым, чтобы старые версии приложения не подсунули устаревший URL.
     saveToStorage(URL_KEY, "");
-    void keyringSet(URL_KEYRING, url);
+    queueCredentialMutation(keyringSet(URL_KEYRING, url));
   },
   setHwid: (hwid) => {
-    if (credentialMutationFence.isBlocked()) return;
+    if (
+      credentialMutationFence.isBlocked() ||
+      subscriptionSourceFence.isBlocked()
+    ) return;
     set({ hwid });
     // 0.3.0: sync с primary subscription тоже.
     const primaryId = get().primaryId;
@@ -1181,14 +1474,19 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
           s.id === primaryId ? { ...s, hwid } : s
         ),
       });
-      if (hwid.trim()) void keyringSet(`${HWID_KEYRING}:${primaryId}`, hwid);
-      else void keyringDelete(`${HWID_KEYRING}:${primaryId}`);
+      if (hwid.trim()) {
+        queueCredentialMutation(
+          keyringSet(`${HWID_KEYRING}:${primaryId}`, hwid)
+        );
+      } else {
+        queueCredentialMutation(keyringDelete(`${HWID_KEYRING}:${primaryId}`));
+      }
     }
     saveToStorage(HWID_KEY, "");
     if (hwid.trim()) {
-      void keyringSet(HWID_KEYRING, hwid);
+      queueCredentialMutation(keyringSet(HWID_KEYRING, hwid));
     } else {
-      void keyringDelete(HWID_KEYRING);
+      queueCredentialMutation(keyringDelete(HWID_KEYRING));
     }
   },
 
@@ -1203,6 +1501,7 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
   },
 
   async loadSecureCreds() {
+    return await runSubscriptionMutation(async () => {
     // Rotate the backend-issued epoch before reading any runtime/cache state.
     // Renderer reloads therefore cannot reuse sequence numbers or complete
     // delayed mutations from the previous WebView instance.
@@ -1290,10 +1589,12 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
         });
       }
       if (subs.length > 0) {
-        set({ subscriptions: subs, primaryId: subs[0].id });
+        const persistedPrimary = loadPrimaryId();
+        const primary = choosePersistedById(subs, persistedPrimary)!;
+        set({ subscriptions: subs, primaryId: primary.id });
         // Legacy fields синхронизируются с primary (для callsites,
         // которые ещё читают `url`/`hwid`/`meta`).
-        set({ url: subs[0].url, hwid: subs[0].hwid });
+        set({ url: primary.url, hwid: primary.hwid });
         scenarioASucceeded = true;
         // Index НЕ переписываем — даже если из 5 ids только 3
         // прочитались (2 транзиентно фейлят), на следующем запуске
@@ -1304,13 +1605,14 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
         // оставляем для retry на следующем запуске. Падаем в
         // Сценарий B ниже как fallback.
         console.warn(
-          `[subscription] все ${ids.length} ID вернули пустой keyring — индекс сохранён для retry, fallback на legacy URL_KEYRING`
+          `[subscription] все ${ids.length} ID вернули пустой keyring — индекс и primary сохранены для retry`
         );
       }
     }
-    if (!scenarioASucceeded && urlFromKeyring) {
+    if (!scenarioASucceeded && ids.length === 0 && urlFromKeyring) {
       // Сценарий B — миграция legacy single-sub в multi
-      // ИЛИ recovery после транзиентной ошибки Scenario A.
+      // только когда multi-index действительно отсутствует. Если indexed
+      // reads были временно пустыми, индекс нельзя заменять новым ID.
       const id = genId();
       const sub: Subscription = {
         id,
@@ -1327,23 +1629,20 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
       // 0.3.3 fix: keyring-write СНАЧАЛА (await), потом index. Если
       // keyring write упал — index не обновляется → нет phantom id
       // которые попадут в next-start scenario A с пустым keyring.
-      const ok = await keyringSet(`${URL_KEYRING}:${id}`, urlFromKeyring);
-      if (ok) {
-        if (hwidFromKeyring) {
-          await keyringSet(`${HWID_KEYRING}:${id}`, hwidFromKeyring);
-        }
-        set({ subscriptions: [sub], primaryId: id });
-        // Если Scenario A создал устаревший индекс с мертвыми ids —
-        // здесь его перезапишем валидным. Если index был пуст — тоже
-        // OK, пишем новый.
-        saveSubsIndex([id]);
-      } else {
-        // Keyring write упал — оставляем все state как есть, юзеру
-        // придётся ввести URL заново. Это лучше чем сломать индекс.
-        console.warn(
-          "[subscription] Scenario B keyring write failed — Welcome будет показан, юзер введёт URL вручную"
-        );
+      const previous = await replaceCredentialsTransactional([
+        { key: `${URL_KEYRING}:${id}`, value: urlFromKeyring },
+        {
+          key: `${HWID_KEYRING}:${id}`,
+          value: hwidFromKeyring || null,
+        },
+      ]);
+      try {
+        saveBootstrapIdentityStrict(id);
+      } catch (error) {
+        await restoreCredentialValues(previous);
+        throw error;
       }
+      set({ subscriptions: [sub], primaryId: id });
     }
 
     removeLegacyPlaintextCache();
@@ -1422,11 +1721,12 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
         });
       }
     }
+    });
   },
 
   async fetchSubscription() {
-    const { url, hwid } = get();
-    if (!url.trim()) return;
+    const initial = get();
+    if (!initial.url.trim() && initial.subscriptions.length === 0) return;
 
     // 0.3.0 auto-bootstrap: если subscriptions[] пуст, создаём primary
     // из текущего legacy URL ДО fetch'а. Иначе после fetch'а subscriptions[]
@@ -1436,6 +1736,10 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
     // - юзер запустил app до миграции (legacy single-sub)
     // - keyring пуст, но Rust state имеет cached servers
     if (get().subscriptions.length === 0) {
+      await runSubscriptionMutation(async () => {
+      if (get().subscriptions.length > 0) return;
+      const { url, hwid } = get();
+      if (!url.trim()) return;
       const bootstrapId = genId();
       const bootstrapSub: Subscription = {
         id: bootstrapId,
@@ -1455,21 +1759,21 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
       // обратный порядок: saveSubsIndex → keyringSet, что при тихом
       // failure'е keyring (наш wrapper глотает ошибки) приводил к
       // permanent data loss.
-      const urlOk = await keyringSet(`${URL_KEYRING}:${bootstrapId}`, url);
-      if (urlOk) {
-        if (hwid.trim()) {
-          await keyringSet(`${HWID_KEYRING}:${bootstrapId}`, hwid);
-        }
-        set({ subscriptions: [bootstrapSub], primaryId: bootstrapId });
-        saveSubsIndex([bootstrapId]);
-      } else {
-        // Keyring недоступен — ставим только in-memory state без
-        // index'а. На след. старте Welcome заново; индекс не сломан.
-        set({ subscriptions: [bootstrapSub], primaryId: bootstrapId });
-        console.warn(
-          "[subscription] bootstrap keyring write failed — index НЕ обновлён, данные не переживут restart"
-        );
+      const previous = await replaceCredentialsTransactional([
+        { key: `${URL_KEYRING}:${bootstrapId}`, value: url },
+        {
+          key: `${HWID_KEYRING}:${bootstrapId}`,
+          value: hwid.trim() ? hwid : null,
+        },
+      ]);
+      try {
+        saveBootstrapIdentityStrict(bootstrapId);
+      } catch (error) {
+        await restoreCredentialValues(previous);
+        throw error;
       }
+      set({ subscriptions: [bootstrapSub], primaryId: bootstrapId });
+      });
     }
 
     const primaryId = get().primaryId;
@@ -1477,6 +1781,7 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
   },
 
   async loadCached() {
+    return await runSubscriptionMutation(async () => {
     try {
       await ensureRuntimeEpoch();
       const servers = await invoke<ProxyEntry[]>("get_servers");
@@ -1503,12 +1808,20 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
               servers: [],
               pings: [],
             };
-            set({ subscriptions: [sub], primaryId: id });
-            saveSubsIndex([id]);
-            await keyringSet(`${URL_KEYRING}:${id}`, url);
-            if (sub.hwid.trim()) {
-              await keyringSet(`${HWID_KEYRING}:${id}`, sub.hwid);
+            const previous = await replaceCredentialsTransactional([
+              { key: `${URL_KEYRING}:${id}`, value: url },
+              {
+                key: `${HWID_KEYRING}:${id}`,
+                value: sub.hwid.trim() ? sub.hwid : null,
+              },
+            ]);
+            try {
+              saveBootstrapIdentityStrict(id);
+            } catch (error) {
+              await restoreCredentialValues(previous);
+              throw error;
             }
+            set({ subscriptions: [sub], primaryId: id });
             primaryId = id;
           } else {
             // URL пуст и subscriptions[] пуст — Rust state хранит orphan
@@ -1556,6 +1869,7 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
     } catch {
       // кеш пустой — не ошибка
     }
+    });
   },
 
   async pingAll() {
@@ -1570,83 +1884,7 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
   },
 
   async deleteSubscription() {
-    requireCredentialMutationAllowed("delete subscriptions");
-    // 0.2.4: полное удаление подписки. Если VPN активен — сначала
-    // тушим (без него выбранный сервер «висит» в ядре, но в UI его
-    // уже нет). После очистки экран должен вернуться к Welcome.
-    const vpn = useVpnStore.getState();
-    if (vpn.status !== "stopped") {
-      await vpn.disconnect();
-      requireVpnStopped("subscription deletion");
-    }
-
-    // Invalidate already queued credential writes before waiting for either
-    // mutex. New writes are rejected until tombstone + credential/cache/local
-    // finalization all complete.
-    const deletionFence = credentialMutationFence.beginExclusive();
-    try {
-      await primaryRuntimeMutex.runExclusive(async () => {
-        // Snapshot synchronously after acquiring the runtime mutex, before the
-        // first await. No setPrimary/runtime publish can overtake this block.
-        const runtimePrimaryId = get().primaryId;
-        const subscriptionsToDelete = [...get().subscriptions];
-
-        // Publish and await the empty generation before clearing credentials,
-        // cache, primaryId, or any other local state.
-        await publishRequiredTombstone(
-          runtimePrimaryId,
-          clearRustRuntimeUnlocked
-        );
-
-        // Wait for an already executing old write, then delete every key using
-        // raw calls. Queued old-generation writes are fenced out by the epoch.
-        await credentialMutationMutex.runExclusive(async () => {
-          await Promise.all([
-            keyringDeleteRaw(URL_KEYRING),
-            keyringDeleteRaw(HWID_KEYRING),
-            ...subscriptionsToDelete.flatMap((s) => [
-              keyringDeleteRaw(`${URL_KEYRING}:${s.id}`),
-              keyringDeleteRaw(`${HWID_KEYRING}:${s.id}`),
-            ]),
-          ]);
-        });
-        await Promise.all(
-          subscriptionsToDelete.map((s) => deleteEncryptedCache(s.id))
-        );
-
-        // 2. Чистим persisted selectedIndex, last-fetched timestamp и
-        //    multi-subscription index.
-        try {
-          localStorage.removeItem(LAST_FETCH_KEY);
-          localStorage.removeItem("kwikproxy-secure.selectedServerName.v1");
-          localStorage.removeItem(SUBS_INDEX_KEY);
-          localStorage.removeItem(SERVERS_CACHE_KEY);
-        } catch {
-          // приватный режим — игнорируем
-        }
-        // 3. Сбрасываем in-memory state (multi + legacy) и selectedIndex.
-        set({
-          subscriptions: [],
-          primaryId: null,
-          servers: [],
-          meta: null,
-          pings: [],
-          lastFetchedAt: null,
-          url: "",
-          hwid: "",
-          error: null,
-        });
-        useVpnStore.setState({ selectedIndex: null });
-      });
-    } finally {
-      credentialMutationFence.endExclusive(deletionFence);
-    }
-
-    showToast({
-      kind: "success",
-      title: i18n.t("toast.subscriptionDeleted.title"),
-      message: i18n.t("toast.subscriptionDeleted.message"),
-      durationMs: 4000,
-    });
+    return await runSubscriptionMutation(deleteSubscriptionUnlocked);
   },
-}));
+  });
+});

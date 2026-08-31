@@ -480,8 +480,8 @@ export const useVpnStore = create<VpnState>((set, get) => ({
               const afterConnect = useSubscriptionStore.getState();
               if (!connectionAttempts.isCurrent(attempt)) {
                 const cleanup = await cleanupBackendConnection();
-                backendCleaned = cleanup.stopped;
-                if (!cleanup.stopped) {
+                backendCleaned = cleanup.stopped && cleanup.cleanupSucceeded;
+                if (!backendCleaned) {
                   throw new BackendCleanupFailure(
                     "cancelled connection cleanup failed",
                     cleanup.error,
@@ -503,8 +503,8 @@ export const useVpnStore = create<VpnState>((set, get) => ({
                   "vpnStore.connectError.selectionChanged"
                 );
                 const cleanup = await cleanupBackendConnection();
-                backendCleaned = cleanup.stopped;
-                if (!cleanup.stopped) {
+                backendCleaned = cleanup.stopped && cleanup.cleanupSucceeded;
+                if (!backendCleaned) {
                   throw new BackendCleanupFailure(
                     selectionError,
                     cleanup.error,
@@ -563,7 +563,7 @@ export const useVpnStore = create<VpnState>((set, get) => ({
               const cleanup = await connectionLifecycle.runExclusive(
                 cleanupBackendConnection
               );
-              if (!cleanup.stopped) {
+              if (!cleanup.stopped || !cleanup.cleanupSucceeded) {
                 console.warn(
                   "[vpn] cancelled connect cleanup left backend running:",
                   cleanup.error
@@ -617,7 +617,7 @@ export const useVpnStore = create<VpnState>((set, get) => ({
       const cleanup = await connectionLifecycle.runExclusive(
         cleanupBackendConnection
       );
-      if (!cleanup.stopped) {
+      if (!cleanup.stopped || !cleanup.cleanupSucceeded) {
         throw new BackendCleanupFailure(
           "VPN disconnect failed",
           cleanup.error,
