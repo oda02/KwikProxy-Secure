@@ -91,6 +91,7 @@ fn uninstall_cannot_succeed_with_protected_payload_left_behind() {
 #[test]
 fn install_failure_rollback_preserves_registered_recovery_path() {
     let postinstall = macro_body("NSIS_HOOK_POSTINSTALL");
+    assert!(postinstall.contains("stage=helper-provision outcome=failed"));
     assert!(postinstall.contains("uninstall-for-installer"));
     assert!(postinstall.contains("KWIK_SECURE_DELETE_HELPER_BOUNDED"));
     assert!(postinstall.contains("KWIK_SECURE_RECOVER_UNPROVISIONED_INSTALL"));

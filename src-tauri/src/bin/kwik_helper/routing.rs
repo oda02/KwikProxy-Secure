@@ -1,60 +1,24 @@
 //! Управление маршрутизацией Windows напрямую через Win32 IP Helper API.
 //!
 //! После перехода на mihomo built-in TUN внешний tun2socks-путь выпилен,
-//! поэтому здесь осталась только подчистка наших маршрутов и orphan
-//! WinTUN-адаптеров (9.E / cleanup на старте helper-сервиса):
+//! поэтому здесь осталась только подчистка наших маршрутов:
 //! - `GetIpForwardTable2` + `DeleteIpForwardEntry2` — удаление half-default
 //!   routes, оставшихся после краша предыдущей сессии (по destination+nexthop);
-//! - `ConvertInterfaceIndexToLuid` — резолв LUID интерфейса;
-//! - PowerShell `Remove-NetAdapter` — снос orphan WinTUN-адаптера по имени.
+//! - `ConvertInterfaceIndexToLuid` — резолв LUID интерфейса.
+//!
+//! Orphan WinTUN detection lives in `tun`; a present owned orphan fails
+//! closed until a verified native Wintun deletion backend is available.
 
-use std::ffi::c_void;
 use std::mem;
 use std::net::Ipv4Addr;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::process::Stdio;
-use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use tokio::process::Command as AsyncCommand;
-use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, HANDLE, NO_ERROR};
+use anyhow::{bail, Result};
+use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     DeleteIpForwardEntry2, FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN, SOCKADDR_INET};
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
-
-use super::security;
-
-struct CleanupJob(OwnedHandle);
-
-fn create_cleanup_job() -> Result<CleanupJob> {
-    let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-    if handle.is_null() {
-        bail!("CreateJobObjectW(cleanup) failed");
-    }
-    // SAFETY: CreateJobObjectW returned a fresh owned job HANDLE.
-    let job = CleanupJob(unsafe { OwnedHandle::from_raw_handle(handle) });
-    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { mem::zeroed() };
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if unsafe {
-        SetInformationJobObject(
-            job.0.as_raw_handle() as HANDLE,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const c_void,
-            mem::size_of_val(&info) as u32,
-        )
-    } == 0
-    {
-        bail!("SetInformationJobObject(cleanup) failed");
-    }
-    Ok(job)
-}
 
 // ── Утилиты ────────────────────────────────────────────────────────────────
 
@@ -154,68 +118,4 @@ pub async fn delete_route_with_nexthop(destination: &str, mask: &str, nexthop: &
     })
     .await??;
     Ok(())
-}
-
-// ── Cleanup orphan WinTUN-адаптера ─────────────────────────────────────────
-
-/// Удалить orphaned WinTUN-адаптер с указанным именем, если он остался от
-/// предыдущего запуска (например, после kill -9). Без cleanup-а новая
-/// попытка `Creating adapter` зависает на 15 секунд: WinTUN видит
-/// существующий адаптер с тем же именем и не может создать новый.
-///
-/// Реализация — через PowerShell: `Get-NetAdapter | Remove-NetAdapter`.
-/// Не падает если адаптера нет (SilentlyContinue). Удаляет ТОЛЬКО адаптер
-/// с указанным именем — чужие TUN-адаптеры (Happ, Outline, etc.) не трогаем.
-pub async fn cleanup_orphan_tun(name: &str) -> Result<()> {
-    // Защита от инъекции: имя адаптера должно быть только из ASCII-букв/цифр/
-    // дефисов/подчёркиваний/звёздочки (для product-owned wildcard).
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '*')
-    {
-        bail!("недопустимое имя TUN-адаптера: {name:?}");
-    }
-    let script = format!(
-        "Get-NetAdapter -Name '{name}' -ErrorAction SilentlyContinue | Remove-NetAdapter -Confirm:$false -ErrorAction SilentlyContinue"
-    );
-    let windows_dir = security::known_windows_directory()?;
-    let powershell = security::known_system_directory()?
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe");
-    if !powershell.is_file() {
-        bail!("trusted system PowerShell executable is missing");
-    }
-    let job = create_cleanup_job()?;
-    let mut child = AsyncCommand::new(&powershell)
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .env_clear()
-        .env("SystemRoot", &windows_dir)
-        .env("WINDIR", &windows_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .context("powershell для cleanup_orphan_tun не запустился")?;
-    let process = child
-        .raw_handle()
-        .ok_or_else(|| anyhow::anyhow!("cleanup PowerShell has no process handle"))?
-        as HANDLE;
-    if unsafe { AssignProcessToJobObject(job.0.as_raw_handle() as HANDLE, process) } == 0 {
-        let _ = child.start_kill();
-        bail!("AssignProcessToJobObject(cleanup) failed");
-    }
-
-    // Жёсткий потолок: PowerShell cold-start ~2с + Remove-NetAdapter
-    // обычно <1с. Если процесс «тонет» (драйвер залип, антивирус блокирует) —
-    // убиваем чтобы не блокировать helper-startup на пол-минуты.
-    match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => bail!("cleanup_orphan_tun PowerShell exited with {status}"),
-        Ok(Err(error)) => Err(error).context("wait for cleanup_orphan_tun PowerShell"),
-        Err(_) => {
-            let _ = child.start_kill();
-            bail!("cleanup_orphan_tun timed out after 5 seconds")
-        }
-    }
 }

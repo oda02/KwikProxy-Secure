@@ -212,8 +212,6 @@ fn wide_z_to_string(buf: &[u16]) -> String {
 /// does not publish its pipe unless command success and all-status absence
 /// verification both succeed.
 pub async fn cleanup_orphan_resources() -> Result<()> {
-    let wildcard = format!("{TUN_NAME_PREFIX}*");
-    routing::cleanup_orphan_tun(&wildcard).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
         let still_present = tokio::task::spawn_blocking(owned_prefix_exists)
@@ -223,7 +221,14 @@ pub async fn cleanup_orphan_resources() -> Result<()> {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("owned TUN adapter remains after prefix cleanup");
+            return cleanup_if_present(
+                || Ok(true),
+                || {
+                    bail!(
+                        "owned TUN adapter with the reserved prefix remains after bounded self-removal wait; safe Wintun orphan deletion is unavailable"
+                    )
+                },
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -240,7 +245,9 @@ pub async fn cleanup_owned_device(name: &str) -> Result<()> {
     {
         bail!("invalid exact owned TUN device identity");
     }
-    routing::cleanup_orphan_tun(name).await?;
+    // Mihomo/Wintun normally removes its adapter asynchronously while the
+    // child is exiting. Give that ownership-safe path a short bounded window
+    // before deciding that a real orphan remains.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
         let alias = name.to_string();
@@ -251,9 +258,31 @@ pub async fn cleanup_owned_device(name: &str) -> Result<()> {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("exact owned TUN adapter still exists after cleanup");
+            return cleanup_if_present(
+                || Ok(true),
+                || {
+                    bail!(
+                    "exact owned TUN adapter still exists after bounded self-removal wait; safe Wintun orphan deletion is unavailable"
+                )
+                },
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Centralized fail-closed policy for an optional orphan-removal backend.
+/// Keeping the presence decision explicit makes it impossible to launch a
+/// cleanup command on the common clean/absent path.
+fn cleanup_if_present<P, F>(presence_check: P, backend: F) -> Result<()>
+where
+    P: FnOnce() -> Result<bool>,
+    F: FnOnce() -> Result<()>,
+{
+    if presence_check()? {
+        backend()
+    } else {
+        Ok(())
     }
 }
 
@@ -295,6 +324,7 @@ fn owned_prefix_exists() -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn wide_z_to_string_handles_null_terminator() {
@@ -345,5 +375,46 @@ mod tests {
             }
         );
         assert!(verify_candidate_identity(&candidate, 0x9999).is_err());
+    }
+
+    #[test]
+    fn absent_owned_adapter_never_launches_cleanup_backend() {
+        let launched = Cell::new(false);
+        let predicate_called = Cell::new(false);
+        let result = cleanup_if_present(
+            || {
+                predicate_called.set(true);
+                Ok(false)
+            },
+            || {
+                launched.set(true);
+                bail!("backend must not run")
+            },
+        );
+        assert!(result.is_ok());
+        assert!(predicate_called.get());
+        assert!(!launched.get());
+    }
+
+    #[test]
+    fn present_owned_adapter_fails_explicitly_without_safe_backend() {
+        let launched = Cell::new(false);
+        let predicate_called = Cell::new(false);
+        let result = cleanup_if_present(
+            || {
+                predicate_called.set(true);
+                Ok(true)
+            },
+            || {
+                launched.set(true);
+                bail!("safe Wintun orphan deletion is unavailable")
+            },
+        );
+        assert!(predicate_called.get());
+        assert!(launched.get());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("safe Wintun orphan deletion is unavailable"));
     }
 }

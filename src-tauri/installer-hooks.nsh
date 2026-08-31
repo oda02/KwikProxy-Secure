@@ -157,6 +157,8 @@
   Pop $2
   DetailPrint "$2"
   ${If} $0 != 0
+    ; Bounded, non-sensitive stage marker for visible/silent installer logs.
+    DetailPrint "stage=helper-provision outcome=failed exit=$0"
     ; Best-effort rollback uses the same canonical helper and bounded SCM path.
     ; The rollback result is checked and reported; nothing is silently ignored.
     nsExec::ExecToLog '"${KWIK_SECURE_HELPER}" uninstall-for-installer'
@@ -173,9 +175,9 @@
       ${EndIf}
     ${EndIf}
     ${If} $1 != 0
-      MessageBox MB_ICONSTOP "Helper provisioning failed (exit $0), and rollback also failed (exit $1). Do not use this installation; inspect the service in an isolated test VM."
+      MessageBox MB_ICONSTOP "Helper provisioning failed at stage helper-provision (exit $0), and rollback also failed (exit $1). Do not use this installation; inspect the service in an isolated test VM."
     ${Else}
-      MessageBox MB_ICONSTOP "Helper provisioning failed safely (exit $0). No SYSTEM service or exact helper remains; the registered uninstaller was retained to remove remaining files and any protected recovery metadata."
+      MessageBox MB_ICONSTOP "Helper provisioning failed safely at stage helper-provision (exit $0). No SYSTEM service or exact helper remains; the registered uninstaller was retained to remove remaining files and any protected recovery metadata."
     ${EndIf}
     SetErrorLevel 2
     Abort
