@@ -1,4 +1,6 @@
 const HOOKS: &str = include_str!("../installer-hooks.nsh");
+const SECURITY: &str = include_str!("../src/bin/kwik_helper/security.rs");
+const SERVICE: &str = include_str!("../src/bin/kwik_helper/service.rs");
 
 fn macro_body(name: &str) -> &'static str {
     let start_marker = format!("!macro {name}");
@@ -17,9 +19,11 @@ fn clean_install_guard_still_rejects_existing_protected_state() {
     let preinstall = macro_body("NSIS_HOOK_PREINSTALL");
     assert!(preinstall.contains("${FileExists} \"${KWIK_SECURE_HELPER}\""));
     assert!(preinstall.contains("${FileExists} \"$INSTDIR\\*.*\""));
-    assert!(preinstall.contains("SYSTEM\\CurrentControlSet\\Services\\${KWIK_SECURE_SERVICE}"));
+    assert!(preinstall.contains("$SYSDIR\\sc.exe\" query ${KWIK_SECURE_SERVICE}"));
+    assert!(preinstall.contains("$0 != 1060"));
+    assert!(preinstall.contains("RegOpenKeyExW"));
+    assert!(preinstall.contains("0x20119"));
     assert!(preinstall.contains("SOFTWARE\\KwikProxySecure"));
-    assert!(preinstall.contains("ManifestV1"));
 }
 
 #[test]
@@ -37,13 +41,16 @@ fn uninstall_checks_app_before_mutating_privileged_state() {
     assert!(app_check < helper_call);
     assert!(helper_call < manifest_delete);
     assert!(preuninstall.contains("KWIK_SECURE_DELETE_HELPER_BOUNDED"));
+    assert!(preuninstall.contains("RegOpenKeyExW"));
+    assert!(preuninstall.contains("SetErrorLevel 2"));
 }
 
 #[test]
-fn uninstall_cannot_succeed_with_protected_install_root_left_behind() {
+fn uninstall_cannot_succeed_with_protected_payload_left_behind() {
     let postuninstall = macro_body("NSIS_HOOK_POSTUNINSTALL");
     assert!(postuninstall.contains("GetFileAttributesW"));
     assert!(postuninstall.contains("$INSTDIR"));
+    assert!(postuninstall.contains("${FileExists} \"$INSTDIR\\*.*\""));
     assert!(postuninstall.contains("SetErrorLevel 2"));
     assert!(postuninstall.contains("Abort"));
 
@@ -52,4 +59,50 @@ fn uninstall_cannot_succeed_with_protected_install_root_left_behind() {
     assert!(bounded_delete.contains("${FileExists} \"${KWIK_SECURE_HELPER}\""));
     assert!(!bounded_delete.contains("/REBOOTOK"));
     assert!(!bounded_delete.contains("RMDir /r"));
+}
+
+#[test]
+fn install_failure_rollback_preserves_registered_recovery_path() {
+    let postinstall = macro_body("NSIS_HOOK_POSTINSTALL");
+    assert!(postinstall.contains("uninstall-for-installer"));
+    assert!(postinstall.contains("KWIK_SECURE_DELETE_HELPER_BOUNDED"));
+    assert!(postinstall.contains("KWIK_SECURE_RECOVER_UNPROVISIONED_INSTALL"));
+    assert!(!postinstall.contains("DeleteRegKey HKLM \"SOFTWARE\\KwikProxySecure\""));
+    assert!(!postinstall.contains("\"${KWIK_SECURE_HELPER}\" uninstall'"));
+
+    let pre_provision_recovery = macro_body("KWIK_SECURE_RECOVER_UNPROVISIONED_INSTALL");
+    assert!(pre_provision_recovery.contains("$SYSDIR\\sc.exe\" query"));
+    assert!(pre_provision_recovery.contains("$5 == 1060"));
+    assert!(pre_provision_recovery.contains("RegOpenKeyExW"));
+    assert!(pre_provision_recovery.contains("0x20119"));
+    assert!(pre_provision_recovery.contains("$6 == 2"));
+    assert!(pre_provision_recovery.contains("$6 == 3"));
+    assert!(pre_provision_recovery.contains("KWIK_SECURE_DELETE_HELPER_BOUNDED"));
+    assert!(!pre_provision_recovery.contains("DeleteRegKey"));
+}
+
+#[test]
+fn deletion_boundary_is_loaded_before_scm_mutation_and_never_canonicalizes_product_root() {
+    let uninstall = SERVICE
+        .split("fn uninstall_impl")
+        .nth(1)
+        .expect("missing uninstall implementation");
+    let identity = uninstall
+        .find("UninstallIdentity::load")
+        .expect("missing retry-safe uninstall identity");
+    let scm = uninstall
+        .find("ServiceManager::local_computer")
+        .expect("missing SCM mutation path");
+    assert!(identity < scm);
+
+    let loader = SECURITY
+        .split("impl UninstallIdentity")
+        .nth(1)
+        .expect("missing uninstall identity implementation")
+        .split("impl Installation")
+        .next()
+        .unwrap();
+    assert!(loader.contains("open_directory_no_reparse(&install_dir"));
+    assert!(loader.contains("final_path_by_handle"));
+    assert!(!loader.contains("canonical_dir"));
 }

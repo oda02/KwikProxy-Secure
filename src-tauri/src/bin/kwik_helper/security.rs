@@ -118,6 +118,67 @@ pub struct Installation {
     pub runtime_dir: PathBuf,
 }
 
+/// Minimal, retry-safe deletion boundary for the NSIS uninstaller. Unlike a
+/// runtime `Installation`, this identity deliberately does not require any
+/// payload file or digest to remain intact: a previous partial prune must be
+/// safely retryable.
+pub struct UninstallIdentity {
+    owner_sid: String,
+    install_dir: PathBuf,
+    install_handle: OwnedHandle,
+}
+
+impl UninstallIdentity {
+    pub fn load() -> Result<Self> {
+        let program_files = known_program_files()?;
+        let program_files_handle = open_directory_no_reparse(&program_files, false)
+            .context("open literal Program Files deletion boundary")?;
+        let actual_program_files = final_path_by_handle(program_files_handle.0)?;
+        if !same_path(&actual_program_files, &program_files) {
+            bail!("Program Files deletion boundary resolves to a different path");
+        }
+
+        // Open the literal product name with OPEN_REPARSE_POINT before any
+        // canonicalization. A product-root junction is rejected, never
+        // followed to obtain a seemingly valid target.
+        let install_dir = program_files.join("KwikProxy Secure");
+        let install_handle = open_directory_no_reparse(&install_dir, false)
+            .context("open literal protected install root")?;
+        let actual_install = final_path_by_handle(install_handle.0)?;
+        if !same_path(&actual_install, &install_dir) {
+            bail!("protected install root resolves away from its literal fixed path");
+        }
+
+        let owner_sid = runtime_acl_owner_sid(install_handle.0)
+            .context("derive owner from exact protected install-root ACL")?;
+        verify_runtime_acl(install_handle.0, &owner_sid)
+            .context("verify retry-safe protected install-root ACL")?;
+        validate_optional_manifest_identity(&owner_sid, &install_dir)?;
+
+        Ok(Self {
+            owner_sid,
+            install_dir,
+            install_handle,
+        })
+    }
+
+    pub fn verify_running_helper(&self, helper_filename: &str) -> Result<()> {
+        let current = std::env::current_exe().context("resolve running helper image")?;
+        let expected = self.install_dir.join(helper_filename);
+        if !same_path(&current, &expected) {
+            bail!(
+                "installer cleanup helper must be the fixed protected image {}",
+                expected.display()
+            );
+        }
+        let metadata = std::fs::symlink_metadata(&current)?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            bail!("installer cleanup helper is not a plain file");
+        }
+        Ok(())
+    }
+}
+
 impl Installation {
     /// Load the installer-owned manifest. Missing or inconsistent metadata is
     /// a hard error: starting a permissive helper is never a fallback.
@@ -1112,6 +1173,107 @@ fn verify_runtime_acl(handle: HANDLE, owner_sid: &str) -> Result<()> {
     Ok(())
 }
 
+fn runtime_acl_owner_sid(handle: HANDLE) -> Result<String> {
+    let mut dacl = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 || descriptor.is_null() || dacl.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor) };
+        }
+        bail!("read protected install-root DACL failed: {status}");
+    }
+    let result = (|| -> Result<String> {
+        let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                &mut info as *mut _ as *mut c_void,
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+            || info.AceCount < 3
+        {
+            bail!("protected install-root DACL has no owner ACE");
+        }
+        let mut raw_ace = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, 2, &mut raw_ace) } == 0 || raw_ace.is_null() {
+            bail!("read protected install-root owner ACE failed");
+        }
+        let ace = unsafe { &*(raw_ace as *const ACCESS_ALLOWED_ACE) };
+        // ACCESS_ALLOWED_ACE_TYPE is defined by WinNT as zero. Avoid enabling
+        // the broad SystemServices feature solely for this layout tag.
+        if ace.Header.AceType != 0 || ace.Header.AceSize < size_of::<ACCESS_ALLOWED_ACE>() as u16 {
+            bail!("protected install-root owner ACE has an unexpected layout");
+        }
+        let sid = &ace.SidStart as *const u32 as *mut c_void;
+        let value = sid_to_string(sid)?;
+        validate_sid_text(&value)?;
+        Ok(value)
+    })();
+    unsafe { LocalFree(descriptor) };
+    result
+}
+
+fn sid_to_string(sid: *mut c_void) -> Result<String> {
+    let mut sid_text = std::ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(sid, &mut sid_text) } == 0 || sid_text.is_null() {
+        bail!("ConvertSidToStringSidW failed");
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *sid_text.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let value = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_text, len) });
+    unsafe { LocalFree(sid_text as *mut c_void) };
+    Ok(value)
+}
+
+fn validate_optional_manifest_identity(owner_sid: &str, install_dir: &Path) -> Result<()> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let key = match hklm.open_subkey_with_flags(MANIFEST_KEY, KEY_READ) {
+        Ok(key) => key,
+        Err(_) => return Ok(()),
+    };
+    // A missing/corrupt legacy manifest is repairable because the literal
+    // no-follow root and its exact protected ACL are authoritative. If the
+    // registry key is still usable, require it to agree rather than trusting
+    // its paths as a deletion boundary.
+    if verify_registry_acl(key.raw_handle() as HANDLE, owner_sid).is_err() {
+        return Ok(());
+    }
+    let raw_a = key.get_value::<String, _>(MANIFEST_VALUE);
+    let raw_b = key.get_value::<String, _>(MANIFEST_VALUE);
+    match (raw_a, raw_b) {
+        (Ok(a), Ok(b)) if a != b => bail!("helper manifest changed during uninstall identity load"),
+        (Ok(a), Ok(_)) => {
+            if let Ok(manifest) = serde_json::from_str::<ManifestV1>(&a) {
+                if manifest.owner_sid != owner_sid
+                    || !same_path(Path::new(&manifest.install_dir), install_dir)
+                {
+                    bail!("protected manifest disagrees with fixed uninstall identity");
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Compare every ACE, including order, type, inheritance flags, access mask
 /// and SID. This rejects inherited, deny, additional, or weakened entries
 /// rather than merely checking that a non-NULL protected DACL exists.
@@ -1340,19 +1502,16 @@ fn keep_for_nsis_uninstaller(name: &OsStr) -> bool {
 /// Every other entry, including legacy filenames from older packages, is
 /// removed with the same bounded no-follow walker used for ProgramData. A
 /// reparse point is unlinked as a name and is never traversed.
-pub fn cleanup_install_tree_for_uninstaller(installation: &Installation) -> Result<()> {
-    validate_sid_text(&installation.owner_sid)?;
-    let program_files = canonical_dir(known_program_files()?)?;
-    let expected_install = canonical_dir(program_files.join("KwikProxy Secure"))?;
-    if !same_path(&expected_install, &installation.install_dir) {
-        bail!("refusing installer cleanup outside the fixed Program Files root");
+pub fn cleanup_install_tree_for_uninstaller(identity: &UninstallIdentity) -> Result<()> {
+    validate_sid_text(&identity.owner_sid)?;
+    let actual_install = final_path_by_handle(identity.install_handle.0)?;
+    if !same_path(&actual_install, &identity.install_dir) {
+        bail!("protected install root identity changed during cleanup");
     }
-
-    let install_guard = open_directory_no_reparse(&installation.install_dir, false)?;
-    verify_runtime_acl(install_guard.0, &installation.owner_sid)
+    verify_runtime_acl(identity.install_handle.0, &identity.owner_sid)
         .context("verify protected install root before uninstall cleanup")?;
 
-    let entries = std::fs::read_dir(&installation.install_dir)?
+    let entries = std::fs::read_dir(&identity.install_dir)?
         .take(258)
         .collect::<std::io::Result<Vec<_>>>()?;
     if entries.len() > 256 {
@@ -1367,7 +1526,7 @@ pub fn cleanup_install_tree_for_uninstaller(installation: &Installation) -> Resu
     }
 
     // Fail closed unless only the two explicitly handed-off NSIS names remain.
-    for entry in std::fs::read_dir(&installation.install_dir)? {
+    for entry in std::fs::read_dir(&identity.install_dir)? {
         let entry = entry?;
         if !keep_for_nsis_uninstaller(&entry.file_name()) {
             bail!(
@@ -1376,7 +1535,6 @@ pub fn cleanup_install_tree_for_uninstaller(installation: &Installation) -> Resu
             );
         }
     }
-    drop(install_guard);
     Ok(())
 }
 
@@ -1868,5 +2026,26 @@ mod tests {
         ] {
             assert!(!keep_for_nsis_uninstaller(OsStr::new(stale)));
         }
+    }
+
+    #[test]
+    fn partial_prune_model_is_retryable_without_deleted_payload_metadata() {
+        let mut remaining = vec![
+            "vpn-client.exe",
+            "resources",
+            "mihomo.exe",
+            "kwik-helper-x86_64-pc-windows-msvc.exe",
+            "uninstall.exe",
+        ];
+        // Model a transient failure after an arbitrary prefix was removed.
+        remaining.remove(0);
+        remaining.remove(0);
+        // Retry classification depends only on the fixed handoff names, not
+        // on hashes/files deleted by the first attempt.
+        remaining.retain(|name| keep_for_nsis_uninstaller(OsStr::new(name)));
+        assert_eq!(
+            remaining,
+            ["kwik-helper-x86_64-pc-windows-msvc.exe", "uninstall.exe"]
+        );
     }
 }

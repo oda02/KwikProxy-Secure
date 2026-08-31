@@ -14,6 +14,8 @@
 !define KWIK_SECURE_HELPER "$INSTDIR\kwik-helper-x86_64-pc-windows-msvc.exe"
 
 !macro KWIK_SECURE_REQUIRE_FIXED_INSTALL_ROOT
+  ; The reviewed helper is a native x64 binary and owns the 64-bit HKLM view.
+  SetRegView 64
   ${If} "$INSTDIR" != "${KWIK_SECURE_INSTALL_ROOT}"
     MessageBox MB_ICONSTOP "KwikProxy Secure must be installed at ${KWIK_SECURE_INSTALL_ROOT}. Custom install paths are disabled because the SYSTEM helper trusts this protected location."
     Abort
@@ -42,6 +44,27 @@
   ${Loop}
 !macroend
 
+; If helper provisioning failed before it could protect the root/write the
+; manifest, the strict installer-only cleanup identity intentionally does not
+; exist. Recovery is still safe after independently proving that neither SCM
+; nor the 64-bit manifest key contains privileged state: delete only the exact
+; helper name and retain the registered uninstaller for stock file cleanup.
+!macro KWIK_SECURE_RECOVER_UNPROVISIONED_INSTALL RESULT
+  StrCpy ${RESULT} 1
+  nsExec::ExecToStack '"$SYSDIR\sc.exe" query ${KWIK_SECURE_SERVICE}'
+  Pop $5
+  Pop $9
+  ${If} $5 == 1060
+    System::Call 'advapi32::RegOpenKeyExW(p 0x80000002, w "SOFTWARE\KwikProxySecure", i 0, i 0x20119, *p .r7) i.r6'
+    ${If} $6 == 2
+    ${OrIf} $6 == 3
+      !insertmacro KWIK_SECURE_DELETE_HELPER_BOUNDED ${RESULT}
+    ${ElseIf} $6 == 0
+      System::Call 'advapi32::RegCloseKey(p r7) i.r8'
+    ${EndIf}
+  ${EndIf}
+!macroend
+
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro KWIK_SECURE_REQUIRE_FIXED_INSTALL_ROOT
 
@@ -61,17 +84,31 @@
     Abort
   ${EndIf}
 
-  ClearErrors
-  ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Services\${KWIK_SECURE_SERVICE}" "ImagePath"
-  ${IfNot} ${Errors}
+  ; Query SCM itself so a corrupt service key with a missing ImagePath cannot
+  ; be mistaken for absence. Only ERROR_SERVICE_DOES_NOT_EXIST (1060) is the
+  ; clean-install case; access/query failures abort fail-closed.
+  nsExec::ExecToStack '"$SYSDIR\sc.exe" query ${KWIK_SECURE_SERVICE}'
+  Pop $0
+  Pop $2
+  ${If} $0 == 0
     MessageBox MB_ICONSTOP "A KwikProxy Secure SYSTEM service already exists. In-place upgrade/repair is disabled, so installation is aborted without changing it."
     Abort
   ${EndIf}
+  ${If} $0 != 1060
+    MessageBox MB_ICONSTOP "The installer could not prove that the KwikProxy Secure SYSTEM service is absent (SCM query exit $0). Installation is aborted without changing machine state."
+    Abort
+  ${EndIf}
 
-  ClearErrors
-  ReadRegStr $0 HKLM "SOFTWARE\KwikProxySecure" "ManifestV1"
-  ${IfNot} ${Errors}
+  ; Detect the HKLM key independent of ManifestV1 value type/readability.
+  System::Call 'advapi32::RegOpenKeyExW(p 0x80000002, w "SOFTWARE\KwikProxySecure", i 0, i 0x20119, *p .r1) i.r0'
+  ${If} $0 == 0
+    System::Call 'advapi32::RegCloseKey(p r1) i.r2'
     MessageBox MB_ICONSTOP "A KwikProxy Secure machine manifest already exists. In-place upgrade/repair is disabled; uninstall the prior installation explicitly first."
+    Abort
+  ${EndIf}
+  ${If} $0 != 2
+  ${AndIf} $0 != 3
+    MessageBox MB_ICONSTOP "The installer could not prove that the KwikProxy Secure machine manifest key is absent (registry query error $0). Installation is aborted."
     Abort
   ${EndIf}
 !macroend
@@ -87,14 +124,25 @@
   ${If} $0 != 0
     ; Best-effort rollback uses the same canonical helper and bounded SCM path.
     ; The rollback result is checked and reported; nothing is silently ignored.
-    nsExec::ExecToLog '"${KWIK_SECURE_HELPER}" uninstall'
+    nsExec::ExecToLog '"${KWIK_SECURE_HELPER}" uninstall-for-installer'
     Pop $1
-    DeleteRegKey HKLM "SOFTWARE\KwikProxySecure"
+    ${If} $1 == 0
+      !insertmacro KWIK_SECURE_DELETE_HELPER_BOUNDED $4
+      ${If} $4 != 0
+        StrCpy $1 $4
+      ${EndIf}
+    ${Else}
+      !insertmacro KWIK_SECURE_RECOVER_UNPROVISIONED_INSTALL $4
+      ${If} $4 == 0
+        StrCpy $1 0
+      ${EndIf}
+    ${EndIf}
     ${If} $1 != 0
       MessageBox MB_ICONSTOP "Helper provisioning failed (exit $0), and rollback also failed (exit $1). Do not use this installation; inspect the service in an isolated test VM."
     ${Else}
-      MessageBox MB_ICONSTOP "Helper provisioning failed safely (exit $0). The partial service registration was removed."
+      MessageBox MB_ICONSTOP "Helper provisioning failed safely (exit $0). No SYSTEM service or exact helper remains; the registered uninstaller was retained to remove remaining files and any protected recovery metadata."
     ${EndIf}
+    SetErrorLevel 2
     Abort
   ${EndIf}
 
@@ -102,14 +150,25 @@
   nsExec::ExecToLog '"$SYSDIR\sc.exe" sdset ${KWIK_SECURE_SERVICE} "D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)"'
   Pop $0
   ${If} $0 != 0
-    nsExec::ExecToLog '"${KWIK_SECURE_HELPER}" uninstall'
+    nsExec::ExecToLog '"${KWIK_SECURE_HELPER}" uninstall-for-installer'
     Pop $1
-    DeleteRegKey HKLM "SOFTWARE\KwikProxySecure"
+    ${If} $1 == 0
+      !insertmacro KWIK_SECURE_DELETE_HELPER_BOUNDED $4
+      ${If} $4 != 0
+        StrCpy $1 $4
+      ${EndIf}
+    ${Else}
+      !insertmacro KWIK_SECURE_RECOVER_UNPROVISIONED_INSTALL $4
+      ${If} $4 == 0
+        StrCpy $1 0
+      ${EndIf}
+    ${EndIf}
     ${If} $1 != 0
       MessageBox MB_ICONSTOP "Service ACL protection failed (exit $0), and rollback also failed (exit $1). Do not use this installation; inspect the service in an isolated test VM."
     ${Else}
-      MessageBox MB_ICONSTOP "Service ACL protection failed safely (exit $0). The service was removed."
+      MessageBox MB_ICONSTOP "Service ACL protection failed safely (exit $0). No SYSTEM service or exact helper remains; the registered uninstaller was retained to remove remaining files and any protected recovery metadata."
     ${EndIf}
+    SetErrorLevel 2
     Abort
   ${EndIf}
 !macroend
@@ -143,15 +202,34 @@
       Abort
     ${EndIf}
   ${Else}
-    ClearErrors
-    ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Services\${KWIK_SECURE_SERVICE}" "ImagePath"
-    ${IfNot} ${Errors}
+    nsExec::ExecToStack '"$SYSDIR\sc.exe" query ${KWIK_SECURE_SERVICE}'
+    Pop $0
+    Pop $2
+    ${If} $0 == 0
       MessageBox MB_ICONSTOP "The KwikProxy Secure SYSTEM service still exists, but its protected helper binary is missing. Uninstall is aborted before deleting any remaining privileged files."
+      SetErrorLevel 2
+      Abort
+    ${EndIf}
+    ${If} $0 != 1060
+      MessageBox MB_ICONSTOP "Uninstall could not prove that the KwikProxy Secure SYSTEM service is absent (SCM query exit $0). No remaining protected files were deleted."
       SetErrorLevel 2
       Abort
     ${EndIf}
   ${EndIf}
   DeleteRegKey HKLM "SOFTWARE\KwikProxySecure"
+  System::Call 'advapi32::RegOpenKeyExW(p 0x80000002, w "SOFTWARE\KwikProxySecure", i 0, i 0x20119, *p .r1) i.r0'
+  ${If} $0 == 0
+    System::Call 'advapi32::RegCloseKey(p r1) i.r2'
+    MessageBox MB_ICONSTOP "The protected machine manifest could not be removed. Uninstall is aborted before the stock file/registration cleanup so the failure can be retried safely."
+    SetErrorLevel 2
+    Abort
+  ${EndIf}
+  ${If} $0 != 2
+  ${AndIf} $0 != 3
+    MessageBox MB_ICONSTOP "Uninstall could not verify machine-manifest removal (registry query error $0). Stock file/registration cleanup is aborted fail-closed."
+    SetErrorLevel 2
+    Abort
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
@@ -159,8 +237,25 @@
   ; template has now deleted uninstall.exe and attempted to remove $INSTDIR.
   ; Do not let an unchecked Delete/RMDir report success with a protected root
   ; (or any canonical payload) still present.
-  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR") i.r3'
-  ${If} $3 != -1
+  ; Retry removal of an empty exact root after stock NSIS cleanup. If an empty
+  ; directory remains harmlessly locked, it is safe for the next SetOutPath;
+  ; only remaining entries are an uninstall failure.
+  StrCpy $3 0
+  ${Do}
+    RMDir "$INSTDIR"
+    System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR") i.r4'
+    ${If} $4 == -1
+      ${ExitDo}
+    ${EndIf}
+    IntOp $3 $3 + 1
+    ${If} $3 >= 20
+      ${ExitDo}
+    ${EndIf}
+    Sleep 100
+  ${Loop}
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR") i.r4'
+  ${If} $4 != -1
+  ${AndIf} ${FileExists} "$INSTDIR\*.*"
     MessageBox MB_ICONSTOP "KwikProxy Secure uninstall is incomplete because its protected installation directory still exists. Do not reinstall yet; retry uninstall with administrator rights."
     SetErrorLevel 2
     Abort

@@ -471,7 +471,18 @@ pub fn uninstall_for_installer() -> Result<()> {
 }
 
 fn uninstall_impl(prune_install_tree: bool) -> Result<()> {
-    validate_helper_location()?;
+    // Establish the fixed no-follow deletion boundary before mutating SCM.
+    // It intentionally survives missing payload files or a corrupt manifest,
+    // so a partially completed prior prune remains safely retryable.
+    let uninstall_identity = if prune_install_tree {
+        let identity = security::UninstallIdentity::load()
+            .context("validate installer cleanup identity before service removal")?;
+        identity.verify_running_helper(HELPER_FILENAME)?;
+        Some(identity)
+    } else {
+        validate_helper_location()?;
+        None
+    };
     // Load before service removal while the protected manifest still exists.
     // A damaged/missing manifest must not prevent repair/uninstall of SCM state.
     let installation = security::Installation::load().ok();
@@ -497,11 +508,12 @@ fn uninstall_impl(prune_install_tree: bool) -> Result<()> {
         }
     }
     if prune_install_tree {
-        let installation = installation.as_ref().context(
-            "installer cleanup requires the exact protected manifest; service was removed but Program Files payload was left fail-closed",
-        )?;
-        security::cleanup_install_tree_for_uninstaller(installation)
-            .context("prune protected Program Files payload for NSIS handoff")?;
+        security::cleanup_install_tree_for_uninstaller(
+            uninstall_identity
+                .as_ref()
+                .context("installer cleanup identity missing")?,
+        )
+        .context("prune protected Program Files payload for NSIS handoff")?;
     }
     println!("сервис «{SERVICE_NAME}» удалён");
     Ok(())
