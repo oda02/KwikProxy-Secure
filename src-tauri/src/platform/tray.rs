@@ -129,7 +129,14 @@ fn toggle_main_window(app: &AppHandle) {
 pub fn quit_app(app: &AppHandle) {
     let mihomo = app.state::<MihomoState>();
     let _ = mihomo.stop();
-    let _ = platform::proxy::clear_system_proxy();
+    if let Some(attempt_id) = mihomo.proxy_attempt_id() {
+        if matches!(
+            platform::proxy::clear_system_proxy_owned(&attempt_id),
+            Ok(true)
+        ) {
+            mihomo.clear_proxy_attempt(&attempt_id);
+        }
+    }
     // Helper-сервис не трогаем — он остаётся жить, ждёт следующего запуска
     // приложения (так быстрее first-connect, не нужно UAC заново).
     //

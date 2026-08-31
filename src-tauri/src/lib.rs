@@ -85,19 +85,9 @@ pub fn run() {
                 acquire_outcome,
                 platform::session_lock::AcquireOutcome::PreviousSessionCrashed
             ) {
-                // Если регистрация системного прокси указывает на наш
-                // диапазон портов — это однозначно наш orphan от
-                // упавшего connect'а, чистим без лишних вопросов.
-                if platform::proxy::is_proxy_pointing_to_us() {
-                    if let Err(e) = platform::proxy::force_clear_system_proxy() {
-                        eprintln!("[startup self-healing] force clear proxy: {e:#}");
-                    } else {
-                        eprintln!("[startup self-healing] orphan системный прокси очищен");
-                    }
-                }
-                // Backup от прошлой сессии не трогаем: фронт на старте
+                // Backup от прошлой сессии не трогаем: frontend на старте
                 // зовёт `get_recovery_state` и показывает CrashRecoveryDialog
-                // — пользователь сам решит restore/discard.
+                // — пользователь сам решит exact-token restore/discard.
             }
 
             let hwid = load_or_create().unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());

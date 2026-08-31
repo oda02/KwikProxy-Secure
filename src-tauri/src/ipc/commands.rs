@@ -304,30 +304,51 @@ async fn rollback_connect(
 ) -> Result<(), String> {
     vpn::diagnostics::record("connect_rollback", "started", "post_spawn_failure");
     let mut errors = Vec::new();
+    let mut privileged_cleanup_verified = !cleanup_helper;
     // Each stop is ownership-scoped: the local state owns only our sidecar,
     // and helper MihomoStop is authenticated/session-bound. No foreign VPN
     // process, adapter or proxy executable is selected by name.
     if cleanup_helper {
+        privileged_cleanup_verified = true;
         if let Err(error) = platform::helper_client::mihomo_stop().await {
             errors.push(format!("stop protected Mihomo: {error:#}"));
+            privileged_cleanup_verified = false;
         }
         if let Err(error) = platform::helper_client::kill_switch_disable().await {
             errors.push(format!("disable kill switch: {error:#}"));
+            privileged_cleanup_verified = false;
         }
     }
     if cleanup_helper && expect_tunnel {
         match platform::helper_client::tunnel_status().await {
             Ok(false) => {}
-            Ok(true) => errors.push("protected Mihomo is still running after rollback".into()),
-            Err(error) => errors.push(format!("verify protected Mihomo stopped: {error:#}")),
+            Ok(true) => {
+                errors.push("protected Mihomo is still running after rollback".into());
+                privileged_cleanup_verified = false;
+            }
+            Err(error) => {
+                errors.push(format!("verify protected Mihomo stopped: {error:#}"));
+                privileged_cleanup_verified = false;
+            }
         }
     }
+    if !privileged_cleanup_verified {
+        // Preserve every visible ownership marker and the local engine/proxy.
+        // A retrying disconnect can reconcile the authenticated helper later;
+        // reporting stopped here would strand SYSTEM Mihomo or WFP silently.
+        mihomo.mark_helper_spawned(true);
+        mihomo.mark_privileged_cleanup_uncertain(true);
+        vpn::diagnostics::record("connect_rollback", "error", "privileged_state_unknown");
+        return Err(errors.join("; "));
+    }
+    mihomo.mark_privileged_cleanup_uncertain(false);
     mihomo.mark_helper_spawned(false);
     if let Err(error) = mihomo.stop() {
         errors.push(format!("stop local Mihomo: {error}"));
     }
     match platform::proxy::clear_system_proxy_owned(proxy_attempt_id) {
-        Ok(_) => mihomo.clear_proxy_attempt(proxy_attempt_id),
+        Ok(true) => mihomo.clear_proxy_attempt(proxy_attempt_id),
+        Ok(false) => errors.push("attempt-owned system proxy publication was not found".into()),
         Err(error) => errors.push(format!("restore attempt-owned system proxy: {error:#}")),
     }
     mihomo_api.clear();
@@ -438,7 +459,7 @@ pub async fn connect(
     // или есть half-default routes), молча чистим перед connect. Иначе
     // следующий xray встретит «сломанную» среду и сам сломается.
     if platform::proxy::is_proxy_pointing_to_us() {
-        platform::proxy::clear_system_proxy()
+        platform::proxy::restore_pending_owned_proxy()
             .map_err(|error| format!("restore previous proxy publication: {error:#}"))?;
         stamp("preflight: restored orphan proxy backup");
     }
@@ -881,34 +902,64 @@ pub async fn connect(
 /// Отключиться: остановить TUN (если был активен), Xray, сбросить системный
 /// прокси, выключить kill switch (если был активен).
 ///
-/// Все операции выполняются независимо: ошибка одной не отменяет других.
-/// `tun_stop` и `kill_switch_disable` идемпотентны — игнорируют
-/// «не запущен» / «helper недоступен». Это важно: при отключении мы
-/// должны гарантировать что интернет вернётся, даже если helper исчез.
+/// Privileged cleanup is reconciled and verified before local ownership
+/// markers are cleared. If helper status is unknown, the command fails while
+/// retaining visible state so a later disconnect can retry safely.
 #[tauri::command]
 pub async fn disconnect(
     mihomo: State<'_, MihomoState>,
     mihomo_api: State<'_, vpn::MihomoApiState>,
     ks_ctx: State<'_, KillSwitchState>,
 ) -> Result<(), String> {
-    // 1. built-in TUN — гасим helper-spawned mihomo. Идемпотентно.
-    let _ = platform::helper_client::mihomo_stop().await;
+    let helper_owned = mihomo.helper_spawned();
+    let firewall_owned = ks_ctx.0.lock().await.is_some();
+    let reconcile_privileged =
+        helper_owned || firewall_owned || mihomo.privileged_cleanup_uncertain();
+    if reconcile_privileged {
+        let mut errors = Vec::new();
+        if let Err(error) = platform::helper_client::mihomo_stop().await {
+            errors.push(format!("stop protected Mihomo: {error:#}"));
+        }
+        if let Err(error) = platform::helper_client::kill_switch_disable().await {
+            errors.push(format!("disable kill switch: {error:#}"));
+        }
+        if helper_owned {
+            match platform::helper_client::tunnel_status().await {
+                Ok(false) => {}
+                Ok(true) => errors.push("protected Mihomo is still running".into()),
+                Err(error) => errors.push(format!("verify protected Mihomo stopped: {error:#}")),
+            }
+        }
+        if !errors.is_empty() {
+            mihomo.mark_helper_spawned(true);
+            mihomo.mark_privileged_cleanup_uncertain(true);
+            vpn::diagnostics::record("disconnect", "error", "privileged_state_unknown");
+            return Err(format!(
+                "privileged disconnect incomplete; state remains active: {}",
+                errors.join("; ")
+            ));
+        }
+    }
+
     mihomo.mark_helper_spawned(false);
-    // 2. Kill switch — всегда вызываем, чтобы убрать остатки если
-    //    включён был в прошлый сеанс (на случай если краш / повторный
-    //    запуск). Helper тихо вернёт ok если он не был enabled.
-    let _ = platform::helper_client::kill_switch_disable().await;
-    // Очищаем контекст live-toggle — VPN больше не активен.
+    mihomo.mark_privileged_cleanup_uncertain(false);
     *ks_ctx.0.lock().await = None;
-    // 8.F: чистим mihomo controller endpoint — UI больше не должен
-    // ходить в API мёртвого процесса.
     mihomo_api.clear();
 
     // 3. Движок Mihomo (если не запущен — stop() no-op) + system proxy.
     let mihomo_err = mihomo.stop().err();
-    let proxy_err = platform::proxy::clear_system_proxy()
-        .err()
-        .map(|e| e.to_string());
+    let proxy_err = if let Some(attempt_id) = mihomo.proxy_attempt_id() {
+        match platform::proxy::clear_system_proxy_owned(&attempt_id) {
+            Ok(true) => {
+                mihomo.clear_proxy_attempt(&attempt_id);
+                None
+            }
+            Ok(false) => Some("attempt-owned system proxy publication was not found".into()),
+            Err(error) => Some(error.to_string()),
+        }
+    } else {
+        None
+    };
 
     if let Some(e) = mihomo_err {
         return Err(e);
@@ -929,15 +980,39 @@ pub async fn is_xray_running(
     mihomo: State<'_, MihomoState>,
     mihomo_api: State<'_, vpn::MihomoApiState>,
 ) -> bool {
-    if !mihomo.helper_spawned() {
-        return mihomo.is_running();
+    if !mihomo.helper_spawned() && mihomo.is_running() {
+        // A tracked user-side sidecar needs no privileged round trip.
+        return true;
     }
     match platform::helper_client::tunnel_status().await {
-        Ok(true) => true,
-        Ok(false) | Err(_) => {
+        Ok(true) => {
+            // Also adopts a protected child left by a previous UI process:
+            // in-memory ownership markers do not survive a UI crash/restart.
+            mihomo.mark_helper_spawned(true);
+            vpn::diagnostics::record("tun_child", "ok", "running_reconciled");
+            true
+        }
+        Ok(false) if mihomo.privileged_cleanup_uncertain() => {
+            vpn::diagnostics::record("privileged_state", "error", "cleanup_unverified");
+            true
+        }
+        Ok(false) => {
             mihomo.mark_helper_spawned(false);
             mihomo_api.clear();
             vpn::diagnostics::record("tun_child", "error", "not_running");
+            false
+        }
+        Err(_) if mihomo.helper_spawned() || mihomo.privileged_cleanup_uncertain() => {
+            // Transport failure is unknown, never proof that tracked
+            // privileged state stopped.
+            mihomo.mark_privileged_cleanup_uncertain(true);
+            vpn::diagnostics::record("tun_child", "error", "status_unknown");
+            true
+        }
+        Err(_) => {
+            // No local process and no ownership evidence. Helper
+            // unavailability alone must not make every fresh launch look
+            // connected.
             false
         }
     }
@@ -1022,8 +1097,8 @@ pub async fn recover_network() -> RecoveryReport {
             .push("helper-сервис недоступен: пропустили WFP/TUN cleanup".to_string());
     }
 
-    match platform::proxy::force_clear_system_proxy() {
-        Ok(()) => report.system_proxy_cleared = true,
+    match platform::proxy::restore_pending_owned_proxy() {
+        Ok(restored) => report.system_proxy_cleared = restored,
         Err(e) => report.errors.push(format!("system proxy: {e}")),
     }
 
@@ -1058,6 +1133,45 @@ pub struct RecoveryState {
     pub proxy_backup_present: bool,
     pub tun_orphan: bool,
     pub orphan_wfp_filters: bool,
+}
+
+fn sanitized_proxy_recovery_metadata(backup: &platform::proxy::ProxyBackup) -> serde_json::Value {
+    serde_json::json!({
+        "schema": 1,
+        "has_attempt_token": backup.attempt_id.as_deref().is_some_and(|v| !v.is_empty()),
+        "has_exact_publication": backup.published_proxy_server.as_deref().is_some_and(|v| !v.is_empty()),
+        "has_exact_bypass": backup.published_proxy_override.as_deref().is_some_and(|v| !v.is_empty()),
+        "original_proxy_enabled": backup.proxy_enable == Some(1),
+        "original_proxy_server_present": backup.proxy_server.is_some(),
+        "original_proxy_override_present": backup.proxy_override.is_some(),
+    })
+}
+
+#[cfg(test)]
+mod diagnostics_privacy_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_recovery_export_contains_no_raw_registry_values() {
+        let backup = platform::proxy::ProxyBackup {
+            attempt_id: Some("secret-attempt-token".into()),
+            published_proxy_server: Some("http=user:password@127.0.0.1:30000".into()),
+            published_proxy_override: Some("internal.corp;<local>".into()),
+            proxy_enable: Some(1),
+            proxy_server: Some("http=internal-proxy.corp:8080".into()),
+            proxy_override: Some("secret.internal".into()),
+        };
+        let json = sanitized_proxy_recovery_metadata(&backup).to_string();
+        for secret in [
+            "secret-attempt-token",
+            "password",
+            "internal.corp",
+            "internal-proxy.corp",
+            "secret.internal",
+        ] {
+            assert!(!json.contains(secret));
+        }
+    }
 }
 
 #[tauri::command]
@@ -1263,7 +1377,15 @@ pub fn hide_floating_window(app: tauri::AppHandle) -> Result<(), String> {
 /// в режиме proxy). Удаляет backup-файл после успеха.
 #[tauri::command]
 pub fn restore_proxy_backup() -> Result<(), String> {
-    platform::proxy::restore_from_backup().map_err(|e| e.to_string())
+    platform::proxy::restore_pending_owned_proxy()
+        .and_then(|restored| {
+            if restored {
+                Ok(())
+            } else {
+                anyhow::bail!("owned proxy publication was not restored")
+            }
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Отбросить backup без применения (пользователь в диалоге выбрал
@@ -1446,7 +1568,8 @@ async fn resolve_ipv4(host: &str, port: u16) -> Option<std::net::Ipv4Addr> {
 /// - `connection-lifecycle.log` — bounded credential-free app/helper stages;
 /// - `competing-vpns.txt` — список найденных параллельных VPN-клиентов;
 /// - `recovery-state.json` — текущее состояние orphan-ресурсов;
-/// - `proxy-backup.json` — сохранённый backup системного прокси (если есть).
+/// - `proxy-recovery-metadata.json` — только безопасные признаки наличия
+///   attempt-owned backup, без исходных proxy/bypass значений и token.
 ///
 /// Сохраняется в `%USERPROFILE%\Documents\kwikproxy-secure-diagnostics-<timestamp>.zip`.
 /// Возвращает абсолютный путь — UI показывает в toast с кнопкой
@@ -1532,10 +1655,12 @@ pub async fn export_diagnostics() -> Result<String, String> {
         let _ = zip.write_all(json.as_bytes());
     }
 
-    // 5. proxy_backup.json — если есть
+    // 5. Proxy recovery metadata only. Original proxy/bypass strings can
+    // contain internal hosts or credential-like material and are omitted.
     if let Some(backup) = platform::proxy::read_backup() {
-        if let Ok(json) = serde_json::to_string_pretty(&backup) {
-            let _ = zip.start_file("proxy-backup.json", opts);
+        let safe = sanitized_proxy_recovery_metadata(&backup);
+        if let Ok(json) = serde_json::to_string_pretty(&safe) {
+            let _ = zip.start_file("proxy-recovery-metadata.json", opts);
             let _ = zip.write_all(json.as_bytes());
         }
     }

@@ -53,6 +53,10 @@ pub struct MihomoState {
     /// 13.L: mihomo запущен helper'ом (built-in TUN). Set/cleared в
     /// connect/disconnect, влияет только на `is_running()`.
     helper_spawned: AtomicBool,
+    /// A failed helper round-trip means SYSTEM Mihomo or WFP state may still
+    /// exist. Keep the lifecycle visibly active until a later authenticated
+    /// reconciliation proves both resources stopped.
+    privileged_cleanup_uncertain: AtomicBool,
 }
 
 impl MihomoState {
@@ -64,6 +68,7 @@ impl MihomoState {
             subscription_proxy_port: Mutex::new(None),
             proxy_attempt_id: Mutex::new(None),
             helper_spawned: AtomicBool::new(false),
+            privileged_cleanup_uncertain: AtomicBool::new(false),
         }
     }
 
@@ -76,6 +81,15 @@ impl MihomoState {
 
     pub fn helper_spawned(&self) -> bool {
         self.helper_spawned.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_privileged_cleanup_uncertain(&self, on: bool) {
+        self.privileged_cleanup_uncertain
+            .store(on, Ordering::SeqCst);
+    }
+
+    pub fn privileged_cleanup_uncertain(&self) -> bool {
+        self.privileged_cleanup_uncertain.load(Ordering::SeqCst)
     }
 
     pub fn set_subscription_proxy_port(&self, port: Option<u16>) {
@@ -225,9 +239,13 @@ impl MihomoState {
                             if let Some(attempt_id) =
                                 proxy_attempt.as_mut().and_then(|attempt| attempt.take())
                             {
-                                if crate::platform::proxy::clear_system_proxy_owned(&attempt_id)
-                                    .is_err()
-                                {
+                                if !matches!(
+                                    crate::platform::proxy::clear_system_proxy_owned(&attempt_id),
+                                    Ok(true)
+                                ) {
+                                    if let Some(current) = proxy_attempt.as_mut() {
+                                        **current = Some(attempt_id);
+                                    }
                                     super::diagnostics::record(
                                         "system_proxy",
                                         "error",
@@ -273,7 +291,13 @@ impl MihomoState {
                 super::diagnostics::record("proxy_monitor", "error", "event_stream_lost");
                 if let Some(attempt_id) = proxy_attempt.as_mut().and_then(|attempt| attempt.take())
                 {
-                    if crate::platform::proxy::clear_system_proxy_owned(&attempt_id).is_err() {
+                    if !matches!(
+                        crate::platform::proxy::clear_system_proxy_owned(&attempt_id),
+                        Ok(true)
+                    ) {
+                        if let Some(current) = proxy_attempt.as_mut() {
+                            **current = Some(attempt_id);
+                        }
                         super::diagnostics::record(
                             "system_proxy",
                             "error",
@@ -317,6 +341,13 @@ impl MihomoState {
                 *current = None;
             }
         }
+    }
+
+    pub fn proxy_attempt_id(&self) -> Option<String> {
+        self.proxy_attempt_id
+            .lock()
+            .ok()
+            .and_then(|current| current.clone())
     }
 
     /// Остановить Mihomo. Если не запущен — no-op.
@@ -417,6 +448,18 @@ mod readiness_tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         assert!(!loopback_listener_ready(port).await);
+    }
+
+    #[test]
+    fn uncertain_privileged_cleanup_remains_visible() {
+        let state = MihomoState::new();
+        state.mark_helper_spawned(true);
+        state.mark_privileged_cleanup_uncertain(true);
+        assert!(state.is_running());
+        assert!(state.privileged_cleanup_uncertain());
+        state.mark_privileged_cleanup_uncertain(false);
+        state.mark_helper_spawned(false);
+        assert!(!state.is_running());
     }
 
     fn temporary_log() -> (std::path::PathBuf, Arc<Mutex<File>>) {

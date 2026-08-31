@@ -89,32 +89,35 @@ pub fn get_default_route_interface_name() -> Option<String> {
 /// Алгоритм:
 /// 1. Находим physic-default ifIndex (наименьшая metric, NextHop ≠ 0,
 ///    PrefixLength = 0) — это «штатный» Wi-Fi/Ethernet шлюз.
-/// 2. Перебираем все default- и half-default-маршруты (PrefixLength
-///    ∈ {0, 1}).
-/// 3. Конфликтом считаем маршрут, у которого:
-///    - NextHop ≠ 198.18.0.1 (не наш TUN-gateway);
-///    - including on-link defaults when a distinct physical default route
-///      proves that the route belongs to another interface;
-///    - ifIndex ≠ physic-default ifIndex.
+/// 2. Перебираем half-default маршруты `/1`.
+/// 3. Конфликтом считается только полная complementary pair
+///    `0.0.0.0/1` + `128.0.0.0/1` с одинаковыми interface и explicit
+///    gateway. Одиночный `/0` другого uplink — нормальная multihoming,
+///    а on-link route вообще не является ownership evidence.
 /// 4. Резолвим alias интерфейса и возвращаем уникальные имена.
 ///
 /// Возвращает пустой вектор если конфликтов нет / на не-Windows.
 #[cfg(windows)]
-fn is_foreign_default_route(
+fn foreign_half_route_bit(
     prefix_len: u8,
+    destination: u32,
     next_hop: u32,
     interface_index: u32,
     physical_interface: Option<u32>,
     kwik_tun_gateway: u32,
-) -> bool {
-    if prefix_len > 1 || next_hop == kwik_tun_gateway || Some(interface_index) == physical_interface
+) -> Option<u8> {
+    if prefix_len != 1
+        || next_hop == 0
+        || next_hop == kwik_tun_gateway
+        || Some(interface_index) == physical_interface
     {
-        return false;
+        return None;
     }
-    // An on-link /0 or /1 is not ownership evidence: Hyper-V, cellular,
-    // policy routes and ordinary point-to-point uplinks can all create one.
-    // Only a route with an explicit non-product gateway is actionable here.
-    next_hop != 0
+    match destination {
+        0 => Some(0b01),
+        0x0000_0080 => Some(0b10),
+        _ => None,
+    }
 }
 
 #[cfg(windows)]
@@ -163,28 +166,41 @@ pub fn detect_routing_conflicts() -> Vec<String> {
             }
         }
 
-        // Шаг 2: ищем подозрительные default + half-default.
-        let mut conflict_ifs: HashSet<u32> = HashSet::new();
+        // Шаг 2: only a complementary /1 pair on the same interface and
+        // gateway is strong enough evidence. Generic multiple /0 routes are
+        // ordinary Wi-Fi/Ethernet multihoming and remain fail-open.
+        let mut half_pairs: std::collections::HashMap<(u32, u32), u8> =
+            std::collections::HashMap::new();
         for e in entries {
-            // half-default = /1 c destination 0.0.0.0 или 128.0.0.0 (типовой VPN-приём).
             let prefix_len = e.DestinationPrefix.PrefixLength;
+            let destination: &SOCKADDR_INET = &e.DestinationPrefix.Prefix;
+            if destination.si_family != AF_INET {
+                continue;
+            }
+            let destination_v4: &SOCKADDR_IN = mem::transmute(destination);
+            let destination_addr = destination_v4.sin_addr.S_un.S_addr;
             let nh: &SOCKADDR_INET = &e.NextHop;
             if nh.si_family != AF_INET {
                 continue;
             }
             let nh_v4: &SOCKADDR_IN = mem::transmute(nh);
             let nh_addr = nh_v4.sin_addr.S_un.S_addr;
-            if !is_foreign_default_route(
+            let Some(bit) = foreign_half_route_bit(
                 prefix_len,
+                destination_addr,
                 nh_addr,
                 e.InterfaceIndex,
                 physic_if_idx,
                 KWIK_TUN_GATEWAY,
-            ) {
+            ) else {
                 continue;
-            }
-            conflict_ifs.insert(e.InterfaceIndex);
+            };
+            *half_pairs.entry((e.InterfaceIndex, nh_addr)).or_default() |= bit;
         }
+        let conflict_ifs: HashSet<u32> = half_pairs
+            .into_iter()
+            .filter_map(|((interface, _gateway), bits)| (bits == 0b11).then_some(interface))
+            .collect();
         FreeMibTable(fwd_ptr as *mut _);
 
         // Шаг 3: резолвим aliases + фильтруем известные P2P / mesh-VPN
@@ -247,39 +263,44 @@ pub fn detect_routing_conflicts() -> Vec<String> {
 
 #[cfg(all(test, windows))]
 mod conflict_tests {
-    use super::is_foreign_default_route;
+    use super::foreign_half_route_bit;
 
     const KWIK_GATEWAY: u32 = 0x0100_12C6;
 
     #[test]
     fn on_link_defaults_are_advisory_not_hard_conflicts() {
-        assert!(!is_foreign_default_route(0, 0, 27, Some(14), KWIK_GATEWAY));
-        assert!(!is_foreign_default_route(1, 0, 27, Some(14), KWIK_GATEWAY));
-        assert!(!is_foreign_default_route(0, 0, 14, Some(14), KWIK_GATEWAY));
+        assert_eq!(
+            foreign_half_route_bit(0, 0, 0, 27, Some(14), KWIK_GATEWAY),
+            None
+        );
+        assert_eq!(
+            foreign_half_route_bit(1, 0, 0, 27, Some(14), KWIK_GATEWAY),
+            None
+        );
     }
 
     #[test]
-    fn explicit_foreign_gateway_on_distinct_interface_is_a_conflict() {
-        assert!(is_foreign_default_route(
-            0,
-            0x0101_A8C0,
-            27,
-            Some(14),
-            KWIK_GATEWAY,
-        ));
+    fn dual_physical_defaults_are_not_vpn_evidence() {
+        assert_eq!(
+            foreign_half_route_bit(0, 0, 0x0101_A8C0, 27, Some(14), KWIK_GATEWAY,),
+            None
+        );
+    }
+
+    #[test]
+    fn complementary_explicit_gateway_half_routes_form_strong_evidence() {
+        let left = foreign_half_route_bit(1, 0, 0x0101_A8C0, 27, Some(14), KWIK_GATEWAY).unwrap();
+        let right = foreign_half_route_bit(1, 0x0000_0080, 0x0101_A8C0, 27, Some(14), KWIK_GATEWAY)
+            .unwrap();
+        assert_eq!(left | right, 0b11);
     }
 
     #[test]
     fn product_gateway_and_non_default_routes_are_not_conflicts() {
-        assert!(!is_foreign_default_route(
-            0,
-            KWIK_GATEWAY,
-            27,
-            Some(14),
-            KWIK_GATEWAY,
-        ));
-        assert!(!is_foreign_default_route(2, 0, 27, Some(14), KWIK_GATEWAY));
-        assert!(!is_foreign_default_route(0, 0, 27, None, KWIK_GATEWAY));
+        assert_eq!(
+            foreign_half_route_bit(1, 0, KWIK_GATEWAY, 27, Some(14), KWIK_GATEWAY,),
+            None
+        );
     }
 }
 
