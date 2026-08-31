@@ -1,6 +1,7 @@
 //! VPN-логика: управление Mihomo sidecar, поиск свободных портов, пинги.
 
 pub mod connection_ping;
+pub(crate) mod diagnostics;
 pub mod leak_test;
 mod mihomo;
 pub mod mihomo_api;

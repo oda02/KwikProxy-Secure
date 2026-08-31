@@ -7,11 +7,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Version 13 intentionally breaks compatibility with the upstream helper:
+/// Version 14 adds authenticated runtime-status and safe diagnostic queries
+/// to the hardened version 13 protocol:
 /// a new pipe identity, authenticated clients, no client-supplied paths and
 /// no remote self-shutdown command. Client and helper require an exact version
 /// match; upgrades are performed only by the per-machine installer.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -89,6 +90,13 @@ pub enum Request {
     /// Не destructive: только читает существование sublayer'а с
     /// нашим GUID.
     WfpQueryOrphan,
+    /// Read a bounded, credential-free tail from the protected helper
+    /// lifecycle log. The pipe authentication boundary is required even
+    /// though this operation is read-only.
+    ReadDiagnostics,
+    /// Read-only liveness for the helper-owned Mihomo child. This lets the UI
+    /// discard stale local state after an unexpected engine exit.
+    TunnelStatus,
     /// Start the fixed, installer-owned Mihomo binary. The unprivileged UI
     /// supplies configuration bytes, never filesystem/executable paths.
     StartTunnel {
@@ -119,6 +127,12 @@ pub enum Response {
     WfpOrphan {
         has_orphan: bool,
     },
+    Diagnostics {
+        text: String,
+    },
+    TunnelStatus {
+        running: bool,
+    },
     /// Ошибка с описанием.
     Error {
         message: String,
@@ -133,7 +147,7 @@ impl Response {
     }
 }
 
-pub const PIPE_NAME: &str = r"\\.\pipe\KwikProxySecure.Helper.v13";
+pub const PIPE_NAME: &str = r"\\.\pipe\KwikProxySecure.Helper.v14";
 pub const SERVICE_NAME: &str = "KwikProxySecureHelper";
 pub const SERVICE_DISPLAY_NAME: &str = "KwikProxy Secure Helper";
 pub const SERVICE_DESCRIPTION: &str = "Protected TUN and kill-switch broker for KwikProxy Secure.";
@@ -168,6 +182,25 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, Request::WfpQueryOrphan));
+    }
+
+    #[test]
+    fn diagnostics_request_contains_no_path() {
+        let json = serde_json::to_string(&Request::ReadDiagnostics).unwrap();
+        assert_eq!(json, r#"{"cmd":"read_diagnostics"}"#);
+        assert!(!json.contains("path"));
+    }
+
+    #[test]
+    fn tunnel_status_wire_shape_is_path_free() {
+        assert_eq!(
+            serde_json::to_string(&Request::TunnelStatus).unwrap(),
+            r#"{"cmd":"tunnel_status"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::TunnelStatus { running: false }).unwrap(),
+            r#"{"result":"tunnel_status","running":false}"#
+        );
     }
 
     #[test]

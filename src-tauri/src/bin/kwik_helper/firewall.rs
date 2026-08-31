@@ -170,12 +170,12 @@ fn enable_blocking(
     force_disable_ipv6: bool,
 ) -> Result<()> {
     hlog(&format!(
-        "[wfp-killswitch] ON: server_ips={:?}, allow_lan={}, apps={}, block_dns={}, dns_allow={:?}, tun_if={:?}, strict={}, force_disable_ipv6={}",
-        server_ips,
+        "[wfp-killswitch] ON: server_ip_count={}, allow_lan={}, apps={}, block_dns={}, dns_allow_count={}, tun_if={:?}, strict={}, force_disable_ipv6={}",
+        server_ips.len(),
         allow_lan,
         allow_app_paths.len(),
         block_dns,
-        allow_dns_ips,
+        allow_dns_ips.len(),
         tun_interface_index,
         strict_mode,
         force_disable_ipv6,

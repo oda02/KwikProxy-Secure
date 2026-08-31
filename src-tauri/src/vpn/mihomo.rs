@@ -17,10 +17,16 @@ use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
+use tokio::net::TcpStream;
+
+const READINESS_TIMEOUT: Duration = Duration::from_secs(8);
+const READINESS_POLL: Duration = Duration::from_millis(100);
+const READINESS_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Глобальный state Mihomo sidecar.
 ///
@@ -64,6 +70,10 @@ impl MihomoState {
         self.helper_spawned.store(on, Ordering::SeqCst);
     }
 
+    pub fn helper_spawned(&self) -> bool {
+        self.helper_spawned.load(Ordering::SeqCst)
+    }
+
     pub fn set_subscription_proxy_port(&self, port: Option<u16>) {
         if let Ok(mut current) = self.subscription_proxy_port.lock() {
             *current = port.filter(|value| (30_000..60_000).contains(value));
@@ -74,20 +84,25 @@ impl MihomoState {
         if !self.is_running() {
             return None;
         }
-        self.subscription_proxy_port.lock().ok().and_then(|port| *port)
+        self.subscription_proxy_port
+            .lock()
+            .ok()
+            .and_then(|port| *port)
     }
 
     /// Запустить Mihomo с указанным YAML-конфигом.
     ///
     /// Если уже запущен — останавливает перед перезапуском. Конфиг
     /// сохраняется в `%TEMP%\KwikProxy Secure\mihomo-config.yaml`.
-    pub fn start_with_config(
+    pub async fn start_with_config(
         &self,
         app: &AppHandle,
         config_yaml: &str,
         mixed_port: u16,
+        controller_port: u16,
     ) -> Result<(), String> {
         self.stop()?;
+        super::diagnostics::record("proxy_spawn", "started", "pending_readiness");
 
         let tmp_dir = std::env::temp_dir().join("KwikProxy Secure");
         std::fs::create_dir_all(&tmp_dir)
@@ -126,14 +141,26 @@ impl MihomoState {
         let my_pid = child.pid();
         eprintln!("[mihomo] запущен pid={my_pid}, stderr-лог: {stderr_log_path:?}");
 
+        let readiness = wait_for_readiness(
+            &mut rx,
+            mixed_port,
+            controller_port,
+            &stderr_log,
+            READINESS_TIMEOUT,
+        )
+        .await;
+        if let Err(error) = readiness {
+            super::diagnostics::record("proxy_readiness", "error", "not_ready");
+            let _ = child.kill();
+            return Err(error);
+        }
+        super::diagnostics::record("proxy_readiness", "ok", "listeners_ready");
+
         {
             let mut g = self.child.lock().map_err(|e| format!("mutex: {e}"))?;
             *g = Some(child);
         }
-        *self
-            .current_pid
-            .lock()
-            .map_err(|e| format!("mutex: {e}"))? = Some(my_pid);
+        *self.current_pid.lock().map_err(|e| format!("mutex: {e}"))? = Some(my_pid);
         *self.mixed_port.lock().map_err(|e| format!("mutex: {e}"))? = mixed_port;
 
         let app_handle = app.clone();
@@ -188,6 +215,8 @@ impl MihomoState {
                             if let Ok(mut g) = state.current_pid.lock() {
                                 *g = None;
                             }
+                            app_handle.state::<super::MihomoApiState>().clear();
+                            super::diagnostics::record("proxy_child", "error", "unexpected_exit");
                             // Сбрасываем system proxy только если упал актуальный процесс
                             // (см. xray.rs — та же защита от race при быстром реконнекте).
                             let _ = crate::platform::proxy::clear_system_proxy();
@@ -200,13 +229,54 @@ impl MihomoState {
                     }
                     CommandEvent::Error(err) => {
                         eprintln!("[mihomo:error] {err}");
+                        break;
                     }
                     _ => {}
                 }
             }
+            // A closed/erroring event stream means child liveness is no
+            // longer observable. Fail closed: terminate only the exact child
+            // currently associated with this monitor, then clear published
+            // controller/proxy state. Normal termination and explicit stop
+            // clear current_pid first, making this block a no-op.
+            let state = app_handle.state::<MihomoState>();
+            let is_current = state
+                .current_pid
+                .lock()
+                .map(|current| *current == Some(my_pid))
+                .unwrap_or(false);
+            if is_current {
+                let child = state.child.lock().ok().and_then(|mut child| child.take());
+                if let Ok(mut current) = state.current_pid.lock() {
+                    *current = None;
+                }
+                if let Some(child) = child {
+                    let _ = child.kill();
+                }
+                app_handle.state::<super::MihomoApiState>().clear();
+                super::diagnostics::record("proxy_monitor", "error", "event_stream_lost");
+                let _ = crate::platform::proxy::clear_system_proxy();
+            }
         });
 
         Ok(())
+    }
+
+    /// Publish the system proxy while holding the same state lock used by the
+    /// Terminated handler. If Mihomo died after readiness, publication fails;
+    /// if it dies immediately afterwards, the handler clears the proxy after
+    /// this method releases the lock.
+    pub fn set_system_proxy_if_running(
+        &self,
+        socks_port: u16,
+        http_port: u16,
+    ) -> Result<(), String> {
+        let child = self.child.lock().map_err(|e| format!("mutex: {e}"))?;
+        if child.is_none() {
+            return Err("Mihomo exited before system proxy publication".to_string());
+        }
+        crate::platform::proxy::set_system_proxy(socks_port, http_port)
+            .map_err(|error| error.to_string())
     }
 
     /// Остановить Mihomo. Если не запущен — no-op.
@@ -230,5 +300,144 @@ impl MihomoState {
             return true;
         }
         self.child.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+}
+
+async fn loopback_listener_ready(port: u16) -> bool {
+    tokio::time::timeout(
+        READINESS_CONNECT_TIMEOUT,
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+async fn wait_for_readiness(
+    events: &mut tauri::async_runtime::Receiver<CommandEvent>,
+    mixed_port: u16,
+    controller_port: u16,
+    log: &Arc<Mutex<File>>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if loopback_listener_ready(mixed_port).await
+            && loopback_listener_ready(controller_port).await
+        {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "Mihomo did not open its loopback listeners within {timeout:?}"
+            ));
+        }
+        let wait = READINESS_POLL.min(deadline - now);
+        tokio::select! {
+            event = events.recv() => match event {
+                Some(CommandEvent::Stdout(line)) | Some(CommandEvent::Stderr(line)) => {
+                    if let Ok(mut file) = log.lock() {
+                        let _ = writeln!(file, "{}", String::from_utf8_lossy(&line));
+                        let _ = file.flush();
+                    }
+                }
+                Some(CommandEvent::Terminated(payload)) => {
+                    if let Ok(mut file) = log.lock() {
+                        let _ = writeln!(
+                            file,
+                            "--- terminated during readiness code={:?} signal={:?} ---",
+                            payload.code,
+                            payload.signal,
+                        );
+                        let _ = file.flush();
+                    }
+                    return Err(format!(
+                        "Mihomo exited before readiness (code={:?}, signal={:?})",
+                        payload.code, payload.signal
+                    ));
+                }
+                Some(CommandEvent::Error(_)) => {
+                    return Err("Mihomo process monitor failed during readiness".to_string());
+                }
+                None => return Err("Mihomo process event stream closed before readiness".to_string()),
+                _ => {}
+            },
+            _ = tokio::time::sleep(wait) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unused_loopback_port_is_not_ready() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(!loopback_listener_ready(port).await);
+    }
+
+    fn temporary_log() -> (std::path::PathBuf, Arc<Mutex<File>>) {
+        let path = std::env::temp_dir().join(format!(
+            "kwikproxy-readiness-test-{}-{}.log",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let file = File::create(&path).unwrap();
+        (path, Arc::new(Mutex::new(file)))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn immediate_termination_event_fails_readiness() {
+        let (sender, mut receiver) = tauri::async_runtime::channel(1);
+        sender
+            .send(CommandEvent::Terminated(
+                tauri_plugin_shell::process::TerminatedPayload {
+                    code: Some(23),
+                    signal: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let (path, log) = temporary_log();
+        let error = wait_for_readiness(
+            &mut receiver,
+            unused_port(),
+            unused_port(),
+            &log,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        drop(log);
+        let _ = std::fs::remove_file(path);
+        assert!(error.contains("exited before readiness"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_readiness_timeout_is_bounded() {
+        let (_sender, mut receiver) = tauri::async_runtime::channel(1);
+        let (path, log) = temporary_log();
+        let error = wait_for_readiness(
+            &mut receiver,
+            unused_port(),
+            unused_port(),
+            &log,
+            Duration::from_millis(250),
+        )
+        .await
+        .unwrap_err();
+        drop(log);
+        let _ = std::fs::remove_file(path);
+        assert!(error.contains("did not open"));
+    }
+
+    fn unused_port() -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
     }
 }

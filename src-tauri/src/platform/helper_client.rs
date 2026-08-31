@@ -31,7 +31,7 @@ use windows_sys::Win32::System::Threading::{
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
 use winreg::RegKey;
 
-const PIPE_NAME: &str = r"\\.\pipe\KwikProxySecure.Helper.v13";
+const PIPE_NAME: &str = r"\\.\pipe\KwikProxySecure.Helper.v14";
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_BYTES: usize = 1400 * 1024;
 const MAX_REQUEST_BYTES: usize = 1536 * 1024;
@@ -107,6 +107,8 @@ pub enum HelperRequest {
     /// 14.E: read-only проверка остатков WFP-фильтров от прошлой
     /// сессии. Helper смотрит существование sublayer с нашим GUID.
     WfpQueryOrphan,
+    ReadDiagnostics,
+    TunnelStatus,
     /// Start the fixed protected Mihomo binary with config bytes only.
     StartTunnel {
         config_yaml: String,
@@ -133,6 +135,12 @@ pub enum HelperResponse {
     WfpOrphan {
         has_orphan: bool,
     },
+    Diagnostics {
+        text: String,
+    },
+    TunnelStatus {
+        running: bool,
+    },
     Error {
         message: String,
     },
@@ -141,7 +149,7 @@ pub enum HelperResponse {
 /// Минимально-поддерживаемая версия протокола. Если helper отвечает
 /// меньшей — `helper_bootstrap` форсит uninstall+install. Бампается
 /// синхронно с константой в `kwik_helper::protocol`.
-pub const HELPER_PROTOCOL_VERSION: u32 = 13;
+pub const HELPER_PROTOCOL_VERSION: u32 = 14;
 
 /// Открыть pipe с retry — сервис может быть busy сразу после старта или
 /// перезапуска. Возвращает первый успешный клиент за 1 секунду или ошибку.
@@ -485,13 +493,34 @@ pub async fn wfp_query_orphan() -> Result<bool> {
     }
 }
 
+/// Read a bounded sanitized lifecycle log through the authenticated helper
+/// pipe. The unprivileged process never opens ProgramData directly.
+pub async fn read_diagnostics() -> Result<String> {
+    match send(HelperRequest::ReadDiagnostics).await? {
+        HelperResponse::Diagnostics { text } => Ok(text),
+        HelperResponse::Error { message } => bail!("{message}"),
+        other => bail!("неожиданный ответ helper: {other:?}"),
+    }
+}
+
+/// Query liveness of the service-owned Mihomo child over the authenticated
+/// pipe. A transport error is deliberately distinct from `running=false` so
+/// callers can choose a fail-closed UI state.
+pub async fn tunnel_status() -> Result<bool> {
+    match send(HelperRequest::TunnelStatus).await? {
+        HelperResponse::TunnelStatus { running } => Ok(running),
+        HelperResponse::Error { message } => bail!("{message}"),
+        other => bail!("неожиданный ответ helper: {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn protocol_is_exact_and_path_free() {
-        assert_eq!(HELPER_PROTOCOL_VERSION, 13);
+        assert_eq!(HELPER_PROTOCOL_VERSION, 14);
         let json = serde_json::to_string(&HelperRequest::StartTunnel {
             config_yaml: "mixed-port: 7890".into(),
             allow_lan: false,

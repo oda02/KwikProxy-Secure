@@ -92,11 +92,33 @@ pub fn get_default_route_interface_name() -> Option<String> {
 ///    ∈ {0, 1}).
 /// 3. Конфликтом считаем маршрут, у которого:
 ///    - NextHop ≠ 198.18.0.1 (не наш TUN-gateway);
-///    - NextHop ≠ 0.0.0.0 (не on-link);
+///    - including on-link defaults when a distinct physical default route
+///      proves that the route belongs to another interface;
 ///    - ifIndex ≠ physic-default ifIndex.
 /// 4. Резолвим alias интерфейса и возвращаем уникальные имена.
 ///
 /// Возвращает пустой вектор если конфликтов нет / на не-Windows.
+#[cfg(windows)]
+fn is_foreign_default_route(
+    prefix_len: u8,
+    next_hop: u32,
+    interface_index: u32,
+    physical_interface: Option<u32>,
+    kwik_tun_gateway: u32,
+) -> bool {
+    if prefix_len > 1
+        || next_hop == kwik_tun_gateway
+        || Some(interface_index) == physical_interface
+    {
+        return false;
+    }
+    // A Wintun default is commonly on-link (0.0.0.0 next hop). It is
+    // foreign when Windows also exposes a distinct physical gateway route.
+    // If no physical route can be identified, stay fail-open for detection
+    // rather than falsely blocking a machine whose real uplink is on-link.
+    next_hop != 0 || physical_interface.is_some()
+}
+
 #[cfg(windows)]
 pub fn detect_routing_conflicts() -> Vec<String> {
     use std::collections::HashSet;
@@ -148,19 +170,19 @@ pub fn detect_routing_conflicts() -> Vec<String> {
         for e in entries {
             // half-default = /1 c destination 0.0.0.0 или 128.0.0.0 (типовой VPN-приём).
             let prefix_len = e.DestinationPrefix.PrefixLength;
-            if prefix_len > 1 {
-                continue;
-            }
             let nh: &SOCKADDR_INET = &e.NextHop;
             if nh.si_family != AF_INET {
                 continue;
             }
             let nh_v4: &SOCKADDR_IN = mem::transmute(nh);
             let nh_addr = nh_v4.sin_addr.S_un.S_addr;
-            if nh_addr == 0 || nh_addr == KWIK_TUN_GATEWAY {
-                continue;
-            }
-            if Some(e.InterfaceIndex) == physic_if_idx {
+            if !is_foreign_default_route(
+                prefix_len,
+                nh_addr,
+                e.InterfaceIndex,
+                physic_if_idx,
+                KWIK_TUN_GATEWAY,
+            ) {
                 continue;
             }
             conflict_ifs.insert(e.InterfaceIndex);
@@ -223,6 +245,32 @@ pub fn detect_routing_conflicts() -> Vec<String> {
 #[cfg(not(windows))]
 pub fn detect_routing_conflicts() -> Vec<String> {
     Vec::new()
+}
+
+#[cfg(all(test, windows))]
+mod conflict_tests {
+    use super::is_foreign_default_route;
+
+    const KWIK_GATEWAY: u32 = 0x0100_12C6;
+
+    #[test]
+    fn foreign_on_link_default_is_a_conflict() {
+        assert!(is_foreign_default_route(0, 0, 27, Some(14), KWIK_GATEWAY));
+        assert!(!is_foreign_default_route(0, 0, 14, Some(14), KWIK_GATEWAY));
+    }
+
+    #[test]
+    fn product_gateway_and_non_default_routes_are_not_conflicts() {
+        assert!(!is_foreign_default_route(
+            0,
+            KWIK_GATEWAY,
+            27,
+            Some(14),
+            KWIK_GATEWAY,
+        ));
+        assert!(!is_foreign_default_route(2, 0, 27, Some(14), KWIK_GATEWAY));
+        assert!(!is_foreign_default_route(0, 0, 27, None, KWIK_GATEWAY));
+    }
 }
 
 /// 14.E — есть ли orphan TUN-адаптер с уникальным префиксом этого fork.

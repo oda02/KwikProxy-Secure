@@ -73,3 +73,64 @@ pub fn recent(max_bytes: usize) -> Option<String> {
     let text = String::from_utf8_lossy(&bytes).trim().to_string();
     (!text.is_empty()).then_some(text)
 }
+
+/// Return only structured lifecycle events that are safe to expose to the
+/// unelevated UI. Older helper versions wrote arbitrary diagnostic text to
+/// this file (including network endpoints), so forwarding the raw tail would
+/// cross the service trust boundary.
+pub fn recent_structured(max_bytes: usize) -> Option<String> {
+    let raw = recent(max_bytes.saturating_mul(2))?;
+    let mut selected = Vec::new();
+    let mut size = 0usize;
+
+    for line in raw.lines().rev() {
+        if !is_ui_safe_event(line) {
+            continue;
+        }
+        let additional = line.len().saturating_add(1);
+        if size.saturating_add(additional) > max_bytes {
+            break;
+        }
+        size += additional;
+        selected.push(line);
+    }
+    selected.reverse();
+    (!selected.is_empty()).then(|| selected.join("\n"))
+}
+
+fn is_ui_safe_event(line: &str) -> bool {
+    let Some((timestamp, event)) = line.split_once("] ") else {
+        return false;
+    };
+    let Some(timestamp) = timestamp.strip_prefix('[') else {
+        return false;
+    };
+    if timestamp.is_empty() || !timestamp.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    matches!(
+        event,
+        "[helper-mihomo] stage=config_validated outcome=ok code=accepted"
+            | "[helper-mihomo] stage=readiness outcome=error code=not_ready"
+            | "[helper-mihomo] stage=readiness outcome=ok code=controller_and_tun_ready"
+            | "[helper-mihomo] stage=child_monitor outcome=exited code=child_exit"
+            | "[helper-mihomo] stage=orphan_cleanup outcome=error code=cleanup_failed"
+            | "[helper-dispatch] stage=child_exit_wfp_cleanup outcome=error code=disable_failed"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn structured_diagnostic_shape_requires_static_fields() {
+        let safe = "[1] [helper-mihomo] stage=readiness outcome=ok code=controller_and_tun_ready";
+        let legacy = "[1] allowing server_ips={1.2.3.4}";
+        let injected = "[1] [helper-mihomo] stage=readiness outcome=ok code=controller_and_tun_ready token=secret";
+        let partial =
+            "secret] [helper-mihomo] stage=readiness outcome=ok code=controller_and_tun_ready";
+        assert!(super::is_ui_safe_event(safe));
+        assert!(!super::is_ui_safe_event(legacy));
+        assert!(!super::is_ui_safe_event(injected));
+        assert!(!super::is_ui_safe_event(partial));
+    }
+}

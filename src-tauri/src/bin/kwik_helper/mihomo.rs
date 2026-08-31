@@ -25,6 +25,9 @@ use super::security::Installation;
 
 const MAX_CONFIG_BYTES: usize = 1400 * 1024;
 const SECURE_TUN_PREFIX: &str = "kwikproxy-secure-";
+const READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const READINESS_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+const READINESS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 struct Job(OwnedHandle);
 
@@ -53,7 +56,9 @@ pub async fn start(
     if config_yaml.as_bytes().contains(&0) {
         bail!("mihomo config contains NUL bytes");
     }
-    let tun_device = validate_privileged_config(config_yaml, allow_lan)?;
+    let validated = validate_privileged_config(config_yaml, allow_lan)?;
+    let tun_device = validated.tun_device;
+    super::helper_log::log("[helper-mihomo] stage=config_validated outcome=ok code=accepted");
 
     let mut state = STATE.lock().await;
     if state.is_some() {
@@ -100,6 +105,23 @@ pub async fn start(
     }
 
     eprintln!("[helper-mihomo] started protected pid={pid}");
+    if let Err(error) = wait_for_child_readiness(
+        &mut child,
+        validated.controller_addr,
+        Some(&tun_device),
+        READINESS_TIMEOUT,
+    )
+    .await
+    {
+        super::helper_log::log("[helper-mihomo] stage=readiness outcome=error code=not_ready");
+        let _ = child.kill().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+        let _ = super::tun::cleanup_owned_device(&tun_device).await;
+        return Err(error);
+    }
+    super::helper_log::log(
+        "[helper-mihomo] stage=readiness outcome=ok code=controller_and_tun_ready",
+    );
     *state = Some(State {
         child,
         pid,
@@ -108,7 +130,87 @@ pub async fn start(
         generation: installation.generation.clone(),
         tun_device: tun_device.clone(),
     });
+    drop(state);
+    spawn_exit_monitor(
+        pid,
+        session_id,
+        installation.generation.clone(),
+        tun_device.clone(),
+    );
     Ok(tun_device)
+}
+
+async fn loopback_listener_ready(address: std::net::SocketAddr) -> bool {
+    tokio::time::timeout(
+        READINESS_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect(address),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+async fn wait_for_child_readiness(
+    child: &mut Child,
+    controller_addr: std::net::SocketAddr,
+    expected_tun: Option<&str>,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("query Mihomo readiness process")? {
+            bail!("Mihomo exited before readiness with status {status}");
+        }
+        let controller_ready = loopback_listener_ready(controller_addr).await;
+        let tun_ready = match expected_tun {
+            Some(alias) => super::tun::owned_tun_interface_ready(alias).await,
+            None => true,
+        };
+        if controller_ready && tun_ready {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("Mihomo readiness timed out after {timeout:?}");
+        }
+        tokio::time::sleep(READINESS_POLL).await;
+    }
+}
+
+fn spawn_exit_monitor(pid: u32, session_id: u32, generation: String, tun_device: String) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let exit_observed = {
+                let mut state = STATE.lock().await;
+                let Some(active) = state.as_mut() else {
+                    return;
+                };
+                if active.pid != pid
+                    || active.session_id != session_id
+                    || active.generation != generation
+                {
+                    return;
+                }
+                let exited = !matches!(active.child.try_wait(), Ok(None));
+                if exited {
+                    let _ = state.take();
+                }
+                exited
+            };
+            if !exit_observed {
+                continue;
+            }
+            super::helper_log::log(
+                "[helper-mihomo] stage=child_monitor outcome=exited code=child_exit",
+            );
+            if super::tun::cleanup_owned_device(&tun_device).await.is_err() {
+                super::helper_log::log(
+                    "[helper-mihomo] stage=orphan_cleanup outcome=error code=cleanup_failed",
+                );
+            }
+            super::dispatch::on_tunnel_process_exit(session_id, &generation).await;
+            return;
+        }
+    });
 }
 
 fn write_config(installation: &Installation, bytes: &[u8]) -> Result<()> {
@@ -184,7 +286,12 @@ fn create_kill_on_close_job() -> Result<Job> {
 /// Defense in depth at the privileged sink. The normal config sanitizer runs
 /// in the application, but these settings must never reach a SYSTEM network
 /// engine even if a future caller regresses.
-fn validate_privileged_config(yaml: &str, allow_lan: bool) -> Result<String> {
+struct ValidatedConfig {
+    tun_device: String,
+    controller_addr: std::net::SocketAddr,
+}
+
+fn validate_privileged_config(yaml: &str, allow_lan: bool) -> Result<ValidatedConfig> {
     let value: Value = serde_yaml::from_str(yaml).context("parse Mihomo YAML")?;
     let root = value
         .as_mapping()
@@ -214,7 +321,10 @@ fn validate_privileged_config(yaml: &str, allow_lan: bool) -> Result<String> {
 
     let controller = string_value(root, "external-controller")
         .ok_or_else(|| anyhow!("external-controller must be explicitly configured"))?;
-    if !(controller.starts_with("127.0.0.1:") || controller.starts_with("[::1]:")) {
+    let controller_addr = controller
+        .parse::<std::net::SocketAddr>()
+        .context("external-controller must be a numeric loopback socket")?;
+    if !controller_addr.ip().is_loopback() || controller_addr.port() == 0 {
         bail!("external-controller must bind loopback only");
     }
     let secret = string_value(root, "secret").unwrap_or_default();
@@ -263,7 +373,10 @@ fn validate_privileged_config(yaml: &str, allow_lan: bool) -> Result<String> {
     }
     validate_provider_paths(root, "proxy-providers")?;
     validate_provider_paths(root, "rule-providers")?;
-    Ok(device.to_string())
+    Ok(ValidatedConfig {
+        tun_device: device.to_string(),
+        controller_addr,
+    })
 }
 
 fn key(name: &str) -> Value {
@@ -340,7 +453,10 @@ pub async fn stop_owned(session_id: u32, generation: &str) -> Result<()> {
 
 #[allow(dead_code)]
 pub async fn is_running() -> bool {
-    STATE.lock().await.is_some()
+    let mut state = STATE.lock().await;
+    state
+        .as_mut()
+        .is_some_and(|active| matches!(active.child.try_wait(), Ok(None)))
 }
 
 #[allow(dead_code)]
@@ -426,5 +542,48 @@ proxy-providers:
                 "shortcut inbound {key} must be rejected"
             );
         }
+    }
+
+    fn unused_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn immediate_child_exit_fails_readiness() {
+        let mut child = tokio::process::Command::new("cmd.exe")
+            .args(["/C", "exit 23"])
+            .spawn()
+            .unwrap();
+        let error = wait_for_child_readiness(
+            &mut child,
+            ([127, 0, 0, 1], unused_loopback_port()).into(),
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("exited before readiness"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn readiness_timeout_is_bounded() {
+        let mut child = tokio::process::Command::new("cmd.exe")
+            .args(["/C", "ping -n 10 127.0.0.1 >NUL"])
+            .spawn()
+            .unwrap();
+        let error = wait_for_child_readiness(
+            &mut child,
+            ([127, 0, 0, 1], unused_loopback_port()).into(),
+            None,
+            std::time::Duration::from_millis(250),
+        )
+        .await
+        .unwrap_err();
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        assert!(error.to_string().contains("timed out"));
     }
 }

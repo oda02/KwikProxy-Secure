@@ -5,7 +5,7 @@
 //! (CreateAdapter требует админа).
 //!
 //! User-mode Tauri-приложение общается с этим helper-ом через named pipe
-//! `\\.\pipe\KwikProxySecure.Helper.v13` bounded JSON-RPC протоколом.
+//! `\\.\pipe\KwikProxySecure.Helper.v14` bounded JSON-RPC протоколом.
 //!
 //! CLI:
 //!   kwik-helper install      — установить и запустить сервис (нужен UAC)

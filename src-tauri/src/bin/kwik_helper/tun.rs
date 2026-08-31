@@ -97,6 +97,20 @@ fn find_owned_tun_interface_index(expected_alias: &str) -> Option<u32> {
     Some(candidate.if_index)
 }
 
+/// Single ownership-safe readiness observation. Unlike
+/// `current_tun_interface_index`, this does not hide a five-second retry loop,
+/// so the Mihomo lifecycle can interleave adapter checks with child-exit
+/// checks and fail immediately when the process terminates.
+pub async fn owned_tun_interface_ready(expected_alias: &str) -> bool {
+    if !expected_alias.starts_with(TUN_NAME_PREFIX) {
+        return false;
+    }
+    let alias = expected_alias.to_string();
+    tokio::task::spawn_blocking(move || find_owned_tun_interface_index(&alias).is_some())
+        .await
+        .unwrap_or(false)
+}
+
 /// Enumerate only adapters bearing this fork's reserved alias prefix.
 fn scan_owned_interfaces() -> Vec<TunCandidate> {
     let mut result = Vec::new();

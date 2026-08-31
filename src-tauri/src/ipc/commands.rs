@@ -297,6 +297,25 @@ pub fn delete_subscription_cache(
 
 // ─── Подключение ──────────────────────────────────────────────────────────────
 
+async fn rollback_connect(
+    mihomo: &MihomoState,
+    mihomo_api: &vpn::MihomoApiState,
+    ks_ctx: &KillSwitchState,
+) {
+    vpn::diagnostics::record("connect_rollback", "started", "post_spawn_failure");
+    // Each stop is ownership-scoped: the local state owns only our sidecar,
+    // and helper MihomoStop is authenticated/session-bound. No foreign VPN
+    // process, adapter or proxy executable is selected by name.
+    let _ = platform::helper_client::mihomo_stop().await;
+    let _ = platform::helper_client::kill_switch_disable().await;
+    mihomo.mark_helper_spawned(false);
+    let _ = mihomo.stop();
+    let _ = platform::proxy::clear_system_proxy();
+    mihomo_api.clear();
+    *ks_ctx.0.lock().await = None;
+    vpn::diagnostics::record("connect_rollback", "ok", "owned_state_cleared");
+}
+
 /// Подключиться к серверу с указанным индексом в режиме `mode`.
 ///
 /// `mode` = "proxy" — системный SOCKS5 + HTTP прокси через реестр.
@@ -349,6 +368,7 @@ pub async fn connect(
     ks_ctx: State<'_, KillSwitchState>,
     routing_store: State<'_, crate::config::routing_store::RoutingStoreState>,
 ) -> Result<ConnectResult, String> {
+    vpn::diagnostics::record("connect", "started", "request_received");
     // Долг: TUN 15-секундная задержка первого запроса. Включаем
     // подробное timing-логирование connect-flow чтобы видеть где
     // именно gap. После накопления логов — оптимизируем узкое место
@@ -546,15 +566,33 @@ pub async fn connect(
             let _ = platform::helper_client::mihomo_stop().await;
             let _ = mihomo.stop();
 
-            platform::helper_client::start_tunnel(cfg.yaml.clone(), lan)
-                .await
-                .map_err(|e| format!("helper.start_tunnel: {e}"))?;
+            if let Err(error) = platform::helper_client::start_tunnel(cfg.yaml.clone(), lan).await {
+                vpn::diagnostics::record("tun_readiness", "error", "helper_rejected");
+                rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
+                return Err(format!("helper.start_tunnel: {error}"));
+            }
             mihomo.mark_helper_spawned(true);
             // mixed_port запоминаем для is_xray_running и др.
-            *mihomo.mixed_port.lock().map_err(|e| format!("mutex: {e}"))? = cfg.mixed_port;
+            match mihomo.mixed_port.lock() {
+                Ok(mut port) => *port = cfg.mixed_port,
+                Err(error) => {
+                    let message = format!("mutex: {error}");
+                    drop(error);
+                    rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
+                    return Err(message);
+                }
+            }
+            vpn::diagnostics::record("tun_readiness", "ok", "helper_ready");
             stamp("mihomo built-in TUN: spawned via helper");
         } else {
-            mihomo.start_with_config(&app, &cfg.yaml, cfg.mixed_port)?;
+            if let Err(error) = mihomo
+                .start_with_config(&app, &cfg.yaml, cfg.mixed_port, controller_port)
+                .await
+            {
+                vpn::diagnostics::record("proxy_readiness", "error", "sidecar_not_ready");
+                rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
+                return Err(error);
+            }
         }
 
         // 8.F: сохраняем endpoint controller'а — UI достучится через
@@ -572,8 +610,12 @@ pub async fn connect(
 
     match mode.as_str() {
         "proxy" => {
-            platform::proxy::set_system_proxy(socks_port, http_port)
-                .map_err(|e| e.to_string())?;
+            if let Err(error) = mihomo.set_system_proxy_if_running(socks_port, http_port) {
+                vpn::diagnostics::record("system_proxy", "error", "publication_failed");
+                rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
+                return Err(error);
+            }
+            vpn::diagnostics::record("system_proxy", "ok", "published");
             stamp("system proxy set");
         }
         "tun" => {
@@ -583,7 +625,7 @@ pub async fn connect(
             stamp("tun: built-in TUN — движок сам поднимает WinTUN-адаптер");
         }
         other => {
-            let _ = mihomo.stop();
+            rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
             return Err(format!("неизвестный режим: {other}"));
         }
     }
@@ -609,9 +651,7 @@ pub async fn connect(
             if server_host.parse::<std::net::IpAddr>().is_ok() {
                 // ОК
             } else {
-                let _ = mihomo.stop();
-                let _ = platform::helper_client::mihomo_stop().await;
-                let _ = platform::proxy::clear_system_proxy();
+                rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
                 return Err(format!(
                     "kill switch: не удалось резолвить server_host={server_host}"
                 ));
@@ -627,9 +667,7 @@ pub async fn connect(
         // — у нас не было ensure_running).
         if !tun_mode {
             if let Err(e) = platform::helper_bootstrap::ensure_running().await {
-                let _ = mihomo.stop();
-                let _ = platform::helper_client::mihomo_stop().await;
-                let _ = platform::proxy::clear_system_proxy();
+                rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
                 return Err(format!("kill switch: helper-сервис недоступен: {e}"));
             }
         }
@@ -660,9 +698,7 @@ pub async fn connect(
         {
             // При ошибке откатываем всё — интернет НЕ должен оставаться
             // в полу-заблокированном состоянии.
-            let _ = mihomo.stop();
-            let _ = platform::helper_client::mihomo_stop().await;
-            let _ = platform::proxy::clear_system_proxy();
+            rollback_connect(&mihomo, &mihomo_api, &ks_ctx).await;
             return Err(format!("kill switch не поднялся: {e}"));
         }
 
@@ -683,6 +719,7 @@ pub async fn connect(
     }
 
     stamp("connect done");
+    vpn::diagnostics::record("connect", "ok", "ready");
     mihomo.set_subscription_proxy_port(if mode == "proxy" && !lan {
         Some(socks_port)
     } else {
@@ -756,8 +793,22 @@ pub async fn disconnect(
 /// возвращает true если движок Mihomo запущен. Семантика «работает ли
 /// VPN», не привязка к конкретному ядру.
 #[tauri::command]
-pub fn is_xray_running(mihomo: State<'_, MihomoState>) -> bool {
-    mihomo.is_running()
+pub async fn is_xray_running(
+    mihomo: State<'_, MihomoState>,
+    mihomo_api: State<'_, vpn::MihomoApiState>,
+) -> bool {
+    if !mihomo.helper_spawned() {
+        return mihomo.is_running();
+    }
+    match platform::helper_client::tunnel_status().await {
+        Ok(true) => true,
+        Ok(false) | Err(_) => {
+            mihomo.mark_helper_spawned(false);
+            mihomo_api.clear();
+            vpn::diagnostics::record("tun_child", "error", "not_running");
+            false
+        }
+    }
 }
 
 /// Обновить tray-icon под текущий VPN-статус (этап 13.A).
@@ -1149,55 +1200,26 @@ pub fn get_hwid(url: Option<String>, hwid: State<'_, HwidState>) -> Result<Strin
     crate::config::hwid::for_subscription(&hwid.0, &url).map_err(|e| e.to_string())
 }
 
-/// Прочитать последние ~32 КБ логов VPN-движка из всех известных
-/// log-файлов (`mihomo-stderr.log`, плюс helper-side
-/// `C:\ProgramData\KwikProxy Secure\mihomo.log` если он есть).
+/// Read bounded credential-free lifecycle diagnostics. Protected service
+/// diagnostics cross the authenticated helper pipe; this user process never
+/// opens or guesses a flat ProgramData path.
 ///
 /// Имя `read_xray_log` оставлено для совместимости с фронтом (UI
 /// `LogsBlock`). Содержимое — логи Mihomo.
 #[tauri::command]
-pub fn read_xray_log() -> Result<String, String> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let tmp_dir = std::env::temp_dir().join("KwikProxy Secure");
-    let prog_dir = std::path::PathBuf::from(r"C:\ProgramData\KwikProxy Secure");
-
-    let candidates = [
-        tmp_dir.join("mihomo-stderr.log"),
-        prog_dir.join("mihomo.log"),
-    ];
-
-    // Берём самый свежий по mtime из существующих файлов.
-    let newest = candidates
-        .iter()
-        .filter(|p| p.exists())
-        .filter_map(|p| {
-            p.metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .map(|t| (p.clone(), t))
-        })
-        .max_by_key(|(_, t)| *t)
-        .map(|(p, _)| p);
-
-    let path = match newest {
-        Some(p) => p,
-        None => return Ok(String::new()),
-    };
-
-    let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-    let len = file.metadata().map_err(|e| e.to_string())?.len();
-    let max = 32 * 1024;
-    let start = len.saturating_sub(max);
-    file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    let header = format!("=== {} ===\n", path.display());
-    Ok(format!(
-        "{}{}",
-        header,
-        String::from_utf8_lossy(&buf)
-    ))
+pub async fn read_xray_log() -> Result<String, String> {
+    let app_log = vpn::diagnostics::recent().unwrap_or_default();
+    let helper_log = platform::helper_client::read_diagnostics()
+        .await
+        .unwrap_or_default();
+    let mut sections = Vec::new();
+    if !app_log.is_empty() {
+        sections.push(format!("=== application lifecycle ===\n{app_log}"));
+    }
+    if !helper_log.is_empty() {
+        sections.push(format!("=== protected helper lifecycle ===\n{helper_log}"));
+    }
+    Ok(sections.join("\n"))
 }
 
 /// Пинговать все серверы из текущей подписки параллельно (TCP-connect).

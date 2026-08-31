@@ -95,6 +95,16 @@ impl BrokerState {
             .as_ref()
             .is_some_and(|owner| owner.tunnel_active || owner.firewall_active)
     }
+
+    fn note_tunnel_exit(&mut self, generation: &str, session_id: u32) -> Option<bool> {
+        let owner = self.owner.as_mut()?;
+        if !owner.matches(generation, session_id) {
+            return None;
+        }
+        owner.tunnel_active = false;
+        owner.tun_device = None;
+        Some(owner.firewall_active)
+    }
 }
 
 fn broker() -> &'static Mutex<BrokerState> {
@@ -116,6 +126,12 @@ pub async fn handle(
         Request::WfpQueryOrphan => match wfp::has_orphan_filters() {
             Ok(has_orphan) => Response::WfpOrphan { has_orphan },
             Err(error) => Response::err(format!("wfp_query_orphan: {error:#}")),
+        },
+        Request::ReadDiagnostics => Response::Diagnostics {
+            text: super::helper_log::recent_structured(16 * 1024).unwrap_or_default(),
+        },
+        Request::TunnelStatus => Response::TunnelStatus {
+            running: mihomo::is_running().await,
         },
         request => {
             let mut state = broker().lock().await;
@@ -268,7 +284,13 @@ async fn handle_mutating(
                 Err(error) => Err(error),
             }
         }
-        Request::Ping | Request::Version | Request::WfpQueryOrphan => unreachable!(),
+        Request::Ping
+        | Request::Version
+        | Request::WfpQueryOrphan
+        | Request::ReadDiagnostics
+        | Request::TunnelStatus => {
+            unreachable!()
+        }
     };
     if result.is_err() {
         state.release_if_idle();
@@ -277,6 +299,29 @@ async fn handle_mutating(
         Ok(()) => Response::Ok,
         Err(error) => Response::err(format!("privileged request rejected: {error:#}")),
     }
+}
+
+/// Reconcile broker/WFP ownership after the monitored SYSTEM Mihomo child
+/// exits without an explicit stop request. Matching is exact, so a delayed
+/// monitor from an older process cannot clear a replacement session.
+pub async fn on_tunnel_process_exit(session_id: u32, generation: &str) {
+    let mut state = broker().lock().await;
+    let Some(firewall_active) = state.note_tunnel_exit(generation, session_id) else {
+        return;
+    };
+    if firewall_active {
+        match firewall::disable().await {
+            Ok(()) => {
+                if let Some(owner) = state.owner.as_mut() {
+                    owner.firewall_active = false;
+                }
+            }
+            Err(_) => hlog(
+                "[helper-dispatch] stage=child_exit_wfp_cleanup outcome=error code=disable_failed",
+            ),
+        }
+    }
+    state.release_if_idle();
 }
 
 /// Service-only shutdown transaction. Pipe acceptance has already stopped and
@@ -335,6 +380,18 @@ mod tests {
         state.release_if_idle();
         assert!(state.owner.is_some());
         state.owner.as_mut().unwrap().tunnel_active = false;
+        state.release_if_idle();
+        assert!(state.owner.is_none());
+    }
+
+    #[test]
+    fn spontaneous_exit_clears_only_matching_tunnel_owner() {
+        let mut state = state();
+        assert_eq!(state.note_tunnel_exit("generation-b", 7), None);
+        assert!(state.owner.as_ref().unwrap().tunnel_active);
+        assert_eq!(state.note_tunnel_exit("generation-a", 7), Some(false));
+        assert!(!state.owner.as_ref().unwrap().tunnel_active);
+        assert!(state.owner.as_ref().unwrap().tun_device.is_none());
         state.release_if_idle();
         assert!(state.owner.is_none());
     }
