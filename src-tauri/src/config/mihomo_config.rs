@@ -428,9 +428,10 @@ fn detect_proxy_target(root: &Mapping) -> String {
     "GLOBAL".to_string()
 }
 
-/// Rewrite provider catch-all targets for an explicit user override. Every
-/// MATCH/FINAL is normalized because Mihomo reaches the first one; specific
-/// provider rules stay in place. If none exists, append one after all rules.
+/// Replace provider catch-alls with one canonical final MATCH for an explicit
+/// user override. Mihomo stops at the first MATCH/FINAL, so leaving an early
+/// catch-all in place would make every later provider rule unreachable.
+/// Non-catch-all rules keep their original order.
 fn normalize_terminal_default(
     root: &mut Mapping,
     default_traffic: DefaultTraffic,
@@ -444,26 +445,17 @@ fn normalize_terminal_default(
     let target = default_traffic
         .explicit_target(proxy_target)
         .context("auto traffic fallback must not be normalized")?;
-    let mut found = false;
-    for rule in rules.iter_mut() {
-        let Some(raw) = rule.as_str() else { continue };
+    rules.retain(|rule| {
+        let Some(raw) = rule.as_str() else { return true };
         let head = raw
             .split(',')
             .next()
             .unwrap_or("")
             .trim()
             .to_ascii_uppercase();
-        if head == "MATCH" || head == "FINAL" {
-            // The first catch-all is the one Mihomo reaches. Normalize every
-            // catch-all so malformed/multi-terminal provider input cannot
-            // silently defeat the explicit user override.
-            *rule = Value::String(format!("{head},{target}"));
-            found = true;
-        }
-    }
-    if !found {
-        rules.push(Value::String(format!("MATCH,{target}")));
-    }
+        head != "MATCH" && head != "FINAL"
+    });
+    rules.push(Value::String(format!("MATCH,{target}")));
     Ok(())
 }
 
@@ -2173,12 +2165,13 @@ rules:
     }
 
     #[test]
-    fn full_profile_vpn_restores_provider_group_and_normalizes_all_catchalls() {
+    fn full_profile_vpn_moves_one_canonical_fallback_after_provider_rules() {
         let yaml = r#"
 proxies: []
 proxy-groups: [{name: provider-main, type: select, proxies: []}]
 rules:
   - MATCH,DIRECT
+  - RULE-SET,provider-domains,provider-main
   - DOMAIN,unreachable.example,DIRECT
   - FINAL,DIRECT
 "#;
@@ -2192,9 +2185,14 @@ rules:
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert_eq!(rules[0], "MATCH,provider-main");
-        assert_eq!(rules[1], "DOMAIN,unreachable.example,DIRECT");
-        assert_eq!(rules[2], "FINAL,provider-main");
+        assert_eq!(
+            rules,
+            vec![
+                "RULE-SET,provider-domains,provider-main",
+                "DOMAIN,unreachable.example,DIRECT",
+                "MATCH,provider-main",
+            ]
+        );
     }
 
     #[test]
@@ -2244,6 +2242,26 @@ rules:
         };
         assert!(generate(DefaultTraffic::Auto).yaml.contains("MATCH,DIRECT"));
         assert!(generate(DefaultTraffic::Vpn).yaml.contains("MATCH,PROXY"));
+
+        let explicit_direct = build(
+            &entry,
+            31_000,
+            "127.0.0.1",
+            None,
+            None,
+            &[],
+            None,
+            DefaultTraffic::Direct,
+            false,
+            None,
+            false,
+            None,
+            31_001,
+            "secret",
+        )
+        .unwrap();
+        assert!(explicit_direct.yaml.contains("MATCH,DIRECT"));
+        assert!(!explicit_direct.yaml.contains("MATCH,PROXY"));
     }
 
     /// 8.F: external-controller перезаписывается нашим (для mihomo_api).

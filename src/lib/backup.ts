@@ -1,7 +1,12 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import i18n from "../i18n";
-import { useSettingsStore, type Settings, type AppRule } from "../stores/settingsStore";
+import {
+  normalizeImportedDefaultTraffic,
+  useSettingsStore,
+  type Settings,
+  type AppRule,
+} from "../stores/settingsStore";
 import { useSubscriptionStore } from "../stores/subscriptionStore";
 import { APP_VERSION } from "./constants";
 
@@ -168,7 +173,7 @@ export function readBackupFile(file: File): Promise<string> {
  *  вместо строки, NaN/Infinity вместо числа) — соответствует
  *  whitelist-принципу проекта. Enum-строки доп. санитизируются в
  *  settingsStore.set/load (напр. theme мигрирует невалидное значение). */
-function sanitizeImportedSettings(raw: unknown): Partial<Settings> {
+export function sanitizeImportedSettings(raw: unknown): Partial<Settings> {
   if (!raw || typeof raw !== "object") return {};
   const incoming = raw as Record<string, unknown>;
   const cur = useSettingsStore.getState();
@@ -201,6 +206,13 @@ function sanitizeImportedSettings(raw: unknown): Partial<Settings> {
       }
     }
     // объекты/функции/null — молча отбрасываем.
+  }
+  // Preview and apply must agree on this cross-setting invariant. Otherwise
+  // a backup could advertise Direct while `set()` silently coerces it to VPN
+  // once strict kill switch values earlier in the same backup are applied.
+  const normalizedFallback = normalizeImportedDefaultTraffic(out, cur);
+  if (normalizedFallback !== undefined) {
+    out.defaultTraffic = normalizedFallback;
   }
   return out as Partial<Settings>;
 }

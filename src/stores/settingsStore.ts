@@ -420,6 +420,43 @@ export function normalizeDefaultTraffic(
   return "auto";
 }
 
+/** Normalize the routing fields of one imported backup as a composite. The
+ * returned value is omitted only when the backup did not mention the fallback
+ * and its kill-switch fields do not coerce the current fallback. This keeps
+ * preview, apply and a later export/roundtrip consistent. */
+export function normalizeImportedDefaultTraffic(
+  incoming: {
+    killSwitch?: unknown;
+    killSwitchStrict?: unknown;
+    defaultTraffic?: unknown;
+  },
+  current: Pick<
+    Settings,
+    "killSwitch" | "killSwitchStrict" | "defaultTraffic"
+  >
+): DefaultTraffic | undefined {
+  const effectiveKillSwitch =
+    typeof incoming.killSwitch === "boolean"
+      ? incoming.killSwitch
+      : current.killSwitch;
+  const effectiveStrict =
+    typeof incoming.killSwitchStrict === "boolean"
+      ? incoming.killSwitchStrict
+      : current.killSwitchStrict;
+  const fallbackBeforeInvariant =
+    incoming.defaultTraffic === undefined
+      ? current.defaultTraffic
+      : normalizeDefaultTraffic(incoming.defaultTraffic, false);
+  const normalized = normalizeDefaultTraffic(
+    fallbackBeforeInvariant,
+    effectiveKillSwitch && effectiveStrict
+  );
+  return incoming.defaultTraffic !== undefined ||
+    normalized !== fallbackBeforeInvariant
+    ? normalized
+    : undefined;
+}
+
 const load = (): Settings => {
   try {
     const raw = localStorage.getItem(KEY);

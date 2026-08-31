@@ -394,7 +394,7 @@
     },
     "appRules": {
       "title": "app rules",
-      "tunWarning": "app rules in TUN mode only work when the subscription delivers a full mihomo-config (server type mihomo-profile). For URI servers (vless/vmess/trojan/hy2/...) in TUN, rules are not applied — switch the mode to proxy.",
+      "tunWarning": "in TUN mode, app rules work for both URI servers and full Mihomo profiles. In system proxy mode, they only cover apps that use the Windows proxy.",
       "intro": "these rules have the highest priority. in TUN mode Mihomo reliably identifies the originating process; in system proxy mode a rule only applies when that app uses the Windows proxy. the exe name is taken from task manager (telegram.exe, steam.exe).",
       "actionTitles": {
         "proxy": "through VPN",
@@ -565,7 +565,7 @@
           "direct": "direct (bypass VPN)"
         },
         "captureHint": "Per-app routing works reliably in TUN mode because Mihomo can identify the originating process. System proxy mode only covers apps that honor the Windows system proxy; the engine cannot see direct connections from other apps.",
-        "strictHint": "Strict kill switch forbids all Direct traffic. Explicit Direct fallback is unavailable; in «follow profile/subscription» mode, provider, profile and app Direct rules are still blocked."
+        "strictHint": "Strict kill switch blocks ordinary Internet traffic that Mihomo routes to Direct. Explicit Direct fallback is unavailable; «follow profile/subscription» remains available, but its Direct rules do not bypass the block. Service loopback, the VPN server address and an allowed local network are handled separately."
       },
       "autoTemplate": {
         "title": "auto-template",
