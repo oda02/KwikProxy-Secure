@@ -47,20 +47,14 @@
 ; SetOutPath creates the fixed root before PREINSTALL. Enumerate it explicitly:
 ; NSIS wildcard existence checks also match `.`/`..` and therefore
 ; rejects a genuinely empty directory. This macro ignores only those two exact
-; names, bounds iteration, closes every valid search handle, and treats an
-; unexpected enumeration failure as non-empty/fail-closed.
+; names, bounds iteration, and closes every valid search handle. A FindFirst
+; error remains fail-closed; FindNext's documented error flag ends a valid
+; enumeration without consulting the volatile Win32 last-error slot.
 !macro KWIK_SECURE_CHECK_INSTALL_ROOT_EMPTY RESULT
   StrCpy ${RESULT} 1
   ClearErrors
   FindFirst $0 $1 "$INSTDIR\*"
-  ${If} ${Errors}
-    System::Call 'kernel32::GetLastError() i.r1'
-    ${If} $1 == 2
-    ${OrIf} $1 == 18
-      ; An existing directory with no first entry is also empty.
-      StrCpy ${RESULT} 0
-    ${EndIf}
-  ${Else}
+  ${IfNot} ${Errors}
     StrCpy ${RESULT} 0
     StrCpy $2 0
     ${Do}
@@ -77,11 +71,6 @@
       ClearErrors
       FindNext $0 $1
       ${If} ${Errors}
-        System::Call 'kernel32::GetLastError() i.r1'
-        ${If} $1 != 18
-          ; ERROR_NO_MORE_FILES (18) is the only successful termination.
-          StrCpy ${RESULT} 1
-        ${EndIf}
         ${ExitDo}
       ${EndIf}
     ${Loop}

@@ -43,10 +43,13 @@ fn explicit_root_enumeration_accepts_only_dot_entries() {
     assert!(check.contains("\"$1\" != \".\""));
     assert!(check.contains("\"$1\" != \"..\""));
     assert!(check.contains("$2 >= 512"));
-    assert!(check.contains("$1 == 2"));
-    assert!(check.contains("$1 != 18"));
+    assert!(check.contains("${IfNot} ${Errors}"));
+    let next = check.find("FindNext $0 $1").expect("missing FindNext");
+    assert!(check[next..].contains("${If} ${Errors}"));
     assert_eq!(check.matches("FindFirst").count(), 1);
     assert_eq!(check.matches("FindClose").count(), 1);
+    assert!(!check.contains("GetLastError"));
+    assert!(!check.contains("System::Call"));
     assert!(!check.contains("${FileExists}"));
 }
 
