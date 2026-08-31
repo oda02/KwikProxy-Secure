@@ -7,12 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Version 14 adds authenticated runtime-status and safe diagnostic queries
-/// to the hardened version 13 protocol:
-/// a new pipe identity, authenticated clients, no client-supplied paths and
-/// no remote self-shutdown command. Client and helper require an exact version
-/// match; upgrades are performed only by the per-machine installer.
-pub const PROTOCOL_VERSION: u32 = 14;
+/// Version 15 makes privileged runtime status resource-aware. The UI must not
+/// collapse a stopped child into a clean state while exact TUN-device or WFP
+/// cleanup is still pending. Client and helper require an exact version match;
+/// upgrades are performed only by the per-machine installer.
+pub const PROTOCOL_VERSION: u32 = 15;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -132,6 +131,9 @@ pub enum Response {
     },
     TunnelStatus {
         running: bool,
+        cleanup_pending: bool,
+        firewall_active: bool,
+        device_owned: bool,
     },
     /// Ошибка с описанием.
     Error {
@@ -147,7 +149,7 @@ impl Response {
     }
 }
 
-pub const PIPE_NAME: &str = r"\\.\pipe\KwikProxySecure.Helper.v14";
+pub const PIPE_NAME: &str = r"\\.\pipe\KwikProxySecure.Helper.v15";
 pub const SERVICE_NAME: &str = "KwikProxySecureHelper";
 pub const SERVICE_DISPLAY_NAME: &str = "KwikProxy Secure Helper";
 pub const SERVICE_DESCRIPTION: &str = "Protected TUN and kill-switch broker for KwikProxy Secure.";
@@ -198,8 +200,14 @@ mod tests {
             r#"{"cmd":"tunnel_status"}"#
         );
         assert_eq!(
-            serde_json::to_string(&Response::TunnelStatus { running: false }).unwrap(),
-            r#"{"result":"tunnel_status","running":false}"#
+            serde_json::to_string(&Response::TunnelStatus {
+                running: false,
+                cleanup_pending: true,
+                firewall_active: true,
+                device_owned: false,
+            })
+            .unwrap(),
+            r#"{"result":"tunnel_status","running":false,"cleanup_pending":true,"firewall_active":true,"device_owned":false}"#
         );
     }
 

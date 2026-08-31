@@ -299,7 +299,6 @@ async fn rollback_connect(
     mihomo_api: &vpn::MihomoApiState,
     ks_ctx: &KillSwitchState,
     proxy_attempt_id: &str,
-    expect_tunnel: bool,
     cleanup_helper: bool,
 ) -> Result<(), String> {
     vpn::diagnostics::record("connect_rollback", "started", "post_spawn_failure");
@@ -319,11 +318,17 @@ async fn rollback_connect(
             privileged_cleanup_verified = false;
         }
     }
-    if cleanup_helper && expect_tunnel {
+    if cleanup_helper {
         match platform::helper_client::tunnel_status().await {
-            Ok(false) => {}
-            Ok(true) => {
-                errors.push("protected Mihomo is still running after rollback".into());
+            Ok(status) if status.is_clear() => {}
+            Ok(status) => {
+                errors.push(format!(
+                    "protected cleanup remains active after rollback (running={}, cleanup_pending={}, firewall_active={}, device_owned={})",
+                    status.running,
+                    status.cleanup_pending,
+                    status.firewall_active,
+                    status.device_owned,
+                ));
                 privileged_cleanup_verified = false;
             }
             Err(error) => {
@@ -358,6 +363,39 @@ async fn rollback_connect(
         Ok(())
     } else {
         vpn::diagnostics::record("connect_rollback", "error", "cleanup_incomplete");
+        Err(errors.join("; "))
+    }
+}
+
+async fn reconcile_privileged_before_tunnel_start() -> Result<(), String> {
+    let before = platform::helper_client::tunnel_status()
+        .await
+        .map_err(|error| format!("query protected preflight status: {error:#}"))?;
+    if before.is_clear() {
+        return Ok(());
+    }
+
+    let mut errors = Vec::new();
+    if let Err(error) = platform::helper_client::mihomo_stop().await {
+        errors.push(format!("stop previous protected Mihomo: {error:#}"));
+    }
+    if let Err(error) = platform::helper_client::kill_switch_disable().await {
+        errors.push(format!("disable previous protected kill switch: {error:#}"));
+    }
+    match platform::helper_client::tunnel_status().await {
+        Ok(status) if status.is_clear() => {}
+        Ok(status) => errors.push(format!(
+            "protected preflight remains non-idle (running={}, cleanup_pending={}, firewall_active={}, device_owned={})",
+            status.running,
+            status.cleanup_pending,
+            status.firewall_active,
+            status.device_owned,
+        )),
+        Err(error) => errors.push(format!("verify protected preflight cleanup: {error:#}")),
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
         Err(errors.join("; "))
     }
 }
@@ -441,6 +479,7 @@ pub async fn connect(
     ks_ctx: State<'_, KillSwitchState>,
     routing_store: State<'_, crate::config::routing_store::RoutingStoreState>,
 ) -> Result<ConnectResult, String> {
+    let _lifecycle = platform::lifecycle::enter().await?;
     vpn::diagnostics::record("connect", "started", "request_received");
     // Долг: TUN 15-секундная задержка первого запроса. Включаем
     // подробное timing-логирование connect-flow чтобы видеть где
@@ -454,13 +493,36 @@ pub async fn connect(
     };
     stamp("start");
 
+    platform::helper_bootstrap::ensure_running()
+        .await
+        .map_err(|error| format!("helper-сервис недоступен: {error}"))?;
+    if mode == "tun" {
+        reconcile_privileged_before_tunnel_start().await?;
+    } else {
+        let status = platform::helper_client::tunnel_status()
+            .await
+            .map_err(|error| format!("protected runtime status is unknown: {error:#}"))?;
+        if status.is_active_or_pending() {
+            return Err(format!(
+                "protected runtime must be disconnected before proxy connect (running={}, cleanup_pending={}, firewall_active={}, device_owned={})",
+                status.running,
+                status.cleanup_pending,
+                status.firewall_active,
+                status.device_owned,
+            ));
+        }
+    }
+
     // Pre-flight self-healing: если в системе остались наши orphan'ы от
     // упавшей сессии (системный прокси указывает на наш диапазон портов
     // или есть half-default routes), молча чистим перед connect. Иначе
     // следующий xray встретит «сломанную» среду и сам сломается.
-    if platform::proxy::is_proxy_pointing_to_us() {
-        platform::proxy::restore_pending_owned_proxy()
-            .map_err(|error| format!("restore previous proxy publication: {error:#}"))?;
+    if platform::proxy::has_pending_backup() {
+        match platform::proxy::restore_pending_owned_proxy() {
+            Ok(true) => {}
+            Ok(false) => return Err("previous owned proxy publication disappeared".into()),
+            Err(error) => return Err(format!("restore previous proxy publication: {error:#}")),
+        }
         stamp("preflight: restored orphan proxy backup");
     }
 
@@ -630,26 +692,16 @@ pub async fn connect(
         // просто tun_mode (а не только mihomo-profile).
         let builtin_tun = tun_mode;
         if builtin_tun {
-            // Гарантируем что helper доступен и нужной версии
-            if let Err(e) = platform::helper_bootstrap::ensure_running().await {
-                return Err(format!("helper-сервис недоступен: {e}"));
-            }
-            // Перед стартом — гасим helper-mihomo и Tauri-mihomo если
-            // что-то осталось от прошлой сессии.
-            let _ = platform::helper_client::mihomo_stop().await;
-            let _ = mihomo.stop();
+            // The helper was already reconciled before any engine spawn.
+            mihomo
+                .stop()
+                .map_err(|error| format!("stop previous local Mihomo: {error}"))?;
 
             if let Err(error) = platform::helper_client::start_tunnel(cfg.yaml.clone(), lan).await {
                 vpn::diagnostics::record("tun_readiness", "error", "helper_rejected");
-                let rollback = rollback_connect(
-                    &mihomo,
-                    &mihomo_api,
-                    &ks_ctx,
-                    &proxy_attempt_id,
-                    tun_mode,
-                    tun_mode,
-                )
-                .await;
+                let rollback =
+                    rollback_connect(&mihomo, &mihomo_api, &ks_ctx, &proxy_attempt_id, tun_mode)
+                        .await;
                 return Err(append_rollback_error(
                     format!("helper.start_tunnel: {error}"),
                     rollback,
@@ -668,7 +720,6 @@ pub async fn connect(
                         &ks_ctx,
                         &proxy_attempt_id,
                         tun_mode,
-                        tun_mode,
                     )
                     .await;
                     return Err(append_rollback_error(message, rollback));
@@ -682,15 +733,8 @@ pub async fn connect(
                 .await
             {
                 vpn::diagnostics::record("proxy_readiness", "error", "sidecar_not_ready");
-                let rollback = rollback_connect(
-                    &mihomo,
-                    &mihomo_api,
-                    &ks_ctx,
-                    &proxy_attempt_id,
-                    tun_mode,
-                    false,
-                )
-                .await;
+                let rollback =
+                    rollback_connect(&mihomo, &mihomo_api, &ks_ctx, &proxy_attempt_id, false).await;
                 return Err(append_rollback_error(error, rollback));
             }
         }
@@ -714,15 +758,8 @@ pub async fn connect(
                 mihomo.set_system_proxy_if_running(socks_port, http_port, &proxy_attempt_id)
             {
                 vpn::diagnostics::record("system_proxy", "error", "publication_failed");
-                let rollback = rollback_connect(
-                    &mihomo,
-                    &mihomo_api,
-                    &ks_ctx,
-                    &proxy_attempt_id,
-                    tun_mode,
-                    false,
-                )
-                .await;
+                let rollback =
+                    rollback_connect(&mihomo, &mihomo_api, &ks_ctx, &proxy_attempt_id, false).await;
                 return Err(append_rollback_error(error, rollback));
             }
             vpn::diagnostics::record("system_proxy", "ok", "published");
@@ -735,15 +772,8 @@ pub async fn connect(
             stamp("tun: built-in TUN — движок сам поднимает WinTUN-адаптер");
         }
         other => {
-            let rollback = rollback_connect(
-                &mihomo,
-                &mihomo_api,
-                &ks_ctx,
-                &proxy_attempt_id,
-                tun_mode,
-                tun_mode,
-            )
-            .await;
+            let rollback =
+                rollback_connect(&mihomo, &mihomo_api, &ks_ctx, &proxy_attempt_id, tun_mode).await;
             return Err(append_rollback_error(
                 format!("неизвестный режим: {other}"),
                 rollback,
@@ -771,15 +801,9 @@ pub async fn connect(
             if server_host.parse::<std::net::IpAddr>().is_ok() {
                 // ОК
             } else {
-                let rollback = rollback_connect(
-                    &mihomo,
-                    &mihomo_api,
-                    &ks_ctx,
-                    &proxy_attempt_id,
-                    tun_mode,
-                    tun_mode,
-                )
-                .await;
+                let rollback =
+                    rollback_connect(&mihomo, &mihomo_api, &ks_ctx, &proxy_attempt_id, tun_mode)
+                        .await;
                 return Err(append_rollback_error(
                     format!("kill switch: не удалось резолвить server_host={server_host}"),
                     rollback,
@@ -796,15 +820,8 @@ pub async fn connect(
         // — у нас не было ensure_running).
         if !tun_mode {
             if let Err(e) = platform::helper_bootstrap::ensure_running().await {
-                let rollback = rollback_connect(
-                    &mihomo,
-                    &mihomo_api,
-                    &ks_ctx,
-                    &proxy_attempt_id,
-                    tun_mode,
-                    false,
-                )
-                .await;
+                let rollback =
+                    rollback_connect(&mihomo, &mihomo_api, &ks_ctx, &proxy_attempt_id, false).await;
                 return Err(append_rollback_error(
                     format!("kill switch: helper-сервис недоступен: {e}"),
                     rollback,
@@ -838,15 +855,8 @@ pub async fn connect(
         {
             // При ошибке откатываем всё — интернет НЕ должен оставаться
             // в полу-заблокированном состоянии.
-            let rollback = rollback_connect(
-                &mihomo,
-                &mihomo_api,
-                &ks_ctx,
-                &proxy_attempt_id,
-                tun_mode,
-                true,
-            )
-            .await;
+            let rollback =
+                rollback_connect(&mihomo, &mihomo_api, &ks_ctx, &proxy_attempt_id, true).await;
             return Err(append_rollback_error(
                 format!("kill switch не поднялся: {e}"),
                 rollback,
@@ -911,10 +921,16 @@ pub async fn disconnect(
     mihomo_api: State<'_, vpn::MihomoApiState>,
     ks_ctx: State<'_, KillSwitchState>,
 ) -> Result<(), String> {
+    let _lifecycle = platform::lifecycle::enter().await?;
     let helper_owned = mihomo.helper_spawned();
     let firewall_owned = ks_ctx.0.lock().await.is_some();
-    let reconcile_privileged =
-        helper_owned || firewall_owned || mihomo.privileged_cleanup_uncertain();
+    let initial_status = platform::helper_client::tunnel_status()
+        .await
+        .map_err(|error| format!("protected disconnect status is unknown: {error:#}"))?;
+    let reconcile_privileged = initial_status.is_active_or_pending()
+        || helper_owned
+        || firewall_owned
+        || mihomo.privileged_cleanup_uncertain();
     if reconcile_privileged {
         let mut errors = Vec::new();
         if let Err(error) = platform::helper_client::mihomo_stop().await {
@@ -923,12 +939,16 @@ pub async fn disconnect(
         if let Err(error) = platform::helper_client::kill_switch_disable().await {
             errors.push(format!("disable kill switch: {error:#}"));
         }
-        if helper_owned {
-            match platform::helper_client::tunnel_status().await {
-                Ok(false) => {}
-                Ok(true) => errors.push("protected Mihomo is still running".into()),
-                Err(error) => errors.push(format!("verify protected Mihomo stopped: {error:#}")),
-            }
+        match platform::helper_client::tunnel_status().await {
+            Ok(status) if status.is_clear() => {}
+            Ok(status) => errors.push(format!(
+                "protected cleanup remains active (running={}, cleanup_pending={}, firewall_active={}, device_owned={})",
+                status.running,
+                status.cleanup_pending,
+                status.firewall_active,
+                status.device_owned,
+            )),
+            Err(error) => errors.push(format!("verify protected Mihomo stopped: {error:#}")),
         }
         if !errors.is_empty() {
             mihomo.mark_helper_spawned(true);
@@ -973,47 +993,55 @@ pub async fn disconnect(
 /// Запущен ли VPN-движок (Mihomo) прямо сейчас.
 ///
 /// Имя оставлено `is_xray_running` для совместимости с фронтом —
-/// возвращает true если движок Mihomo запущен. Семантика «работает ли
-/// VPN», не привязка к конкретному ядру.
+/// возвращает true если движок Mihomo запущен или privileged cleanup ещё
+/// pending. Ошибка helper transport/auth возвращается как rejected IPC
+/// Result, а не маскируется под `false`.
 #[tauri::command]
 pub async fn is_xray_running(
     mihomo: State<'_, MihomoState>,
     mihomo_api: State<'_, vpn::MihomoApiState>,
-) -> bool {
+) -> Result<bool, String> {
     if !mihomo.helper_spawned() && mihomo.is_running() {
         // A tracked user-side sidecar needs no privileged round trip.
-        return true;
+        return Ok(true);
     }
     match platform::helper_client::tunnel_status().await {
-        Ok(true) => {
+        Ok(status) if status.is_active_or_pending() => {
             // Also adopts a protected child left by a previous UI process:
             // in-memory ownership markers do not survive a UI crash/restart.
             mihomo.mark_helper_spawned(true);
-            vpn::diagnostics::record("tun_child", "ok", "running_reconciled");
-            true
+            mihomo.mark_privileged_cleanup_uncertain(status.cleanup_pending);
+            vpn::diagnostics::record(
+                "tun_child",
+                if status.cleanup_pending {
+                    "error"
+                } else {
+                    "ok"
+                },
+                if status.cleanup_pending {
+                    "cleanup_pending"
+                } else {
+                    "running_reconciled"
+                },
+            );
+            Ok(true)
         }
-        Ok(false) if mihomo.privileged_cleanup_uncertain() => {
-            vpn::diagnostics::record("privileged_state", "error", "cleanup_unverified");
-            true
-        }
-        Ok(false) => {
+        Ok(_) => {
             mihomo.mark_helper_spawned(false);
+            mihomo.mark_privileged_cleanup_uncertain(false);
             mihomo_api.clear();
             vpn::diagnostics::record("tun_child", "error", "not_running");
-            false
+            Ok(false)
         }
-        Err(_) if mihomo.helper_spawned() || mihomo.privileged_cleanup_uncertain() => {
-            // Transport failure is unknown, never proof that tracked
-            // privileged state stopped.
-            mihomo.mark_privileged_cleanup_uncertain(true);
+        Err(error) => {
+            // A fresh UI has no durable in-process marker. Transport/auth
+            // failure therefore remains an explicit unknown error, never a
+            // false stopped result that would permit a new connect.
+            if mihomo.helper_spawned() || mihomo.privileged_cleanup_uncertain() {
+                mihomo.mark_privileged_cleanup_uncertain(true);
+            }
             vpn::diagnostics::record("tun_child", "error", "status_unknown");
-            true
-        }
-        Err(_) => {
-            // No local process and no ownership evidence. Helper
-            // unavailability alone must not make every fresh launch look
-            // connected.
-            false
+            Err(format!("protected tunnel status is unknown: {error:#}"))
         }
     }
 }
@@ -1076,6 +1104,13 @@ pub async fn recover_network() -> RecoveryReport {
         orphan_resources_cleaned: false,
         system_proxy_cleared: false,
         errors: Vec::new(),
+    };
+    let _lifecycle = match platform::lifecycle::enter().await {
+        Ok(guard) => guard,
+        Err(error) => {
+            report.errors.push(error);
+            return report;
+        }
     };
 
     // Helper нужен для шагов 1+2. Если не доступен — пропускаем их и
@@ -1279,6 +1314,7 @@ pub async fn kill_switch_apply(
     force_disable_ipv6: Option<bool>,
     ks_ctx: State<'_, KillSwitchState>,
 ) -> Result<(), String> {
+    let _lifecycle = platform::lifecycle::enter().await?;
     // Обновляем поля в контексте если фронт прислал новые значения.
     {
         let mut g = ks_ctx.0.lock().await;
@@ -1376,7 +1412,8 @@ pub fn hide_floating_window(app: tauri::AppHandle) -> Result<(), String> {
 /// Восстановить системный прокси из backup-файла (после краша приложения
 /// в режиме proxy). Удаляет backup-файл после успеха.
 #[tauri::command]
-pub fn restore_proxy_backup() -> Result<(), String> {
+pub async fn restore_proxy_backup() -> Result<(), String> {
+    let _lifecycle = platform::lifecycle::enter().await?;
     platform::proxy::restore_pending_owned_proxy()
         .and_then(|restored| {
             if restored {
@@ -1391,8 +1428,9 @@ pub fn restore_proxy_backup() -> Result<(), String> {
 /// Отбросить backup без применения (пользователь в диалоге выбрал
 /// «не восстанавливать»). Текущее состояние реестра остаётся как есть.
 #[tauri::command]
-pub fn discard_proxy_backup() {
-    platform::proxy::discard_backup();
+pub async fn discard_proxy_backup() -> Result<(), String> {
+    let _lifecycle = platform::lifecycle::enter().await?;
+    platform::proxy::discard_backup().map_err(|error| error.to_string())
 }
 
 // ─── Secure storage (6.A — Credential Manager) ────────────────────────────────

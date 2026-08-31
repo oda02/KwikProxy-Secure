@@ -570,7 +570,9 @@ fn service_loop() -> Result<()> {
                 super::firewall::cleanup_on_startup()
                     .await
                     .context("startup WFP cleanup")?;
-                super::tun::cleanup_orphan_resources().await;
+                super::tun::cleanup_orphan_resources()
+                    .await
+                    .context("startup exact-prefix TUN cleanup")?;
                 Ok::<(), anyhow::Error>(())
             })
             .await

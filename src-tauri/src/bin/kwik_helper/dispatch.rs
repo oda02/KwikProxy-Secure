@@ -85,19 +85,17 @@ impl BrokerState {
     }
 
     fn release_if_idle(&mut self) {
-        if self
-            .owner
-            .as_ref()
-            .is_some_and(|owner| !owner.tunnel_active && !owner.firewall_active)
-        {
+        if self.owner.as_ref().is_some_and(|owner| {
+            !owner.tunnel_active && !owner.firewall_active && owner.tun_device.is_none()
+        }) {
             self.owner = None;
         }
     }
 
     fn any_active(&self) -> bool {
-        self.owner
-            .as_ref()
-            .is_some_and(|owner| owner.tunnel_active || owner.firewall_active)
+        self.owner.as_ref().is_some_and(|owner| {
+            owner.tunnel_active || owner.firewall_active || owner.tun_device.is_some()
+        })
     }
 
     fn note_tunnel_exit(
@@ -106,19 +104,34 @@ impl BrokerState {
         session_id: u32,
         pid: u32,
         instance_id: &str,
-    ) -> Option<bool> {
-        let owner = self.owner.as_mut()?;
+    ) -> bool {
+        let Some(owner) = self.owner.as_mut() else {
+            return false;
+        };
         if !owner.matches(generation, session_id)
             || owner.tunnel_pid != Some(pid)
             || owner.tunnel_instance_id.as_deref() != Some(instance_id)
         {
-            return None;
+            return false;
         }
         owner.tunnel_active = false;
-        owner.tun_device = None;
         owner.tunnel_pid = None;
         owner.tunnel_instance_id = None;
-        Some(owner.firewall_active)
+        true
+    }
+
+    fn runtime_status(&self, running: bool) -> (bool, bool, bool) {
+        let firewall_active = self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.firewall_active);
+        let device_owned = self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.tun_device.is_some());
+        let tunnel_marked = self.owner.as_ref().is_some_and(|owner| owner.tunnel_active);
+        let cleanup_pending = !running && (tunnel_marked || firewall_active || device_owned);
+        (cleanup_pending, firewall_active, device_owned)
     }
 }
 
@@ -145,9 +158,20 @@ pub async fn handle(
         Request::ReadDiagnostics => Response::Diagnostics {
             text: super::helper_log::recent_structured(16 * 1024).unwrap_or_default(),
         },
-        Request::TunnelStatus => Response::TunnelStatus {
-            running: mihomo::is_running().await,
-        },
+        Request::TunnelStatus => {
+            let running = mihomo::is_running().await;
+            let state = broker().lock().await;
+            if let Err(error) = state.verify_if_active(installation, client.session_id) {
+                return Response::err(error.to_string());
+            }
+            let (cleanup_pending, firewall_active, device_owned) = state.runtime_status(running);
+            Response::TunnelStatus {
+                running,
+                cleanup_pending,
+                firewall_active,
+                device_owned,
+            }
+        }
         request => {
             let mut state = broker().lock().await;
             handle_mutating(request, installation, client, &mut state).await
@@ -260,8 +284,7 @@ async fn handle_mutating(
                     "orphan cleanup is disabled while privileged state is active"
                 ))
             } else {
-                super::tun::cleanup_orphan_resources().await;
-                Ok(())
+                super::tun::cleanup_orphan_resources().await
             }
         }
         Request::StartTunnel {
@@ -271,16 +294,47 @@ async fn handle_mutating(
             if let Err(error) = state.bind_or_verify(installation, client.session_id, client.pid) {
                 return Response::err(error.to_string());
             }
-            mihomo::start(&config_yaml, allow_lan, installation, client.session_id)
-                .await
-                .map(|started| {
+            if state.any_active() {
+                return Response::err(
+                    "privileged tunnel/device/firewall state must be fully reconciled before start",
+                );
+            }
+            let exact_device = match mihomo::validated_tun_device(&config_yaml, allow_lan) {
+                Ok(device) => device,
+                Err(error) => {
+                    state.release_if_idle();
+                    return Response::err(format!("privileged config rejected: {error:#}"));
+                }
+            };
+            if let Some(owner) = state.owner.as_mut() {
+                // Record the cleanup obligation before spawn. Any failure is
+                // reconciled against this exact reserved alias.
+                owner.tun_device = Some(exact_device.clone());
+            }
+            match mihomo::start(&config_yaml, allow_lan, installation, client.session_id).await {
+                Ok(started) => {
+                    debug_assert_eq!(started.tun_device, exact_device);
                     if let Some(owner) = state.owner.as_mut() {
                         owner.tunnel_active = true;
                         owner.tun_device = Some(started.tun_device);
                         owner.tunnel_pid = Some(started.pid);
                         owner.tunnel_instance_id = Some(started.instance_id);
                     }
-                })
+                    Ok(())
+                }
+                Err(start_error) => match super::tun::cleanup_owned_device(&exact_device).await {
+                    Ok(()) => {
+                        if let Some(owner) = state.owner.as_mut() {
+                            owner.tun_device = None;
+                        }
+                        state.release_if_idle();
+                        Err(start_error)
+                    }
+                    Err(cleanup_error) => Err(anyhow!(
+                        "tunnel start failed ({start_error:#}); exact device cleanup remains pending ({cleanup_error:#})"
+                    )),
+                },
+            }
         }
         Request::MihomoStop => {
             if let Err(error) = state.verify_if_active(installation, client.session_id) {
@@ -292,16 +346,18 @@ async fn handle_mutating(
                 .and_then(|owner| owner.tun_device.clone());
             match mihomo::stop_owned(client.session_id, &installation.generation).await {
                 Ok(()) => {
+                    if let Some(owner) = state.owner.as_mut() {
+                        owner.tunnel_active = false;
+                        owner.tunnel_pid = None;
+                        owner.tunnel_instance_id = None;
+                    }
                     if let Some(device) = device.as_deref() {
                         if let Err(error) = super::tun::cleanup_owned_device(device).await {
                             return Response::err(format!("owned TUN cleanup: {error:#}"));
                         }
                     }
                     if let Some(owner) = state.owner.as_mut() {
-                        owner.tunnel_active = false;
                         owner.tun_device = None;
-                        owner.tunnel_pid = None;
-                        owner.tunnel_instance_id = None;
                     }
                     state.release_if_idle();
                     Ok(())
@@ -336,10 +392,29 @@ pub async fn on_tunnel_process_exit(
     instance_id: &str,
 ) {
     let mut state = broker().lock().await;
-    let Some(firewall_active) = state.note_tunnel_exit(generation, session_id, pid, instance_id)
-    else {
+    if !state.note_tunnel_exit(generation, session_id, pid, instance_id) {
         return;
-    };
+    }
+    let device = state
+        .owner
+        .as_ref()
+        .and_then(|owner| owner.tun_device.clone());
+    if let Some(device) = device.as_deref() {
+        match super::tun::cleanup_owned_device(device).await {
+            Ok(()) => {
+                if let Some(owner) = state.owner.as_mut() {
+                    owner.tun_device = None;
+                }
+            }
+            Err(_) => hlog(
+                "[helper-dispatch] stage=child_exit_device_cleanup outcome=error code=cleanup_failed",
+            ),
+        }
+    }
+    let firewall_active = state
+        .owner
+        .as_ref()
+        .is_some_and(|owner| owner.firewall_active);
     if firewall_active {
         match firewall::disable().await {
             Ok(()) => {
@@ -364,13 +439,38 @@ pub async fn shutdown_cleanup() -> Result<()> {
         .as_ref()
         .and_then(|owner| owner.tun_device.clone());
     let mihomo_result = mihomo::stop().await;
-    let firewall_result = firewall::disable().await;
-    if let Some(device) = device.as_deref() {
-        super::tun::cleanup_owned_device(device).await?;
+    if mihomo_result.is_ok() {
+        if let Some(owner) = state.owner.as_mut() {
+            owner.tunnel_active = false;
+            owner.tunnel_pid = None;
+            owner.tunnel_instance_id = None;
+        }
     }
-    state.owner = None;
+    let firewall_result = firewall::disable().await;
+    if firewall_result.is_ok() {
+        if let Some(owner) = state.owner.as_mut() {
+            owner.firewall_active = false;
+        }
+    }
+    let device_result = if mihomo_result.is_ok() {
+        match device.as_deref() {
+            Some(device) => super::tun::cleanup_owned_device(device).await,
+            None => Ok(()),
+        }
+    } else {
+        Err(anyhow!(
+            "device cleanup blocked because Mihomo stop was not verified"
+        ))
+    };
+    if device_result.is_ok() {
+        if let Some(owner) = state.owner.as_mut() {
+            owner.tun_device = None;
+        }
+    }
+    state.release_if_idle();
     mihomo_result.context("stop Mihomo during service shutdown")?;
     firewall_result.context("disable WFP during service shutdown")?;
+    device_result.context("remove owned TUN during service shutdown")?;
     Ok(())
 }
 
@@ -414,34 +514,35 @@ mod tests {
         assert!(state.owner.is_some());
         state.owner.as_mut().unwrap().tunnel_active = false;
         state.release_if_idle();
+        assert!(state.owner.is_some());
+        state.owner.as_mut().unwrap().tun_device = None;
+        state.release_if_idle();
         assert!(state.owner.is_none());
     }
 
     #[test]
     fn spontaneous_exit_clears_only_matching_tunnel_owner() {
         let mut state = state();
-        assert_eq!(
-            state.note_tunnel_exit("generation-b", 7, 701, "instance-a"),
-            None
-        );
+        assert!(!state.note_tunnel_exit("generation-b", 7, 701, "instance-a"));
         assert!(state.owner.as_ref().unwrap().tunnel_active);
-        assert_eq!(
-            state.note_tunnel_exit("generation-a", 7, 701, "instance-a"),
-            Some(false)
-        );
+        assert!(state.note_tunnel_exit("generation-a", 7, 701, "instance-a"));
         assert!(!state.owner.as_ref().unwrap().tunnel_active);
-        assert!(state.owner.as_ref().unwrap().tun_device.is_none());
+        assert_eq!(
+            state.owner.as_ref().unwrap().tun_device.as_deref(),
+            Some("kwikproxy-secure-owned")
+        );
+        let (cleanup_pending, firewall_active, device_owned) = state.runtime_status(false);
+        assert!(cleanup_pending);
+        assert!(!firewall_active);
+        assert!(device_owned);
         state.release_if_idle();
-        assert!(state.owner.is_none());
+        assert!(state.owner.is_some());
     }
 
     #[test]
     fn stale_same_session_monitor_cannot_clear_replacement() {
         let mut state = state();
-        assert_eq!(
-            state.note_tunnel_exit("generation-a", 7, 700, "instance-old"),
-            None
-        );
+        assert!(!state.note_tunnel_exit("generation-a", 7, 700, "instance-old"));
         assert!(state.owner.as_ref().unwrap().tunnel_active);
         assert!(state.owner.as_ref().unwrap().firewall_active == false);
     }

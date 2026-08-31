@@ -6,7 +6,9 @@
 //! Backup/restore (9.D): перед перезаписью значений мы сохраняем оригиналы
 //! `ProxyEnable` / `ProxyServer` / `ProxyOverride` в JSON-файл
 //! `%LOCALAPPDATA%\KwikProxy Secure\proxy_backup.json`. Restore requires the
-//! exact attempt token and complete published registry write-set. Если приложение
+//! exact attempt token; every field must still equal either that attempt's
+//! publication or its saved original. This makes interrupted per-field restore
+//! retryable without granting authority over foreign changes. Если приложение
 //! крашнется в режиме proxy и не успеет очистить — на старте next-run-а мы
 //! детектим backup-файл и предлагаем пользователю восстановить.
 
@@ -39,6 +41,27 @@ fn exact_write_set_matches(
         && proxy_enable == Some(1)
         && proxy_server == Some(expected_server)
         && proxy_override == Some(expected_override)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailedPublicationField {
+    AlreadyOriginal,
+    RestoreOwnedValue,
+    ForeignConflict,
+}
+
+fn classify_failed_publication_field<T: PartialEq>(
+    current: &Option<T>,
+    original: &Option<T>,
+    published: &Option<T>,
+) -> FailedPublicationField {
+    if current == original {
+        FailedPublicationField::AlreadyOriginal
+    } else if current == published {
+        FailedPublicationField::RestoreOwnedValue
+    } else {
+        FailedPublicationField::ForeignConflict
+    }
 }
 
 /// Снимок настроек системного прокси для backup/restore.
@@ -109,10 +132,15 @@ fn save_backup(backup: &ProxyBackup) -> Result<()> {
     Ok(())
 }
 
-/// Удалить backup-файл (best-effort). Вызывается после успешного restore.
-fn delete_backup() {
-    if let Some(path) = backup_path() {
-        let _ = std::fs::remove_file(path);
+/// Удалить ownership marker только после подтверждённого restore. Ошибка
+/// удаления fail-closed: оставшийся marker нельзя выдавать за завершённый
+/// cleanup, иначе следующая публикация окажется заблокирована неожиданно.
+fn delete_backup() -> Result<()> {
+    let path = backup_path().context("LOCALAPPDATA is unavailable")?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove proxy ownership backup"),
     }
 }
 
@@ -174,12 +202,11 @@ pub fn set_system_proxy_owned(socks_port: u16, http_port: u16, attempt_id: &str)
             notify_proxy_settings_changed()
         })();
         if let Err(publication_error) = publication {
-            if let Err(restore_error) = apply_backup(&snapshot) {
+            if let Err(restore_error) = restore_owned_publication(&snapshot, Some(attempt_id)) {
                 anyhow::bail!(
                     "proxy publication failed ({publication_error:#}); immediate restore also failed ({restore_error:#})"
                 );
             }
-            delete_backup();
             return Err(publication_error);
         }
 
@@ -193,6 +220,116 @@ pub fn set_system_proxy_owned(socks_port: u16, http_port: u16, attempt_id: &str)
     }
 }
 
+#[cfg(windows)]
+fn restore_owned_publication(backup: &ProxyBackup, expected_attempt: Option<&str>) -> Result<bool> {
+    let attempt = backup
+        .attempt_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .context("proxy backup has no exact attempt ownership token")?;
+    if expected_attempt.is_some_and(|expected| expected != attempt) {
+        return Ok(false);
+    }
+    let published_server = backup
+        .published_proxy_server
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .context("proxy backup has no exact published value")?;
+    let published_override = backup
+        .published_proxy_override
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .context("proxy backup has no exact published bypass value")?;
+
+    let current = read_current_proxy_state()?;
+    let published_enable = Some(1u32);
+    let published_server = Some(published_server.to_string());
+    let published_override = Some(published_override.to_string());
+    let enable_action = classify_failed_publication_field(
+        &current.proxy_enable,
+        &backup.proxy_enable,
+        &published_enable,
+    );
+    let server_action = classify_failed_publication_field(
+        &current.proxy_server,
+        &backup.proxy_server,
+        &published_server,
+    );
+    let override_action = classify_failed_publication_field(
+        &current.proxy_override,
+        &backup.proxy_override,
+        &published_override,
+    );
+    if [enable_action, server_action, override_action]
+        .contains(&FailedPublicationField::ForeignConflict)
+    {
+        anyhow::bail!("system proxy changed concurrently; refusing to overwrite foreign state");
+    }
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu
+        .create_subkey(INET_SETTINGS)
+        .context("open Internet Settings for owned partial restore")?;
+
+    // Revalidate each owned field immediately before its write. Registry has
+    // no compare-and-swap primitive, so no field is touched based only on the
+    // earlier multi-field snapshot.
+    if enable_action == FailedPublicationField::RestoreOwnedValue {
+        if read_proxy_enable() != published_enable {
+            anyhow::bail!("ProxyEnable changed during owned partial restore");
+        }
+        match backup.proxy_enable {
+            Some(value) => key
+                .set_value("ProxyEnable", &value)
+                .context("restore ProxyEnable")?,
+            None => key
+                .delete_value("ProxyEnable")
+                .context("remove owned ProxyEnable")?,
+        }
+    }
+    if server_action == FailedPublicationField::RestoreOwnedValue {
+        if read_proxy_server() != published_server {
+            anyhow::bail!("ProxyServer changed during owned partial restore");
+        }
+        match &backup.proxy_server {
+            Some(value) => key
+                .set_value("ProxyServer", value)
+                .context("restore ProxyServer")?,
+            None => key
+                .delete_value("ProxyServer")
+                .context("remove owned ProxyServer")?,
+        }
+    }
+    if override_action == FailedPublicationField::RestoreOwnedValue {
+        if read_proxy_override() != published_override {
+            anyhow::bail!("ProxyOverride changed during owned partial restore");
+        }
+        match &backup.proxy_override {
+            Some(value) => key
+                .set_value("ProxyOverride", value)
+                .context("restore ProxyOverride")?,
+            None => key
+                .delete_value("ProxyOverride")
+                .context("remove owned ProxyOverride")?,
+        }
+    }
+    // A partial previous attempt may already have restored one or more
+    // fields. Verify that the complete write-set is now exactly original
+    // before releasing the durable ownership marker.
+    let restored = read_current_proxy_state()?;
+    if restored.proxy_enable != backup.proxy_enable
+        || restored.proxy_server != backup.proxy_server
+        || restored.proxy_override != backup.proxy_override
+    {
+        anyhow::bail!("system proxy restore did not reach the exact original write-set");
+    }
+    // Always retry notification, including a later invocation after a prior
+    // restore wrote the original registry values but WinINet refresh failed.
+    notify_proxy_settings_changed()?;
+    delete_backup()?;
+    Ok(true)
+}
+
 /// Roll back only the system-proxy publication owned by `attempt_id`.
 /// Absence or a different/legacy marker is a successful no-op.
 pub fn clear_system_proxy_owned(attempt_id: &str) -> Result<bool> {
@@ -201,7 +338,7 @@ pub fn clear_system_proxy_owned(attempt_id: &str) -> Result<bool> {
         let Some(backup) = read_backup() else {
             return Ok(false);
         };
-        restore_validated_backup(&backup, Some(attempt_id))
+        restore_owned_publication(&backup, Some(attempt_id))
     }
     #[cfg(not(windows))]
     {
@@ -219,48 +356,12 @@ pub fn restore_pending_owned_proxy() -> Result<bool> {
         let Some(backup) = read_backup() else {
             return Ok(false);
         };
-        restore_validated_backup(&backup, None)
+        restore_owned_publication(&backup, None)
     }
     #[cfg(not(windows))]
     {
         Ok(false)
     }
-}
-
-#[cfg(windows)]
-fn restore_validated_backup(backup: &ProxyBackup, expected_attempt: Option<&str>) -> Result<bool> {
-    let attempt = backup
-        .attempt_id
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .context("proxy backup has no exact attempt ownership token")?;
-    if expected_attempt.is_some_and(|expected| expected != attempt) {
-        return Ok(false);
-    }
-    let published = backup
-        .published_proxy_server
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .context("proxy backup has no exact published value")?;
-    let published_override = backup
-        .published_proxy_override
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .context("proxy backup has no exact published bypass value")?;
-    if !exact_write_set_matches(
-        published,
-        published_override,
-        read_proxy_enable(),
-        read_proxy_server().as_deref(),
-        read_proxy_override().as_deref(),
-    ) {
-        anyhow::bail!(
-            "system proxy no longer equals this attempt's exact publication; refusing to overwrite foreign state"
-        );
-    }
-    apply_backup(backup)?;
-    delete_backup();
-    Ok(true)
 }
 
 #[cfg(windows)]
@@ -358,45 +459,8 @@ pub fn is_proxy_pointing_to_us() -> bool {
 /// пользователь в диалоге crash-recovery нажимает «не восстанавливать»
 /// (значит наши значения он уже не считает актуальными — продолжаем
 /// с текущим состоянием реестра).
-pub fn discard_backup() {
-    delete_backup();
-}
-
-/// Применить значения из backup'а к реестру. Если оригинальное значение
-/// было None (ключа не существовало) — удаляем ключ из реестра.
-#[cfg(windows)]
-fn apply_backup(backup: &ProxyBackup) -> Result<()> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let (key, _) = hkcu
-        .create_subkey(INET_SETTINGS)
-        .context("не удалось открыть Internet Settings в реестре")?;
-
-    match backup.proxy_enable {
-        Some(v) => {
-            key.set_value("ProxyEnable", &v).context("ProxyEnable")?;
-        }
-        None => {
-            let _ = key.delete_value("ProxyEnable");
-        }
-    }
-    match &backup.proxy_server {
-        Some(s) => {
-            key.set_value("ProxyServer", s).context("ProxyServer")?;
-        }
-        None => {
-            let _ = key.delete_value("ProxyServer");
-        }
-    }
-    match &backup.proxy_override {
-        Some(s) => {
-            key.set_value("ProxyOverride", s).context("ProxyOverride")?;
-        }
-        None => {
-            let _ = key.delete_value("ProxyOverride");
-        }
-    }
-    notify_proxy_settings_changed()?;
-    Ok(())
+pub fn discard_backup() -> Result<()> {
+    delete_backup()
 }
 
 #[cfg(test)]
@@ -459,5 +523,43 @@ mod tests {
             Some(server),
             Some(bypass),
         ));
+    }
+
+    #[test]
+    fn failed_publication_restores_only_original_or_exact_owned_values() {
+        assert_eq!(
+            classify_failed_publication_field(&Some(0), &Some(0), &Some(1)),
+            FailedPublicationField::AlreadyOriginal
+        );
+        assert_eq!(
+            classify_failed_publication_field(&Some(1), &Some(0), &Some(1)),
+            FailedPublicationField::RestoreOwnedValue
+        );
+        assert_eq!(
+            classify_failed_publication_field(&Some(2), &Some(0), &Some(1)),
+            FailedPublicationField::ForeignConflict
+        );
+    }
+
+    #[test]
+    fn interrupted_fieldwise_restore_remains_retryable() {
+        let actions = [
+            classify_failed_publication_field(&Some(0), &Some(0), &Some(1)),
+            classify_failed_publication_field(&Some("owned"), &Some("original"), &Some("owned")),
+            classify_failed_publication_field(
+                &Some("original-bypass"),
+                &Some("original-bypass"),
+                &Some("owned-bypass"),
+            ),
+        ];
+        assert_eq!(
+            actions,
+            [
+                FailedPublicationField::AlreadyOriginal,
+                FailedPublicationField::RestoreOwnedValue,
+                FailedPublicationField::AlreadyOriginal,
+            ]
+        );
+        assert!(!actions.contains(&FailedPublicationField::ForeignConflict));
     }
 }

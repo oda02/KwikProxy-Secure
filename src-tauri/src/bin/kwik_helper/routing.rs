@@ -210,11 +210,12 @@ pub async fn cleanup_orphan_tun(name: &str) -> Result<()> {
     // обычно <1с. Если процесс «тонет» (драйвер залип, антивирус блокирует) —
     // убиваем чтобы не блокировать helper-startup на пол-минуты.
     match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(_) => Ok(()),
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => bail!("cleanup_orphan_tun PowerShell exited with {status}"),
+        Ok(Err(error)) => Err(error).context("wait for cleanup_orphan_tun PowerShell"),
         Err(_) => {
             let _ = child.start_kill();
-            eprintln!("[routing] cleanup_orphan_tun({name}) timeout 5с — kill, продолжаем");
-            Ok(())
+            bail!("cleanup_orphan_tun timed out after 5 seconds")
         }
     }
 }

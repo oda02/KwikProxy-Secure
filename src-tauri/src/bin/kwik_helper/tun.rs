@@ -206,13 +206,26 @@ fn wide_z_to_string(buf: &[u16]) -> String {
         .into_owned()
 }
 
-/// Best-effort cleanup of adapters carrying this fork's exact ownership
-/// marker. Legacy aliases and route-only heuristics are intentionally not
-/// touched: neither proves that a resource belongs to this installation.
-pub async fn cleanup_orphan_resources() {
+/// Fail-closed startup cleanup of adapters carrying this fork's exact
+/// ownership prefix. Legacy aliases and route-only heuristics are
+/// intentionally not touched: neither proves product ownership. The helper
+/// does not publish its pipe unless command success and all-status absence
+/// verification both succeed.
+pub async fn cleanup_orphan_resources() -> Result<()> {
     let wildcard = format!("{TUN_NAME_PREFIX}*");
-    if let Err(error) = routing::cleanup_orphan_tun(&wildcard).await {
-        eprintln!("[helper-tun] cleanup_orphan_tun({wildcard}) -> {error}");
+    routing::cleanup_orphan_tun(&wildcard).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let still_present = tokio::task::spawn_blocking(owned_prefix_exists)
+            .await
+            .map_err(|error| anyhow!("owned TUN prefix check task failed: {error}"))??;
+        if !still_present {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("owned TUN adapter remains after prefix cleanup");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -227,7 +240,56 @@ pub async fn cleanup_owned_device(name: &str) -> Result<()> {
     {
         bail!("invalid exact owned TUN device identity");
     }
-    routing::cleanup_orphan_tun(name).await
+    routing::cleanup_orphan_tun(name).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let alias = name.to_string();
+        let still_present = tokio::task::spawn_blocking(move || owned_alias_exists(&alias))
+            .await
+            .map_err(|error| anyhow!("owned TUN absence check task failed: {error}"))??;
+        if !still_present {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("exact owned TUN adapter still exists after cleanup");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Exact absence verification scans every operational state. A removed or
+/// disabled adapter must not disappear merely because readiness filters only
+/// `IfOperStatusUp` entries.
+fn owned_alias_exists(expected_alias: &str) -> Result<bool> {
+    let mut table_ptr: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+    let ret = unsafe { GetIfTable2(&mut table_ptr) };
+    if ret != NO_ERROR || table_ptr.is_null() {
+        bail!("GetIfTable2 failed with code {ret}");
+    }
+    let table = unsafe { &*table_ptr };
+    let entries =
+        unsafe { std::slice::from_raw_parts(table.Table.as_ptr(), table.NumEntries as usize) };
+    let found = entries
+        .iter()
+        .any(|entry| wide_z_to_string(&entry.Alias) == expected_alias);
+    unsafe { FreeMibTable(table_ptr as *mut _) };
+    Ok(found)
+}
+
+fn owned_prefix_exists() -> Result<bool> {
+    let mut table_ptr: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+    let ret = unsafe { GetIfTable2(&mut table_ptr) };
+    if ret != NO_ERROR || table_ptr.is_null() {
+        bail!("GetIfTable2 failed with code {ret}");
+    }
+    let table = unsafe { &*table_ptr };
+    let entries =
+        unsafe { std::slice::from_raw_parts(table.Table.as_ptr(), table.NumEntries as usize) };
+    let found = entries
+        .iter()
+        .any(|entry| wide_z_to_string(&entry.Alias).starts_with(TUN_NAME_PREFIX));
+    unsafe { FreeMibTable(table_ptr as *mut _) };
+    Ok(found)
 }
 
 #[cfg(test)]

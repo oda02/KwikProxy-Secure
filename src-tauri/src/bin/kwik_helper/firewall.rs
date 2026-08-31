@@ -560,10 +560,7 @@ fn disable_blocking() -> Result<()> {
     // удаляем provider/sublayer (каскадно с фильтрами). Идемпотентно
     // если ничего не было.
     drop(g); // отпускаем lock прежде чем делать sync WFP-вызов.
-    if let Err(err) = wfp_cleanup_provider() {
-        eprintln!("[wfp-killswitch] cleanup_provider error (не критично): {err}");
-    }
-    Ok(())
+    wfp_cleanup_provider().context("verify WFP provider cleanup")
 }
 
 /// Cleanup orphan-фильтров с прошлых инкарнаций helper'а.

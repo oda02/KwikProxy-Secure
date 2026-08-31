@@ -31,7 +31,7 @@ use windows_sys::Win32::System::Threading::{
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
 use winreg::RegKey;
 
-const PIPE_NAME: &str = r"\\.\pipe\KwikProxySecure.Helper.v14";
+const PIPE_NAME: &str = r"\\.\pipe\KwikProxySecure.Helper.v15";
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_BYTES: usize = 1400 * 1024;
 const MAX_REQUEST_BYTES: usize = 1536 * 1024;
@@ -143,6 +143,9 @@ pub enum HelperResponse {
     },
     TunnelStatus {
         running: bool,
+        cleanup_pending: bool,
+        firewall_active: bool,
+        device_owned: bool,
     },
     Error {
         message: String,
@@ -152,7 +155,25 @@ pub enum HelperResponse {
 /// Минимально-поддерживаемая версия протокола. Если helper отвечает
 /// меньшей — `helper_bootstrap` форсит uninstall+install. Бампается
 /// синхронно с константой в `kwik_helper::protocol`.
-pub const HELPER_PROTOCOL_VERSION: u32 = 14;
+pub const HELPER_PROTOCOL_VERSION: u32 = 15;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TunnelStatus {
+    pub running: bool,
+    pub cleanup_pending: bool,
+    pub firewall_active: bool,
+    pub device_owned: bool,
+}
+
+impl TunnelStatus {
+    pub fn is_clear(self) -> bool {
+        !self.running && !self.cleanup_pending && !self.firewall_active && !self.device_owned
+    }
+
+    pub fn is_active_or_pending(self) -> bool {
+        !self.is_clear()
+    }
+}
 
 /// Открыть pipe с retry — сервис может быть busy сразу после старта или
 /// перезапуска. Возвращает первый успешный клиент за 1 секунду или ошибку.
@@ -509,9 +530,19 @@ pub async fn read_diagnostics() -> Result<String> {
 /// Query liveness of the service-owned Mihomo child over the authenticated
 /// pipe. A transport error is deliberately distinct from `running=false` so
 /// callers can choose a fail-closed UI state.
-pub async fn tunnel_status() -> Result<bool> {
+pub async fn tunnel_status() -> Result<TunnelStatus> {
     match send(HelperRequest::TunnelStatus).await? {
-        HelperResponse::TunnelStatus { running } => Ok(running),
+        HelperResponse::TunnelStatus {
+            running,
+            cleanup_pending,
+            firewall_active,
+            device_owned,
+        } => Ok(TunnelStatus {
+            running,
+            cleanup_pending,
+            firewall_active,
+            device_owned,
+        }),
         HelperResponse::Error { message } => bail!("{message}"),
         other => bail!("неожиданный ответ helper: {other:?}"),
     }
@@ -523,7 +554,7 @@ mod tests {
 
     #[test]
     fn protocol_is_exact_and_path_free() {
-        assert_eq!(HELPER_PROTOCOL_VERSION, 14);
+        assert_eq!(HELPER_PROTOCOL_VERSION, 15);
         let json = serde_json::to_string(&HelperRequest::StartTunnel {
             config_yaml: "mixed-port: 7890".into(),
             allow_lan: false,
@@ -539,6 +570,36 @@ mod tests {
     #[test]
     fn pipe_deadline_covers_privileged_readiness_and_cleanup() {
         assert!(IO_TIMEOUT > Duration::from_secs(10 + 3));
+    }
+
+    #[test]
+    fn cleanup_pending_status_is_not_clear() {
+        let status = TunnelStatus {
+            running: false,
+            cleanup_pending: true,
+            firewall_active: false,
+            device_owned: true,
+        };
+        assert!(status.is_active_or_pending());
+        assert!(!status.is_clear());
+    }
+
+    #[test]
+    fn resource_status_wire_shape_contains_no_identity() {
+        let json = r#"{"result":"tunnel_status","running":false,"cleanup_pending":true,"firewall_active":false,"device_owned":true}"#;
+        let response: HelperResponse = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            response,
+            HelperResponse::TunnelStatus {
+                running: false,
+                cleanup_pending: true,
+                firewall_active: false,
+                device_owned: true,
+            }
+        ));
+        assert!(!json.contains("path"));
+        assert!(!json.contains("alias"));
+        assert!(!json.contains("pid"));
     }
 
     #[test]

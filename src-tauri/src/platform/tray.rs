@@ -17,6 +17,8 @@ use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, Runtime, Wry};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::platform;
 use crate::vpn::MihomoState;
 
@@ -27,6 +29,7 @@ pub const TRAY_ID: &str = "main";
 const MENU_ID_TOGGLE: &str = "tray:toggle";
 const MENU_ID_VPN: &str = "tray:vpn";
 const MENU_ID_QUIT: &str = "tray:quit";
+static QUIT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Собрать меню под заданное состояние. Текст VPN-кнопки и
 /// её enabled-state зависят от status/has_selection.
@@ -127,27 +130,97 @@ fn toggle_main_window(app: &AppHandle) {
 /// пункта «Выйти» в меню трея — обычное закрытие окна (X) приложение
 /// не закрывает, только сворачивает в трей.
 pub fn quit_app(app: &AppHandle) {
-    let mihomo = app.state::<MihomoState>();
-    let _ = mihomo.stop();
-    if let Some(attempt_id) = mihomo.proxy_attempt_id() {
-        if matches!(
-            platform::proxy::clear_system_proxy_owned(&attempt_id),
-            Ok(true)
-        ) {
-            mihomo.clear_proxy_attempt(&attempt_id);
-        }
+    if QUIT_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+        return;
     }
-    // Helper-сервис не трогаем — он остаётся жить, ждёт следующего запуска
-    // приложения (так быстрее first-connect, не нужно UAC заново).
-    //
-    // 0.3.3 fix: грейс-период перед exit. Фронт может иметь in-flight
-    // IPC-команды (особенно `secure_storage_set` от subscription store)
-    // которые не успели долететь до Rust-handler'ов. exit(0) их
-    // прерывает — keyring остаётся без записанных данных, на следующем
-    // старте URL подписки «исчезает». 200мс — короткое окно которое
-    // юзер не замечает, но обычно достаточно для дренажа очереди IPC.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    app.exit(0);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _lifecycle = match platform::lifecycle::begin_shutdown().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                eprintln!("[tray-quit] shutdown seal refused: {error}");
+                let _ = app.emit("tray-quit-error", error);
+                QUIT_IN_PROGRESS.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        let result: Result<(), String> = async {
+            let before = platform::helper_client::tunnel_status()
+                .await
+                .map_err(|error| format!("query protected shutdown status: {error:#}"))?;
+            let mut errors = Vec::new();
+            if let Err(error) = platform::helper_client::mihomo_stop().await {
+                errors.push(format!("stop protected Mihomo: {error:#}"));
+            }
+            if let Err(error) = platform::helper_client::kill_switch_disable().await {
+                errors.push(format!("disable protected kill switch: {error:#}"));
+            }
+            match platform::helper_client::tunnel_status().await {
+                Ok(status) if status.is_clear() => {}
+                Ok(status) => errors.push(format!(
+                    "protected cleanup remains active (running={}, cleanup_pending={}, firewall_active={}, device_owned={})",
+                    status.running,
+                    status.cleanup_pending,
+                    status.firewall_active,
+                    status.device_owned,
+                )),
+                Err(error) => {
+                    errors.push(format!("verify protected shutdown cleanup: {error:#}"))
+                }
+            }
+            if !errors.is_empty() {
+                return Err(format!(
+                    "protected shutdown reconciliation failed (initial_active={}): {}",
+                    before.is_active_or_pending(),
+                    errors.join("; ")
+                ));
+            }
+
+            // Restore the exact attempt-owned proxy while its local listener
+            // is still alive. A failed restore aborts exit instead of leaving
+            // clients cached on a dead loopback endpoint.
+            let mihomo = app.state::<MihomoState>();
+            if let Some(attempt_id) = mihomo.proxy_attempt_id() {
+                match platform::proxy::clear_system_proxy_owned(&attempt_id) {
+                    Ok(true) => mihomo.clear_proxy_attempt(&attempt_id),
+                    Ok(false) => {
+                        return Err("attempt-owned system proxy publication is missing".into())
+                    }
+                    Err(error) => {
+                        return Err(format!("restore attempt-owned system proxy: {error:#}"))
+                    }
+                }
+            } else if platform::proxy::has_pending_backup() {
+                match platform::proxy::restore_pending_owned_proxy() {
+                    Ok(true) => {}
+                    Ok(false) => return Err("pending owned system proxy disappeared".into()),
+                    Err(error) => {
+                        return Err(format!("restore pending owned system proxy: {error:#}"))
+                    }
+                }
+            }
+            mihomo.stop()?;
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                app.exit(0);
+            }
+            Err(error) => {
+                eprintln!("[tray-quit] cleanup refused exit: {error}");
+                let _ = app.emit("tray-quit-error", error);
+                let _ = app.get_webview_window("main").map(|window| {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                });
+                platform::lifecycle::cancel_shutdown();
+                QUIT_IN_PROGRESS.store(false, Ordering::SeqCst);
+            }
+        }
+    });
 }
 
 /// Обновить tray под текущий VPN-статус — пересобираем меню целиком

@@ -123,7 +123,6 @@ pub async fn start(
         super::helper_log::log("[helper-mihomo] stage=readiness outcome=error code=not_ready");
         let _ = child.kill().await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
-        let _ = super::tun::cleanup_owned_device(&tun_device).await;
         return Err(error);
     }
     super::helper_log::log(
@@ -144,7 +143,6 @@ pub async fn start(
         pid,
         session_id,
         installation.generation.clone(),
-        tun_device.clone(),
         instance_id.clone(),
     );
     Ok(StartedTunnel {
@@ -189,13 +187,7 @@ async fn wait_for_child_readiness(
     }
 }
 
-fn spawn_exit_monitor(
-    pid: u32,
-    session_id: u32,
-    generation: String,
-    tun_device: String,
-    instance_id: String,
-) {
+fn spawn_exit_monitor(pid: u32, session_id: u32, generation: String, instance_id: String) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -223,11 +215,9 @@ fn spawn_exit_monitor(
             super::helper_log::log(
                 "[helper-mihomo] stage=child_monitor outcome=exited code=child_exit",
             );
-            if super::tun::cleanup_owned_device(&tun_device).await.is_err() {
-                super::helper_log::log(
-                    "[helper-mihomo] stage=orphan_cleanup outcome=error code=cleanup_failed",
-                );
-            }
+            // Broker owns the exact adapter identity. It performs and records
+            // cleanup so a failure remains retryable instead of being reduced
+            // to a best-effort monitor log.
             super::dispatch::on_tunnel_process_exit(session_id, &generation, pid, &instance_id)
                 .await;
             return;
@@ -311,6 +301,10 @@ fn create_kill_on_close_job() -> Result<Job> {
 struct ValidatedConfig {
     tun_device: String,
     controller_addr: std::net::SocketAddr,
+}
+
+pub fn validated_tun_device(yaml: &str, allow_lan: bool) -> Result<String> {
+    Ok(validate_privileged_config(yaml, allow_lan)?.tun_device)
 }
 
 fn validate_privileged_config(yaml: &str, allow_lan: bool) -> Result<ValidatedConfig> {
@@ -446,16 +440,30 @@ fn validate_provider_paths(root: &Mapping, section: &str) -> Result<()> {
 
 pub async fn stop() -> Result<()> {
     let mut state = STATE.lock().await;
-    let Some(mut state_value) = state.take() else {
+    let Some(state_value) = state.as_mut() else {
         return Ok(());
     };
-    eprintln!("[helper-mihomo] kill pid={}", state_value.pid);
-    if let Err(error) = state_value.child.kill().await {
-        eprintln!("[helper-mihomo] kill failed: {error}");
+    if state_value
+        .child
+        .try_wait()
+        .context("query protected Mihomo before stop")?
+        .is_some()
+    {
+        let _ = state.take();
+        return Ok(());
     }
+    eprintln!("[helper-mihomo] kill pid={}", state_value.pid);
+    state_value
+        .child
+        .kill()
+        .await
+        .context("kill protected Mihomo")?;
     match tokio::time::timeout(std::time::Duration::from_secs(3), state_value.child.wait()).await {
-        Ok(Ok(status)) => eprintln!("[helper-mihomo] exited with {status}"),
-        Ok(Err(error)) => eprintln!("[helper-mihomo] wait failed: {error}"),
+        Ok(Ok(status)) => {
+            eprintln!("[helper-mihomo] exited with {status}");
+            let _ = state.take();
+        }
+        Ok(Err(error)) => return Err(error).context("wait for protected Mihomo exit"),
         Err(_) => return Err(anyhow!("mihomo did not stop within 3 seconds")),
     }
     Ok(())
