@@ -1,9 +1,8 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getAllWindows } from "@tauri-apps/api/window";
-import { useVpnStore } from "./stores/vpnStore";
-import { useSubscriptionStore } from "./stores/subscriptionStore";
+import { useVpnStore, type VpnStatus } from "./stores/vpnStore";
 import "./FloatingApp.css";
 
 /**
@@ -25,12 +24,7 @@ import "./FloatingApp.css";
 export function FloatingApp() {
   const { t } = useTranslation();
   const status = useVpnStore((s) => s.status);
-  const selectedIndex = useVpnStore((s) => s.selectedIndex);
   const refresh = useVpnStore((s) => s.refresh);
-  const connect = useVpnStore((s) => s.connect);
-  const disconnect = useVpnStore((s) => s.disconnect);
-  const servers = useSubscriptionStore((s) => s.servers);
-  const loadCached = useSubscriptionStore((s) => s.loadCached);
 
   const [bw, setBw] = useState<{ up: number; down: number }>({ up: 0, down: 0 });
 
@@ -45,12 +39,10 @@ export function FloatingApp() {
     };
   }, []);
 
-  // Главное окно само поднимает stores из IPC и кеша; floating-окно
-  // живёт в отдельном webview-процессе, у него свои Zustand-сторы —
-  // приходится ещё раз поднять кеш списка серверов и refresh статуса
-  // VPN, иначе внутри floating всё видится как «нет сервера, stopped».
+  // Floating не публикует subscription runtime: это отдельный WebView со
+  // своей generation sequence, которая могла обогнать receipt главного окна.
+  // Статус читаем из backend, выбор и имя придут broadcast'ом от main.
   useEffect(() => {
-    void loadCached();
     void refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -95,12 +87,25 @@ export function FloatingApp() {
   // когда VPN активно работал. Bandwidth и status_dot работали через
   // отдельные events, имя — нет.
   const [broadcastName, setBroadcastName] = useState<string | null>(null);
+  const [hasSelection, setHasSelection] = useState(false);
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    void listen<{ status: string; selectedName: string | null }>(
+    void listen<{
+      status: VpnStatus;
+      selectedName: string | null;
+      hasSelection: boolean;
+    }>(
       "vpn-state-broadcast",
       (event) => {
         setBroadcastName(event.payload.selectedName);
+        setHasSelection(event.payload.hasSelection);
+        if (
+          ["stopped", "starting", "running", "stopping", "error"].includes(
+            event.payload.status
+          )
+        ) {
+          useVpnStore.setState({ status: event.payload.status });
+        }
       }
     ).then((fn) => {
       unlisten = fn;
@@ -113,23 +118,14 @@ export function FloatingApp() {
   const isRunning = status === "running";
   const isBusy = status === "starting" || status === "stopping";
   const isError = status === "error";
-  // Имя берём с приоритетом broadcast → локальный store. Локальный
-  // используется как fallback пока main не успел отправить event
-  // (например после рестарта приложения с floating window=true и
-  // refreshOnOpen=false).
-  const localName =
-    selectedIndex !== null && servers[selectedIndex]
-      ? servers[selectedIndex].name
-      : null;
-  const selectedName = broadcastName ?? localName;
+  const selectedName = broadcastName;
 
   const onDotClick = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (isBusy) return;
-    if (isRunning) {
-      void disconnect();
-    } else if (selectedIndex !== null) {
-      void connect();
+    if (isRunning || hasSelection) {
+      // Main is the sole owner of subscription receipts and connect state.
+      void emit("floating-toggle-vpn");
     }
   };
 
@@ -168,7 +164,7 @@ export function FloatingApp() {
         title={
           isRunning
             ? t("floating.vpnOn")
-            : selectedIndex !== null
+            : hasSelection
             ? t("floating.vpnOff")
             : t("floating.pickServer")
         }

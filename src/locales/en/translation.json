@@ -273,6 +273,12 @@
     "staleSelection": {
       "title": "no server selected",
       "message": "the server list changed — pick a server again."
+    },
+    "connectError": {
+      "title": "Could not connect",
+      "retry": "Retry",
+      "noSelection": "Select a server before connecting.",
+      "selectionChanged": "The subscription or selected server changed while connecting. Please retry."
     }
   },
   "notification": {

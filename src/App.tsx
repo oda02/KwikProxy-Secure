@@ -192,26 +192,34 @@ function App() {
     // `tray-action`. Здесь всю логику уже знает vpnStore (engine
     // selection, anti-DPI, kill-switch и т.д.), не дублируем на бэкенде.
     let unlistenTray: (() => void) | undefined;
+    let unlistenFloatingToggle: (() => void) | undefined;
+    const toggleVpn = async () => {
+      const v = useVpnStore.getState();
+      if (v.status === "running") {
+        await v.disconnect();
+      } else if (v.status === "stopped" || v.status === "error") {
+        if (v.selectedIndex !== null) {
+          await v.connect();
+        }
+      }
+      // starting / stopping — игнорируем повторный toggle.
+    };
     void listen<string>("tray-action", async (event) => {
       if (event.payload === "toggle-vpn") {
-        const v = useVpnStore.getState();
-        if (v.status === "running") {
-          await v.disconnect();
-        } else if (v.status === "stopped" || v.status === "error") {
-          if (v.selectedIndex !== null) {
-            await v.connect();
-          }
-        }
-        // starting / stopping — игнорируем клик чтобы не дёргать.
+        await toggleVpn();
       }
     }).then((fn) => {
       unlistenTray = fn;
+    });
+    void listen("floating-toggle-vpn", toggleVpn).then((fn) => {
+      unlistenFloatingToggle = fn;
     });
 
     return () => {
       unlisten?.();
       unlistenNetwork?.();
       unlistenTray?.();
+      unlistenFloatingToggle?.();
       unlistenFloat?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -238,6 +246,7 @@ function App() {
       void emit("vpn-state-broadcast", {
         status,
         selectedName: serverName,
+        hasSelection: selectedIndex !== null,
       });
     });
   }, [status, selectedIndex, servers]);

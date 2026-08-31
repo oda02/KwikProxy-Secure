@@ -412,6 +412,45 @@ html[data-maximized="true"] .soft {
   color: var(--s-lime);
 }
 
+.soft-connect-error {
+  margin: -8px 22px 18px;
+  padding: 12px 14px;
+  border: 1px solid rgba(248, 113, 113, 0.34);
+  border-radius: 16px;
+  background: rgba(127, 29, 29, 0.2);
+  color: #fecaca;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.soft-connect-error-copy {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.soft-connect-error-copy strong {
+  color: #fff;
+  font-size: 13px;
+}
+.soft-connect-error > button {
+  flex: 0 0 auto;
+  border: 1px solid rgba(254, 202, 202, 0.35);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  padding: 7px 11px;
+  font: inherit;
+  font-weight: 700;
+}
+.soft-connect-error > button:disabled {
+  opacity: 0.45;
+}
+
 /* ── Переключатель режима ─────────────────────────────────────────────── */
 [data-look="soft"] .mode-seg {
   display: flex;

@@ -36,7 +36,9 @@ import {
  * переключение + удаление + добавить.
  */
 export function SoftHome({ onOpenSettings }: { onOpenSettings: () => void }) {
+  const { t } = useTranslation();
   const status = useVpnStore((s) => s.status);
+  const errorMessage = useVpnStore((s) => s.errorMessage);
   const mode = useVpnStore((s) => s.mode);
   const setMode = useVpnStore((s) => s.setMode);
   const selectedIndex = useVpnStore((s) => s.selectedIndex);
@@ -310,6 +312,22 @@ export function SoftHome({ onOpenSettings }: { onOpenSettings: () => void }) {
             {isRunning ? "■" : <ChevronRightIcon />}
           </span>
         </button>
+
+        {status === "error" && errorMessage && (
+          <div className="soft-connect-error" role="alert">
+            <span className="soft-connect-error-copy">
+              <strong>{t("vpnStore.connectError.title")}</strong>
+              <span>{errorMessage}</span>
+            </span>
+            <button
+              type="button"
+              disabled={selectedIndex === null}
+              onClick={() => void connect()}
+            >
+              {t("vpnStore.connectError.retry")}
+            </button>
+          </div>
+        )}
 
         {!tunOnlyStrict && (
           <ModeSegment

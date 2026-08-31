@@ -4,6 +4,7 @@ import i18n from "../i18n";
 import { useSettingsStore } from "./settingsStore";
 import { useSubscriptionStore } from "./subscriptionStore";
 import { showToast } from "./toastStore";
+import { AsyncSingleFlight } from "../lib/asyncControl";
 
 /** Anti-DPI опции в формате camelCase, который Rust десериализует через
  *  serde(rename_all = "camelCase") в struct AntiDpiOptions. */
@@ -196,6 +197,18 @@ export const findSelectedIndexByName = (
  *  несколько параллельных disconnect→connect. Module-level (а не в state)
  *  — это чисто внутренний мьютекс, перерисовка UI на него не нужна. */
 let switchingServer = false;
+const connectSingleFlight = new AsyncSingleFlight();
+
+class ConnectFailure extends Error {
+  constructor(
+    message: string,
+    readonly toastTitle: string,
+    readonly toastKind: "warning" | "error" = "error"
+  ) {
+    super(message);
+    this.name = "ConnectFailure";
+  }
+}
 
 export const useVpnStore = create<VpnState>((set, get) => ({
   status: "stopped",
@@ -276,149 +289,175 @@ export const useVpnStore = create<VpnState>((set, get) => ({
     }
   },
 
-  async connect() {
-    const { selectedIndex, mode } = get();
-    if (selectedIndex === null) return;
-    // Защита от устаревшего индекса: после смены/удаления подписки
-    // selectedIndex мог остаться от прежнего (более длинного) списка.
-    // Без проверки в Rust ушёл бы out-of-range / чужой сервер.
-    const servers = useSubscriptionStore.getState().servers;
-    if (selectedIndex < 0 || selectedIndex >= servers.length) {
-      set({ selectedIndex: null });
-      showToast({
-        kind: "warning",
-        title: i18n.t("vpnStore.staleSelection.title"),
-        message: i18n.t("vpnStore.staleSelection.message"),
-        durationMs: 6000,
-      });
-      return;
-    }
+  connect() {
+    return connectSingleFlight.run(async () => {
+      const { selectedIndex, mode } = get();
+      set({ status: "starting", errorMessage: null });
 
-    // 9.C: проверяем routing-таблицу на чужие default/half-default
-    // маршруты до запуска connect. Если такие есть — это другой
-    // активный VPN, и наш TUN/прокси конфликтует с ним. Не запускаем.
-    try {
-      const conflicts = await invoke<string[]>("check_routing_conflicts");
-      if (Array.isArray(conflicts) && conflicts.length > 0) {
-        const list = conflicts.join(", ");
-        showToast({
-          kind: "warning",
-          title: i18n.t("vpnStore.vpnConflict.title"),
-          message: i18n.t("vpnStore.vpnConflict.message", { list }),
-          durationMs: 8000,
+      try {
+        if (selectedIndex === null) {
+          throw new ConnectFailure(
+            i18n.t("vpnStore.connectError.noSelection"),
+            i18n.t("vpnStore.staleSelection.title"),
+            "warning"
+          );
+        }
+        // Защита от устаревшего индекса: после смены/удаления подписки
+        // selectedIndex мог остаться от прежнего (более длинного) списка.
+        // Без проверки в Rust ушёл бы out-of-range / чужой сервер.
+        const servers = useSubscriptionStore.getState().servers;
+        if (selectedIndex < 0 || selectedIndex >= servers.length) {
+          set({ selectedIndex: null });
+          throw new ConnectFailure(
+            i18n.t("vpnStore.staleSelection.message"),
+            i18n.t("vpnStore.staleSelection.title"),
+            "warning"
+          );
+        }
+
+        // 9.C: проверяем routing-таблицу на чужие default/half-default
+        // маршруты до запуска connect. Если такие есть — это другой
+        // активный VPN, и наш TUN/прокси конфликтует с ним. Не запускаем.
+        let conflicts: string[] = [];
+        try {
+          conflicts = await invoke<string[]>("check_routing_conflicts");
+        } catch {
+          // Best-effort preflight: a Win32 inspection failure must not block
+          // a connection whose backend still performs its own validation.
+        }
+        if (Array.isArray(conflicts) && conflicts.length > 0) {
+          const list = conflicts.join(", ");
+          throw new ConnectFailure(
+            i18n.t("vpnStore.vpnConflict.message", { list }),
+            i18n.t("vpnStore.vpnConflict.title"),
+            "warning"
+          );
+        }
+
+        const allowLan = useSettingsStore.getState().allowLan;
+        const tunMasking = useSettingsStore.getState().tunMasking;
+        const killSwitch = useSettingsStore.getState().killSwitch;
+        const killSwitchStrict =
+          useSettingsStore.getState().killSwitchStrict;
+        const autoApplyMinimalRuRules =
+          useSettingsStore.getState().autoApplyMinimalRuRules;
+        const dnsLeakProtection =
+          useSettingsStore.getState().dnsLeakProtection;
+        const forceDisableIpv6 =
+          useSettingsStore.getState().forceDisableIpv6;
+        // #4: IPv6 внутри ядра. #3: пользовательские DNS — парсим свободный
+        // текст (запятая/пробел/перевод строки) в массив, пустые отбрасываем.
+        const ipv6 = useSettingsStore.getState().ipv6;
+        const customDns = useSettingsStore
+          .getState()
+          .customDns.split(/[\s,]+/)
+          .map((x) => x.trim())
+          .filter((x) => x.length > 0);
+        // Mux выпилен вместе с sing-box (был его фичей; Mihomo mux не применяет).
+        const antiDpi = buildEffectiveAntiDpi();
+        // 8.D: per-process правила. Подаём в Rust в camelCase
+        // (`exe`/`action`/`comment`); serde на стороне Rust десериализует
+        // в `AppRule`. Если правил нет — пустой массив, ветка mihomo
+        // воспримет его как «no PROCESS-NAME правил» и не включит
+        // дорогой `find-process-mode: always`.
+        const appRules = useSettingsStore.getState().appRules;
+        // 0.3.0 multi-subscription: engine берём из подписки-источника
+        // выбранного сервера через `getEffectiveEngine()`. Этот метод
+        // соблюдает приоритет: per-subscription engineOverride →
+        // header X-Kwik-Engine → settings.engine (fallback).
+        // Если у server'а нет subscriptionId (legacy state до миграции) —
+        // используем primary, иначе settings.engine.
+        const subStore = useSubscriptionStore.getState();
+        const selectedServer = subStore.servers[selectedIndex];
+        const sourceId = selectedServer?.subscriptionId ?? subStore.primaryId;
+        // Mihomo-only: движок всегда Mihomo. getEffectiveEngine тоже возвращает
+        // "mihomo"; передаём его в connect для совместимости IPC-контракта.
+        const engine = sourceId
+          ? subStore.getEffectiveEngine(sourceId)
+          : "mihomo";
+        // Obtain an exact backend commit receipt immediately before connect.
+        // Rust validates epoch + primary id + generation atomically when reading
+        // the indexed server, so a renderer reload or overtaking primary change
+        // cannot connect a server from another subscription.
+        const result = await subStore.withPrimaryRuntimeReady(
+          async (runtimeReceipt) => {
+            const currentSubscriptions = useSubscriptionStore.getState();
+            if (
+              currentSubscriptions.primaryId !== runtimeReceipt.primaryId ||
+              get().selectedIndex !== selectedIndex
+            ) {
+              throw new ConnectFailure(
+                i18n.t("vpnStore.connectError.selectionChanged"),
+                i18n.t("vpnStore.connectError.title")
+              );
+            }
+            return await invoke<ConnectResult>("connect", {
+              serverIndex: selectedIndex,
+              subscriptionEpoch: runtimeReceipt.sessionEpoch,
+              subscriptionId: runtimeReceipt.primaryId,
+              subscriptionGeneration: runtimeReceipt.generation,
+              mode,
+              engine,
+              allowLan,
+              antiDpi,
+              tunMasking,
+              killSwitch,
+              dnsLeakProtection,
+              killSwitchStrict,
+              forceDisableIpv6,
+              autoApplyMinimalRuRules,
+              appRules,
+              ipv6,
+              customDns,
+            });
+          }
+        );
+        if (!result) {
+          throw new ConnectFailure(
+            i18n.t("vpnStore.connectError.selectionChanged"),
+            i18n.t("vpnStore.connectError.title")
+          );
+        }
+        set({
+          status: "running",
+          socksPort: result.socks_port,
+          httpPort: result.http_port,
+          socksUsername: result.socks_username ?? null,
+          socksPassword: result.socks_password ?? null,
+          connectedAt: Date.now(),
+          errorMessage: null,
         });
-        return;
-      }
-    } catch {
-      // Не критично: detect best-effort, не должен блокировать connect
-      // если внутри Win32 что-то отказало.
-    }
-
-    const allowLan = useSettingsStore.getState().allowLan;
-    const tunMasking = useSettingsStore.getState().tunMasking;
-    const killSwitch = useSettingsStore.getState().killSwitch;
-    const killSwitchStrict =
-      useSettingsStore.getState().killSwitchStrict;
-    const autoApplyMinimalRuRules =
-      useSettingsStore.getState().autoApplyMinimalRuRules;
-    const dnsLeakProtection =
-      useSettingsStore.getState().dnsLeakProtection;
-    const forceDisableIpv6 =
-      useSettingsStore.getState().forceDisableIpv6;
-    // #4: IPv6 внутри ядра. #3: пользовательские DNS — парсим свободный
-    // текст (запятая/пробел/перевод строки) в массив, пустые отбрасываем.
-    const ipv6 = useSettingsStore.getState().ipv6;
-    const customDns = useSettingsStore
-      .getState()
-      .customDns.split(/[\s,]+/)
-      .map((x) => x.trim())
-      .filter((x) => x.length > 0);
-    // Mux выпилен вместе с sing-box (был его фичей; Mihomo mux не применяет).
-    const antiDpi = buildEffectiveAntiDpi();
-    // 8.D: per-process правила. Подаём в Rust в camelCase
-    // (`exe`/`action`/`comment`); serde на стороне Rust десериализует
-    // в `AppRule`. Если правил нет — пустой массив, ветка mihomo
-    // воспримет его как «no PROCESS-NAME правил» и не включит
-    // дорогой `find-process-mode: always`.
-    const appRules = useSettingsStore.getState().appRules;
-    // 0.3.0 multi-subscription: engine берём из подписки-источника
-    // выбранного сервера через `getEffectiveEngine()`. Этот метод
-    // соблюдает приоритет: per-subscription engineOverride →
-    // header X-Kwik-Engine → settings.engine (fallback).
-    // Если у server'а нет subscriptionId (legacy state до миграции) —
-    // используем primary, иначе settings.engine.
-    const subStore = useSubscriptionStore.getState();
-    const selectedServer = subStore.servers[selectedIndex];
-    const sourceId = selectedServer?.subscriptionId ?? subStore.primaryId;
-    // Mihomo-only: движок всегда Mihomo. getEffectiveEngine тоже возвращает
-    // "mihomo"; передаём его в connect для совместимости IPC-контракта.
-    const engine = sourceId
-      ? subStore.getEffectiveEngine(sourceId)
-      : "mihomo";
-    // Obtain an exact backend commit receipt immediately before connect.
-    // Rust validates epoch + primary id + generation atomically when reading
-    // the indexed server, so a renderer reload or overtaking primary change
-    // cannot connect a server from another subscription.
-    const runtimeReceipt = await subStore.ensurePrimaryRuntimeReady();
-    const currentSubscriptions = useSubscriptionStore.getState();
-    if (
-      !runtimeReceipt ||
-      currentSubscriptions.primaryId !== runtimeReceipt.primaryId ||
-      get().selectedIndex !== selectedIndex
-    ) {
-      set({ status: "error", errorMessage: "Subscription selection changed before connect" });
-      return;
-    }
-    set({ status: "starting", errorMessage: null });
-    try {
-      const result = await invoke<ConnectResult>("connect", {
-        serverIndex: selectedIndex,
-        subscriptionEpoch: runtimeReceipt.sessionEpoch,
-        subscriptionId: runtimeReceipt.primaryId,
-        subscriptionGeneration: runtimeReceipt.generation,
-        mode,
-        engine,
-        allowLan,
-        antiDpi,
-        tunMasking,
-        killSwitch,
-        dnsLeakProtection,
-        killSwitchStrict,
-        forceDisableIpv6,
-        autoApplyMinimalRuRules,
-        appRules,
-        ipv6,
-        customDns,
-      });
-      set({
-        status: "running",
-        socksPort: result.socks_port,
-        httpPort: result.http_port,
-        socksUsername: result.socks_username ?? null,
-        socksPassword: result.socks_password ?? null,
-        connectedAt: Date.now(),
-        errorMessage: null,
-      });
-      // 8.F: для mihomo-движка применяем сохранённые пользователем
-      // preferredMihomoNodes (см. ProxiesPanel — клик по ноде до connect
-      // запоминает её как предпочитаемую). external-controller только
-      // что поднялся — Rust сохранил endpoint в connect, теперь дёргаем
-      // /proxies/:group для каждой записи. Ошибки глотаем — обычно это
-      // означает что имя группы не совпадает (пользователь сменил
-      // подписку). UI panel дальше работает в live-режиме как обычно.
-      if (engine === "mihomo") {
-        const preferred = useSettingsStore.getState().preferredMihomoNodes;
-        for (const [group, name] of Object.entries(preferred)) {
-          try {
-            await invoke("mihomo_select_proxy", { group, name });
-          } catch {
-            // имя группы/ноды устарело — игнорируем
+        // 8.F: для mihomo-движка применяем сохранённые пользователем
+        // preferredMihomoNodes (см. ProxiesPanel — клик по ноде до connect
+        // запоминает её как предпочитаемую). external-controller только
+        // что поднялся — Rust сохранил endpoint в connect, теперь дёргаем
+        // /proxies/:group для каждой записи. Ошибки глотаем — обычно это
+        // означает что имя группы не совпадает (пользователь сменил
+        // подписку). UI panel дальше работает в live-режиме как обычно.
+        if (engine === "mihomo") {
+          const preferred = useSettingsStore.getState().preferredMihomoNodes;
+          for (const [group, name] of Object.entries(preferred)) {
+            try {
+              await invoke("mihomo_select_proxy", { group, name });
+            } catch {
+              // имя группы/ноды устарело — игнорируем
+            }
           }
         }
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        set({ status: "error", errorMessage: message });
+        showToast({
+          kind: e instanceof ConnectFailure ? e.toastKind : "error",
+          title:
+            e instanceof ConnectFailure
+              ? e.toastTitle
+              : i18n.t("vpnStore.connectError.title"),
+          message,
+          durationMs: 8000,
+        });
       }
-    } catch (e) {
-      set({ status: "error", errorMessage: String(e) });
-    }
+    });
   },
 
   async disconnect() {

@@ -4,6 +4,7 @@ import { effectiveUserAgent, useSettingsStore, type Engine } from "./settingsSto
 import { findSelectedIndexByName, useVpnStore } from "./vpnStore";
 import i18n from "../i18n";
 import { showToast } from "./toastStore";
+import { AsyncMutex } from "../lib/asyncControl";
 
 export type ProxyEntry = {
   name: string;
@@ -162,6 +163,10 @@ type SubscriptionStore = {
   setPrimaryId: (id: string) => Promise<boolean>;
   /** Publish and verify the exact current primary snapshot before connect. */
   ensurePrimaryRuntimeReady: () => Promise<SubscriptionRuntimeReceipt | null>;
+  /** Keep the exact receipt current until its backend consumer completes. */
+  withPrimaryRuntimeReady: <T>(
+    consume: (receipt: SubscriptionRuntimeReceipt) => Promise<T>
+  ) => Promise<T | null>;
   /** Set engineOverride для подписки (через ⋯ меню → radio выбор). */
   setEngineOverride: (id: string, engine: Engine | null) => void;
   /** Получить effective engine для подписки. Mihomo-only — всегда "mihomo". */
@@ -405,6 +410,7 @@ const removeLegacyPlaintextCache = () => {
 
 let nextFetchGeneration = 0;
 let nextRuntimeGeneration = 0;
+const primaryRuntimeMutex = new AsyncMutex();
 const fetchGenerations = new Map<string, number>();
 let runtimeEpochPromise: Promise<string> | null = null;
 
@@ -487,7 +493,7 @@ const deleteEncryptedCache = async (id: string): Promise<void> => {
 
 /** Commit the primary snapshot with an app-global monotonic generation.
  * Rust rejects late invokes, so a previous primary cannot win a race. */
-const pushPrimaryToRust = async (
+const commitPrimaryToRust = async (
   id: string,
   url: string,
   servers: ProxyEntry[],
@@ -520,24 +526,35 @@ const pushPrimaryToRust = async (
   }
 };
 
-const clearRustRuntime = async (): Promise<void> => {
-  const state = useSubscriptionStore.getState();
-  const primaryId = state.primaryId;
-  if (!primaryId) return;
-  const generation = ++nextRuntimeGeneration;
-  try {
-    const sessionEpoch = await ensureRuntimeEpoch();
-    await invoke("set_servers", {
-      sessionEpoch,
-      primaryId,
-      servers: [],
-      meta: null,
-      generation,
-    });
-  } catch (error) {
-    console.warn("[subscription] runtime clear failed:", error);
-  }
-};
+const pushPrimaryToRust = (
+  id: string,
+  url: string,
+  servers: ProxyEntry[],
+  meta: SubscriptionMeta | null
+): Promise<SubscriptionRuntimeReceipt | null> =>
+  primaryRuntimeMutex.runExclusive(() =>
+    commitPrimaryToRust(id, url, servers, meta)
+  );
+
+const clearRustRuntime = (): Promise<void> =>
+  primaryRuntimeMutex.runExclusive(async () => {
+    const state = useSubscriptionStore.getState();
+    const primaryId = state.primaryId;
+    if (!primaryId) return;
+    const generation = ++nextRuntimeGeneration;
+    try {
+      const sessionEpoch = await ensureRuntimeEpoch();
+      await invoke("set_servers", {
+        sessionEpoch,
+        primaryId,
+        servers: [],
+        meta: null,
+        generation,
+      });
+    } catch (error) {
+      console.warn("[subscription] runtime clear failed:", error);
+    }
+  });
 
 const genId = (): string => {
   // Безопасный uuid v4 без external crypto.randomUUID для старых runtime'ов.
@@ -736,6 +753,24 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => ({
     const sub = state.subscriptions.find((item) => item.id === id);
     if (!sub) return null;
     return await pushPrimaryToRust(id, sub.url, sub.servers, sub.meta);
+  },
+
+  async withPrimaryRuntimeReady(consume) {
+    return await primaryRuntimeMutex.runExclusive(async () => {
+      const state = get();
+      const id = state.primaryId;
+      if (!id) return null;
+      const sub = state.subscriptions.find((item) => item.id === id);
+      if (!sub) return null;
+      const receipt = await commitPrimaryToRust(
+        id,
+        sub.url,
+        sub.servers,
+        sub.meta
+      );
+      if (!receipt) return null;
+      return await consume(receipt);
+    });
   },
 
   setEngineOverride(id, engine) {
