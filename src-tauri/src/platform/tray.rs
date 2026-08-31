@@ -16,6 +16,7 @@
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, Runtime, Wry};
+use tauri_plugin_notification::NotificationExt;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -30,6 +31,28 @@ const MENU_ID_TOGGLE: &str = "tray:toggle";
 const MENU_ID_VPN: &str = "tray:vpn";
 const MENU_ID_QUIT: &str = "tray:quit";
 static QUIT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+fn surface_quit_error(app: &AppHandle, error: &str) {
+    eprintln!("[tray-quit] cleanup refused exit: {error}");
+    let bounded: String = error.chars().take(600).collect();
+    let _ = app.emit("tray-quit-error", bounded.clone());
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    if let Err(notification_error) = app
+        .notification()
+        .builder()
+        .title("KwikProxy Secure: выход отменён")
+        .body(format!(
+            "Не удалось безопасно завершить VPN. Окно оставлено открытым: {bounded}"
+        ))
+        .show()
+    {
+        eprintln!("[tray-quit] could not show cleanup notification: {notification_error}");
+    }
+}
 
 /// Собрать меню под заданное состояние. Текст VPN-кнопки и
 /// её enabled-state зависят от status/has_selection.
@@ -138,26 +161,29 @@ pub fn quit_app(app: &AppHandle) {
         let _lifecycle = match platform::lifecycle::begin_shutdown().await {
             Ok(guard) => guard,
             Err(error) => {
-                eprintln!("[tray-quit] shutdown seal refused: {error}");
-                let _ = app.emit("tray-quit-error", error);
+                surface_quit_error(&app, &error);
                 QUIT_IN_PROGRESS.store(false, Ordering::SeqCst);
                 return;
             }
         };
         let result: Result<(), String> = async {
-            let before = platform::helper_client::tunnel_status()
-                .await
-                .map_err(|error| format!("query protected shutdown status: {error:#}"))?;
             let mut errors = Vec::new();
+            let mut privileged_errors = Vec::new();
+            if let Err(error) = platform::helper_client::tunnel_status().await {
+                privileged_errors.push(format!(
+                    "protected shutdown status was initially unknown: {error:#}"
+                ));
+            }
             if let Err(error) = platform::helper_client::mihomo_stop().await {
-                errors.push(format!("stop protected Mihomo: {error:#}"));
+                privileged_errors.push(format!("stop protected Mihomo: {error:#}"));
             }
             if let Err(error) = platform::helper_client::kill_switch_disable().await {
-                errors.push(format!("disable protected kill switch: {error:#}"));
+                privileged_errors.push(format!("disable protected kill switch: {error:#}"));
             }
+            let mut privileged_cleanup_verified = false;
             match platform::helper_client::tunnel_status().await {
-                Ok(status) if status.is_clear() => {}
-                Ok(status) => errors.push(format!(
+                Ok(status) if status.is_clear() => privileged_cleanup_verified = true,
+                Ok(status) => privileged_errors.push(format!(
                     "protected cleanup remains active (running={}, cleanup_pending={}, firewall_active={}, device_owned={})",
                     status.running,
                     status.cleanup_pending,
@@ -165,42 +191,59 @@ pub fn quit_app(app: &AppHandle) {
                     status.device_owned,
                 )),
                 Err(error) => {
-                    errors.push(format!("verify protected shutdown cleanup: {error:#}"))
+                    privileged_errors
+                        .push(format!("verify protected shutdown cleanup: {error:#}"))
                 }
             }
-            if !errors.is_empty() {
-                return Err(format!(
-                    "protected shutdown reconciliation failed (initial_active={}): {}",
-                    before.is_active_or_pending(),
-                    errors.join("; ")
-                ));
-            }
+            errors.extend(platform::lifecycle::unresolved_cleanup_errors(
+                privileged_cleanup_verified,
+                privileged_errors,
+            ));
 
             // Restore the exact attempt-owned proxy while its local listener
             // is still alive. A failed restore aborts exit instead of leaving
             // clients cached on a dead loopback endpoint.
             let mihomo = app.state::<MihomoState>();
+            let mut local_cleanup_verified = true;
             if let Some(attempt_id) = mihomo.proxy_attempt_id() {
                 match platform::proxy::clear_system_proxy_owned(&attempt_id) {
                     Ok(true) => mihomo.clear_proxy_attempt(&attempt_id),
                     Ok(false) => {
-                        return Err("attempt-owned system proxy publication is missing".into())
+                        local_cleanup_verified = false;
+                        errors.push("attempt-owned system proxy publication is missing".into());
                     }
                     Err(error) => {
-                        return Err(format!("restore attempt-owned system proxy: {error:#}"))
+                        local_cleanup_verified = false;
+                        errors.push(format!("restore attempt-owned system proxy: {error:#}"));
                     }
                 }
             } else if platform::proxy::has_pending_backup() {
                 match platform::proxy::restore_pending_owned_proxy() {
                     Ok(true) => {}
-                    Ok(false) => return Err("pending owned system proxy disappeared".into()),
+                    Ok(false) => {
+                        local_cleanup_verified = false;
+                        errors.push("pending owned system proxy disappeared".into());
+                    }
                     Err(error) => {
-                        return Err(format!("restore pending owned system proxy: {error:#}"))
+                        local_cleanup_verified = false;
+                        errors.push(format!("restore pending owned system proxy: {error:#}"));
                     }
                 }
             }
-            mihomo.stop()?;
-            Ok(())
+            if local_cleanup_verified {
+                if let Err(error) = mihomo.stop() {
+                    errors.push(format!("stop local Mihomo: {error}"));
+                }
+            } else {
+                errors
+                    .push("local Mihomo retained because its system proxy is not restored".into());
+            }
+
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("shutdown cleanup incomplete: {}", errors.join("; ")))
+            }
         }
         .await;
 
@@ -210,12 +253,7 @@ pub fn quit_app(app: &AppHandle) {
                 app.exit(0);
             }
             Err(error) => {
-                eprintln!("[tray-quit] cleanup refused exit: {error}");
-                let _ = app.emit("tray-quit-error", error);
-                let _ = app.get_webview_window("main").map(|window| {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                });
+                surface_quit_error(&app, &error);
                 platform::lifecycle::cancel_shutdown();
                 QUIT_IN_PROGRESS.store(false, Ordering::SeqCst);
             }

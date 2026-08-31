@@ -57,6 +57,10 @@ pub struct MihomoState {
     /// exist. Keep the lifecycle visibly active until a later authenticated
     /// reconciliation proves both resources stopped.
     privileged_cleanup_uncertain: AtomicBool,
+    /// `CommandChild::kill` consumes its handle. If it fails, retain the
+    /// exact PID token and a visible unknown state until the monitor observes
+    /// that same child terminate; never report the local engine stopped.
+    local_cleanup_uncertain: AtomicBool,
 }
 
 impl MihomoState {
@@ -69,6 +73,7 @@ impl MihomoState {
             proxy_attempt_id: Mutex::new(None),
             helper_spawned: AtomicBool::new(false),
             privileged_cleanup_uncertain: AtomicBool::new(false),
+            local_cleanup_uncertain: AtomicBool::new(false),
         }
     }
 
@@ -179,6 +184,7 @@ impl MihomoState {
             *g = Some(child);
         }
         *self.current_pid.lock().map_err(|e| format!("mutex: {e}"))? = Some(my_pid);
+        self.local_cleanup_uncertain.store(false, Ordering::SeqCst);
         *self.mixed_port.lock().map_err(|e| format!("mutex: {e}"))? = mixed_port;
 
         let app_handle = app.clone();
@@ -234,6 +240,7 @@ impl MihomoState {
                             if let Ok(mut g) = state.current_pid.lock() {
                                 *g = None;
                             }
+                            state.local_cleanup_uncertain.store(false, Ordering::SeqCst);
                             app_handle.state::<super::MihomoApiState>().clear();
                             super::diagnostics::record("proxy_child", "error", "unexpected_exit");
                             if let Some(attempt_id) =
@@ -281,11 +288,14 @@ impl MihomoState {
                 .unwrap_or(false);
             if is_current {
                 let child = state.child.lock().ok().and_then(|mut child| child.take());
-                if let Ok(mut current) = state.current_pid.lock() {
-                    *current = None;
-                }
-                if let Some(child) = child {
-                    let _ = child.kill();
+                let termination_verified = child.is_some_and(|child| child.kill().is_ok());
+                if termination_verified {
+                    if let Ok(mut current) = state.current_pid.lock() {
+                        *current = None;
+                    }
+                    state.local_cleanup_uncertain.store(false, Ordering::SeqCst);
+                } else {
+                    state.local_cleanup_uncertain.store(true, Ordering::SeqCst);
                 }
                 app_handle.state::<super::MihomoApiState>().clear();
                 super::diagnostics::record("proxy_monitor", "error", "event_stream_lost");
@@ -357,7 +367,19 @@ impl MihomoState {
         if let Some(child) = g.take() {
             let pid = child.pid();
             eprintln!("[mihomo] kill pid={pid} (явный stop)");
-            child.kill().map_err(|e| format!("kill mihomo: {e}"))?;
+            if let Err(error) = child.kill() {
+                self.local_cleanup_uncertain.store(true, Ordering::SeqCst);
+                return Err(format!(
+                    "kill local Mihomo pid={pid} failed; exact child state remains unknown: {error}"
+                ));
+            }
+            self.local_cleanup_uncertain.store(false, Ordering::SeqCst);
+        } else if self.local_cleanup_uncertain.load(Ordering::SeqCst) {
+            let pid = self.current_pid.lock().ok().and_then(|current| *current);
+            return Err(format!(
+                "local Mihomo termination is still unknown for exact pid {}",
+                pid.map_or_else(|| "unavailable".into(), |value| value.to_string())
+            ));
         }
         if let Ok(mut g) = self.current_pid.lock() {
             *g = None;
@@ -370,7 +392,8 @@ impl MihomoState {
         if self.helper_spawned.load(Ordering::SeqCst) {
             return true;
         }
-        self.child.lock().map(|g| g.is_some()).unwrap_or(false)
+        self.local_cleanup_uncertain.load(Ordering::SeqCst)
+            || self.child.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 }
 
@@ -460,6 +483,18 @@ mod readiness_tests {
         state.mark_privileged_cleanup_uncertain(false);
         state.mark_helper_spawned(false);
         assert!(!state.is_running());
+    }
+
+    #[test]
+    fn uncertain_local_cleanup_remains_visible_and_retry_fails_closed() {
+        let state = MihomoState::new();
+        *state.current_pid.lock().unwrap() = Some(4242);
+        state.local_cleanup_uncertain.store(true, Ordering::SeqCst);
+        assert!(state.is_running());
+        let error = state.stop().unwrap_err();
+        assert!(error.contains("4242"));
+        assert!(state.is_running());
+        assert_eq!(*state.current_pid.lock().unwrap(), Some(4242));
     }
 
     fn temporary_log() -> (std::path::PathBuf, Arc<Mutex<File>>) {

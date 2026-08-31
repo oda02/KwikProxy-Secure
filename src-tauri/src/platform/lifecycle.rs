@@ -36,6 +36,17 @@ pub fn cancel_shutdown() {
     SHUTTING_DOWN.store(false, Ordering::SeqCst);
 }
 
+/// An early helper RPC failure is an observation, not proof cleanup failed.
+/// A later authenticated clear status is authoritative and supersedes it;
+/// otherwise retain the full chain for a truthful user-visible error.
+pub fn unresolved_cleanup_errors(verified_clear: bool, errors: Vec<String>) -> Vec<String> {
+    if verified_clear {
+        Vec::new()
+    } else {
+        errors
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,5 +64,15 @@ mod tests {
             cancel_shutdown();
             assert!(enter().await.is_ok());
         });
+    }
+
+    #[test]
+    fn authoritative_final_status_controls_cleanup_error() {
+        let observations = vec!["initial status unavailable".to_string()];
+        assert!(unresolved_cleanup_errors(true, observations.clone()).is_empty());
+        assert_eq!(
+            unresolved_cleanup_errors(false, observations.clone()),
+            observations
+        );
     }
 }

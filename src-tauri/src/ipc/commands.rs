@@ -924,70 +924,102 @@ pub async fn disconnect(
     let _lifecycle = platform::lifecycle::enter().await?;
     let helper_owned = mihomo.helper_spawned();
     let firewall_owned = ks_ctx.0.lock().await.is_some();
-    let initial_status = platform::helper_client::tunnel_status()
-        .await
-        .map_err(|error| format!("protected disconnect status is unknown: {error:#}"))?;
-    let reconcile_privileged = initial_status.is_active_or_pending()
+    let mut errors = Vec::new();
+    let mut privileged_errors = Vec::new();
+    let initial_status = match platform::helper_client::tunnel_status().await {
+        Ok(status) => Some(status),
+        Err(error) => {
+            privileged_errors.push(format!(
+                "protected disconnect status was initially unknown: {error:#}"
+            ));
+            None
+        }
+    };
+    let reconcile_privileged = initial_status
+        .as_ref()
+        .is_none_or(|status| status.is_active_or_pending())
         || helper_owned
         || firewall_owned
         || mihomo.privileged_cleanup_uncertain();
+    let mut privileged_cleanup_verified = initial_status
+        .as_ref()
+        .is_some_and(|status| status.is_clear());
     if reconcile_privileged {
-        let mut errors = Vec::new();
+        privileged_cleanup_verified = false;
         if let Err(error) = platform::helper_client::mihomo_stop().await {
-            errors.push(format!("stop protected Mihomo: {error:#}"));
+            privileged_errors.push(format!("stop protected Mihomo: {error:#}"));
         }
         if let Err(error) = platform::helper_client::kill_switch_disable().await {
-            errors.push(format!("disable kill switch: {error:#}"));
+            privileged_errors.push(format!("disable kill switch: {error:#}"));
         }
         match platform::helper_client::tunnel_status().await {
-            Ok(status) if status.is_clear() => {}
-            Ok(status) => errors.push(format!(
+            Ok(status) if status.is_clear() => privileged_cleanup_verified = true,
+            Ok(status) => privileged_errors.push(format!(
                 "protected cleanup remains active (running={}, cleanup_pending={}, firewall_active={}, device_owned={})",
                 status.running,
                 status.cleanup_pending,
                 status.firewall_active,
                 status.device_owned,
             )),
-            Err(error) => errors.push(format!("verify protected Mihomo stopped: {error:#}")),
+            Err(error) => privileged_errors
+                .push(format!("verify protected Mihomo stopped: {error:#}")),
         }
-        if !errors.is_empty() {
-            mihomo.mark_helper_spawned(true);
-            mihomo.mark_privileged_cleanup_uncertain(true);
-            vpn::diagnostics::record("disconnect", "error", "privileged_state_unknown");
-            return Err(format!(
-                "privileged disconnect incomplete; state remains active: {}",
-                errors.join("; ")
-            ));
-        }
+        errors.extend(platform::lifecycle::unresolved_cleanup_errors(
+            privileged_cleanup_verified,
+            privileged_errors,
+        ));
     }
 
-    mihomo.mark_helper_spawned(false);
-    mihomo.mark_privileged_cleanup_uncertain(false);
-    *ks_ctx.0.lock().await = None;
-    mihomo_api.clear();
-
-    // 3. Движок Mihomo (если не запущен — stop() no-op) + system proxy.
-    let mihomo_err = mihomo.stop().err();
-    let proxy_err = if let Some(attempt_id) = mihomo.proxy_attempt_id() {
+    // Local proxy cleanup is independent from helper reachability. Restore
+    // the exact attempt-owned WinINet write-set while its listener is still
+    // alive; only then stop the local child. A failed restore deliberately
+    // keeps the listener alive instead of creating a dead loopback proxy.
+    let mut local_cleanup_verified = true;
+    if let Some(attempt_id) = mihomo.proxy_attempt_id() {
         match platform::proxy::clear_system_proxy_owned(&attempt_id) {
-            Ok(true) => {
-                mihomo.clear_proxy_attempt(&attempt_id);
-                None
+            Ok(true) => mihomo.clear_proxy_attempt(&attempt_id),
+            Ok(false) => {
+                local_cleanup_verified = false;
+                errors.push("attempt-owned system proxy publication was not found".into());
             }
-            Ok(false) => Some("attempt-owned system proxy publication was not found".into()),
-            Err(error) => Some(error.to_string()),
+            Err(error) => {
+                local_cleanup_verified = false;
+                errors.push(format!("restore attempt-owned system proxy: {error:#}"));
+            }
+        }
+    }
+    if local_cleanup_verified {
+        if let Err(error) = mihomo.stop() {
+            local_cleanup_verified = false;
+            errors.push(format!("stop local Mihomo: {error}"));
         }
     } else {
-        None
-    };
+        errors.push("local Mihomo retained because its system proxy could not be restored".into());
+    }
 
-    if let Some(e) = mihomo_err {
-        return Err(e);
+    if privileged_cleanup_verified {
+        mihomo.mark_helper_spawned(false);
+        mihomo.mark_privileged_cleanup_uncertain(false);
+        *ks_ctx.0.lock().await = None;
+    } else {
+        mihomo.mark_helper_spawned(true);
+        mihomo.mark_privileged_cleanup_uncertain(true);
+        vpn::diagnostics::record("disconnect", "error", "privileged_state_unknown");
     }
-    if let Some(e) = proxy_err {
-        return Err(e);
+    if privileged_cleanup_verified && local_cleanup_verified {
+        mihomo_api.clear();
     }
-    Ok(())
+
+    if errors.is_empty() {
+        vpn::diagnostics::record("disconnect", "ok", "verified_owned_state_cleared");
+        Ok(())
+    } else {
+        vpn::diagnostics::record("disconnect", "error", "cleanup_incomplete");
+        Err(format!(
+            "disconnect cleanup incomplete: {}",
+            errors.join("; ")
+        ))
+    }
 }
 
 /// Запущен ли VPN-движок (Mihomo) прямо сейчас.
@@ -1029,9 +1061,18 @@ pub async fn is_xray_running(
         Ok(_) => {
             mihomo.mark_helper_spawned(false);
             mihomo.mark_privileged_cleanup_uncertain(false);
-            mihomo_api.clear();
-            vpn::diagnostics::record("tun_child", "error", "not_running");
-            Ok(false)
+            // Clearing the helper domain must not erase a tracked local
+            // child or an exact-PID local termination uncertainty. Re-read
+            // after dropping the helper marker so `is_running` reflects only
+            // the independent local domain.
+            if mihomo.is_running() {
+                vpn::diagnostics::record("proxy_child", "error", "local_state_retained");
+                Ok(true)
+            } else {
+                mihomo_api.clear();
+                vpn::diagnostics::record("tun_child", "error", "not_running");
+                Ok(false)
+            }
         }
         Err(error) => {
             // A fresh UI has no durable in-process marker. Transport/auth
