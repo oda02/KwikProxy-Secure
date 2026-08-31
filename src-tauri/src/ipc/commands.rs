@@ -1628,15 +1628,18 @@ async fn ping_node(server: &str, port: u16) -> Option<u32> {
 /// Резолв хоста в IPv4 (host уже IP — возвращаем как есть, иначе DNS-lookup).
 async fn resolve_ipv4(host: &str, port: u16) -> Option<std::net::Ipv4Addr> {
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-        return Some(ip);
+        return vpn::ping::is_public_probe_ip(std::net::IpAddr::V4(ip)).then_some(ip);
     }
     let p = if port == 0 { 443 } else { port };
     tokio::net::lookup_host((host, p))
         .await
         .ok()?
         .find_map(|a| match a.ip() {
-            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V4(v4) if vpn::ping::is_public_probe_ip(std::net::IpAddr::V4(v4)) => {
+                Some(v4)
+            }
             std::net::IpAddr::V6(_) => None,
+            _ => None,
         })
 }
 
