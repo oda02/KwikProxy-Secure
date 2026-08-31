@@ -110,6 +110,19 @@ fn install_failure_rollback_preserves_registered_recovery_path() {
 }
 
 #[test]
+fn service_acl_exposes_status_only_to_authenticated_users() {
+    let postinstall = macro_body("NSIS_HOOK_POSTINSTALL");
+    assert!(postinstall.contains("(A;;LC;;;AU)"));
+    assert_eq!(postinstall.matches(";;;AU)").count(), 1);
+    for forbidden in ["CC", "DC", "RP", "WP", "DT", "CR", "WD", "WO"] {
+        assert!(
+            !postinstall.contains(&format!("(A;;{forbidden};;;AU)")),
+            "authenticated users must not receive {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn deletion_boundary_is_loaded_before_scm_mutation_and_never_canonicalizes_product_root() {
     let uninstall = SERVICE
         .split("fn uninstall_impl")

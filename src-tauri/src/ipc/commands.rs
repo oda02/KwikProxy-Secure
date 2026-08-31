@@ -495,7 +495,7 @@ pub async fn connect(
 
     platform::helper_bootstrap::ensure_running()
         .await
-        .map_err(|error| format!("helper-сервис недоступен: {error}"))?;
+        .map_err(|error| format!("helper-сервис недоступен: {error:#}"))?;
     if mode == "tun" {
         reconcile_privileged_before_tunnel_start().await?;
     } else {
@@ -703,7 +703,7 @@ pub async fn connect(
                     rollback_connect(&mihomo, &mihomo_api, &ks_ctx, &proxy_attempt_id, tun_mode)
                         .await;
                 return Err(append_rollback_error(
-                    format!("helper.start_tunnel: {error}"),
+                    format!("helper.start_tunnel: {error:#}"),
                     rollback,
                 ));
             }
@@ -827,7 +827,7 @@ pub async fn connect(
                 let rollback =
                     rollback_connect(&mihomo, &mihomo_api, &ks_ctx, &proxy_attempt_id, false).await;
                 return Err(append_rollback_error(
-                    format!("kill switch: helper-сервис недоступен: {e}"),
+                    format!("kill switch: helper-сервис недоступен: {e:#}"),
                     rollback,
                 ));
             }
@@ -862,7 +862,7 @@ pub async fn connect(
             let rollback =
                 rollback_connect(&mihomo, &mihomo_api, &ks_ctx, &proxy_attempt_id, true).await;
             return Err(append_rollback_error(
-                format!("kill switch не поднялся: {e}"),
+                format!("kill switch не поднялся: {e:#}"),
                 rollback,
             ));
         }
@@ -1118,7 +1118,7 @@ pub fn tray_set_status(
 pub async fn kill_switch_heartbeat() -> Result<(), String> {
     platform::helper_client::kill_switch_heartbeat()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// Полный network recovery — одной кнопкой починить всё, что мы
@@ -1165,11 +1165,11 @@ pub async fn recover_network() -> RecoveryReport {
     if helper_alive {
         match platform::helper_client::kill_switch_force_cleanup().await {
             Ok(()) => report.kill_switch_cleaned = true,
-            Err(e) => report.errors.push(format!("kill switch cleanup: {e}")),
+            Err(e) => report.errors.push(format!("kill switch cleanup: {e:#}")),
         }
         match platform::helper_client::orphan_cleanup().await {
             Ok(()) => report.orphan_resources_cleaned = true,
-            Err(e) => report.errors.push(format!("orphan cleanup: {e}")),
+            Err(e) => report.errors.push(format!("orphan cleanup: {e:#}")),
         }
     } else {
         report
@@ -1379,7 +1379,7 @@ pub async fn kill_switch_apply(
         // disable — безопасно вызвать всегда, helper-side идемпотентно.
         return platform::helper_client::kill_switch_disable()
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| format!("{e:#}"));
     }
 
     let Some(ctx) = ctx_opt else {
@@ -1390,7 +1390,7 @@ pub async fn kill_switch_apply(
 
     // Helper должен быть жив — kill_switch_enable требует pipe.
     if let Err(e) = platform::helper_bootstrap::ensure_running().await {
-        return Err(format!("helper-сервис недоступен: {e}"));
+        return Err(format!("helper-сервис недоступен: {e:#}"));
     }
     platform::helper_client::kill_switch_enable(
         ctx.server_ips,
@@ -1402,7 +1402,7 @@ pub async fn kill_switch_apply(
         ctx.force_disable_ipv6,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| format!("{e:#}"))
 }
 
 // ─── Leak-test (13.B + 13.H) ────────────────────────────────────────────────

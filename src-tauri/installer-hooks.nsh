@@ -184,7 +184,9 @@
   ${EndIf}
 
   ; Restrict SCM control/reconfiguration to SYSTEM and local Administrators.
-  nsExec::ExecToLog '"$SYSDIR\sc.exe" sdset ${KWIK_SECURE_SERVICE} "D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)"'
+  ; Authenticated local users receive only SERVICE_QUERY_STATUS (LC), which
+  ; lets the unprivileged UI bind the pipe-server PID to this SCM service.
+  nsExec::ExecToLog '"$SYSDIR\sc.exe" sdset ${KWIK_SECURE_SERVICE} "D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;LC;;;AU)"'
   Pop $0
   ${If} $0 != 0
     nsExec::ExecToLog '"${KWIK_SECURE_HELPER}" uninstall-for-installer'
