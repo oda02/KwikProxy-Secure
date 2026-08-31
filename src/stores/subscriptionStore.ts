@@ -9,8 +9,12 @@ import {
   MutationFence,
   choosePersistedById,
   deleteWithRollback,
+  optionalValueOrThrow,
   publishAfterCommit,
   publishRequiredTombstone,
+  readOptional,
+  type OptionalRead,
+  withAsyncRollback,
 } from "../lib/asyncControl";
 
 export type ProxyEntry = {
@@ -349,17 +353,31 @@ const keyringSet = (key: string, value: string): Promise<boolean> => {
   });
 };
 
-const keyringGet = (key: string): Promise<string> => {
+const keyringRead = (key: string): Promise<OptionalRead<string>> => {
   const epoch = credentialMutationFence.snapshot();
-  if (epoch === null) return Promise.resolve("");
+  if (epoch === null) {
+    return Promise.resolve({
+      kind: "error",
+      error: new Error("credential deletion is active"),
+    });
+  }
   return credentialMutationMutex.runExclusive(async () => {
-    if (!credentialMutationFence.allows(epoch)) return "";
-    try {
-      return await keyringGetRaw(key);
-    } catch {
-      return "";
+    if (!credentialMutationFence.allows(epoch)) {
+      return {
+        kind: "error",
+        error: new Error("credential read was cancelled by deletion"),
+      };
     }
+    return await readOptional(
+      () => keyringGetRaw(key),
+      (value) => value.length === 0
+    );
   });
+};
+
+const keyringGet = async (key: string): Promise<string> => {
+  const result = await keyringRead(key);
+  return result.kind === "value" ? result.value : "";
 };
 
 const keyringDelete = (key: string): Promise<void> => {
@@ -1168,6 +1186,7 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => {
       if (!sub) return;
       const wasPrimary = initial.primaryId === id;
       const vpn = useVpnStore.getState();
+      const previousSelectedIndex = vpn.selectedIndex;
       if (!wasPrimary) requireVpnTransitionStable("remove a subscription");
       if (wasPrimary && vpn.status !== "stopped") {
         await vpn.disconnect();
@@ -1182,6 +1201,7 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => {
         return;
       }
 
+      let primarySwitched = false;
       if (wasPrimary) {
         const switched = await setPrimaryIdUnlocked(remaining[0].id);
         if (!switched) {
@@ -1189,37 +1209,60 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => {
             "backend rejected the replacement primary subscription"
           );
         }
+        primarySwitched = true;
       }
 
-      // Irreversible/fallible cache cleanup precedes source-of-truth secrets.
-      await deleteEncryptedCache(id);
-      const deletedCredentials = await deleteCredentialKeysTransactional([
-        `${URL_KEYRING}:${id}`,
-        `${HWID_KEYRING}:${id}`,
-      ]);
+      const finalizeRemoval = async (): Promise<string | null> => {
+        // Irreversible/fallible cache cleanup precedes source-of-truth secrets.
+        await deleteEncryptedCache(id);
+        const deletedCredentials = await deleteCredentialKeysTransactional([
+          `${URL_KEYRING}:${id}`,
+          `${HWID_KEYRING}:${id}`,
+        ]);
 
-      const latestRemaining = get().subscriptions.filter((s) => s.id !== id);
-      try {
-        saveSubsIndexStrict(latestRemaining.map((s) => s.id));
-      } catch (error) {
+        const latestRemaining = get().subscriptions.filter((s) => s.id !== id);
         try {
-          await restoreCredentialRecords(deletedCredentials);
-        } catch (rollbackError) {
-          throw new Error(
-            `${String(error)}; subscription removal rollback failed: ${String(
-              rollbackError
-            )}`
-          );
+          saveSubsIndexStrict(latestRemaining.map((s) => s.id));
+        } catch (error) {
+          try {
+            await restoreCredentialRecords(deletedCredentials);
+          } catch (rollbackError) {
+            throw new Error(
+              `${String(error)}; subscription removal rollback failed: ${String(
+                rollbackError
+              )}`
+            );
+          }
+          throw error;
         }
-        throw error;
-      }
-      set({ subscriptions: latestRemaining });
-      if (wasPrimary) {
-        const next = latestRemaining[0];
-        if (next.servers.length === 0) {
-          await get().fetchSubscriptionById(next.id);
+        set({ subscriptions: latestRemaining });
+        if (wasPrimary) {
+          const next = latestRemaining[0];
+          return next.servers.length === 0 ? next.id : null;
         }
-      }
+        return null;
+      };
+      const rollbackPrimary = async (): Promise<void> => {
+        const rollbackVpn = useVpnStore.getState();
+        if (rollbackVpn.status !== "stopped") {
+          await rollbackVpn.disconnect();
+          requireVpnStopped("primary subscription rollback");
+        }
+        const restored = await setPrimaryIdUnlocked(id);
+        if (!restored) {
+          throw new Error("backend rejected primary subscription rollback");
+        }
+        useVpnStore.setState({ selectedIndex: previousSelectedIndex });
+      };
+
+      const nextToFetchId = primarySwitched
+        ? await withAsyncRollback(
+          finalizeRemoval,
+          rollbackPrimary,
+          "primary subscription"
+        )
+        : await finalizeRemoval();
+      if (nextToFetchId) await get().fetchSubscriptionById(nextToFetchId);
     });
   },
 
@@ -1556,14 +1599,22 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => {
     //      этого URL, сохраняем его и в новые per-id ключи (миграция).
     //   C) Всё пусто → subscriptions = [], primaryId = null. Welcome.
     const ids = loadSubsIndex();
+    const persistedPrimary = loadPrimaryId();
     let scenarioASucceeded = false;
     if (ids.length > 0) {
       // Сценарий A
       const subs: Subscription[] = [];
       let allReadEmpty = true;
       for (const id of ids) {
-        const u = await keyringGet(`${URL_KEYRING}:${id}`);
-        const h = await keyringGet(`${HWID_KEYRING}:${id}`);
+        const primaryRead = id === persistedPrimary;
+        const u = optionalValueOrThrow(
+          await keyringRead(`${URL_KEYRING}:${id}`),
+          primaryRead
+        );
+        const h = optionalValueOrThrow(
+          await keyringRead(`${HWID_KEYRING}:${id}`),
+          primaryRead
+        );
         if (!u) {
           // 0.3.3 fix: НЕ удаляем ID из индекса. Транзиентная ошибка
           // Credential Manager на старте app (race с инициализацией
@@ -1578,7 +1629,7 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => {
         subs.push({
           id,
           url: u,
-          hwid: h,
+          hwid: h ?? "",
           meta: null,
           lastFetchedAt: null,
           loading: false,
@@ -1589,7 +1640,6 @@ export const useSubscriptionStore = create<SubscriptionStore>((set, get) => {
         });
       }
       if (subs.length > 0) {
-        const persistedPrimary = loadPrimaryId();
         const primary = choosePersistedById(subs, persistedPrimary)!;
         set({ subscriptions: subs, primaryId: primary.id });
         // Legacy fields синхронизируются с primary (для callsites,

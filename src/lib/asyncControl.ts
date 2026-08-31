@@ -194,6 +194,53 @@ export function choosePersistedById<T extends { id: string }>(
   return entries.find((entry) => entry.id === persistedId) ?? entries[0];
 }
 
+export type OptionalRead<T> =
+  | { kind: "value"; value: T }
+  | { kind: "missing" }
+  | { kind: "error"; error: unknown };
+
+export async function readOptional<T>(
+  read: () => Promise<T>,
+  isMissing: (value: T) => boolean
+): Promise<OptionalRead<T>> {
+  try {
+    const value = await read();
+    return isMissing(value) ? { kind: "missing" } : { kind: "value", value };
+  } catch (error) {
+    return { kind: "error", error };
+  }
+}
+
+export function optionalValueOrThrow<T>(
+  result: OptionalRead<T>,
+  required: boolean
+): T | null {
+  if (result.kind === "error") {
+    if (required) throw result.error;
+    return null;
+  }
+  return result.kind === "value" ? result.value : null;
+}
+
+export async function withAsyncRollback<T>(
+  operation: () => Promise<T>,
+  rollback: () => Promise<void>,
+  label: string
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    try {
+      await rollback();
+    } catch (rollbackError) {
+      throw new Error(
+        `${String(error)}; ${label} rollback failed: ${String(rollbackError)}`
+      );
+    }
+    throw error;
+  }
+}
+
 export type ConnectionSelection<T> = {
   primaryId: string | null;
   selectedIndex: number | null;

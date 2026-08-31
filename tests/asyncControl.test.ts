@@ -9,9 +9,12 @@ import {
   choosePersistedById,
   deleteWithRollback,
   isSameConnectionSelection,
+  optionalValueOrThrow,
   publishAfterCommit,
   publishRequiredTombstone,
+  readOptional,
   stopAndReconcile,
+  withAsyncRollback,
 } from "../src/lib/asyncControl.ts";
 
 test("a double connect shares one attempt", async () => {
@@ -205,6 +208,66 @@ test("credential delete failure restores earlier secrets and preserves exact err
     ["hwid", "secret-hwid"],
     ["url", "secret-url"],
   ]);
+});
+
+test("credential reads distinguish missing values from transient errors", async () => {
+  const exact = new Error("credential provider temporarily unavailable");
+  const missing = await readOptional(async () => "", (value) => !value);
+  const value = await readOptional(async () => "secret", (entry) => !entry);
+  const failed = await readOptional(
+    async () => {
+      throw exact;
+    },
+    (entry) => !entry
+  );
+
+  assert.deepEqual(missing, { kind: "missing" });
+  assert.deepEqual(value, { kind: "value", value: "secret" });
+  assert.equal(optionalValueOrThrow(failed, false), null);
+  assert.throws(
+    () => optionalValueOrThrow(failed, true),
+    (error) => error === exact
+  );
+});
+
+test("failed primary removal restores every switched primary layer", async () => {
+  const exact = new Error("cache deletion failed exactly");
+  const layers = {
+    runtime: "old",
+    credential: "old",
+    persisted: "old",
+    local: "old",
+    selectedIndex: 4,
+  };
+
+  await assert.rejects(
+    withAsyncRollback(
+      async () => {
+        layers.runtime = "replacement";
+        layers.credential = "replacement";
+        layers.persisted = "replacement";
+        layers.local = "replacement";
+        layers.selectedIndex = -1;
+        throw exact;
+      },
+      async () => {
+        layers.runtime = "old";
+        layers.credential = "old";
+        layers.persisted = "old";
+        layers.local = "old";
+        layers.selectedIndex = 4;
+      },
+      "primary subscription"
+    ),
+    (error) => error === exact
+  );
+  assert.deepEqual(layers, {
+    runtime: "old",
+    credential: "old",
+    persisted: "old",
+    local: "old",
+    selectedIndex: 4,
+  });
 });
 
 test("serialized removals recompute current state without resurrection", async () => {
