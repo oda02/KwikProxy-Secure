@@ -104,5 +104,6 @@ fn deletion_boundary_is_loaded_before_scm_mutation_and_never_canonicalizes_produ
         .unwrap();
     assert!(loader.contains("open_directory_no_reparse(&install_dir"));
     assert!(loader.contains("final_path_by_handle"));
+    assert!(loader.contains("_program_files_handle: program_files_handle"));
     assert!(!loader.contains("canonical_dir"));
 }

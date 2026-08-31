@@ -125,6 +125,7 @@ pub struct Installation {
 pub struct UninstallIdentity {
     owner_sid: String,
     install_dir: PathBuf,
+    _program_files_handle: OwnedHandle,
     install_handle: OwnedHandle,
 }
 
@@ -158,6 +159,7 @@ impl UninstallIdentity {
         Ok(Self {
             owner_sid,
             install_dir,
+            _program_files_handle: program_files_handle,
             install_handle,
         })
     }
@@ -1504,6 +1506,14 @@ fn keep_for_nsis_uninstaller(name: &OsStr) -> bool {
 /// reparse point is unlinked as a name and is never traversed.
 pub fn cleanup_install_tree_for_uninstaller(identity: &UninstallIdentity) -> Result<()> {
     validate_sid_text(&identity.owner_sid)?;
+    let expected_program_files = identity
+        .install_dir
+        .parent()
+        .context("fixed install root has no Program Files parent")?;
+    let actual_program_files = final_path_by_handle(identity._program_files_handle.0)?;
+    if !same_path(&actual_program_files, expected_program_files) {
+        bail!("Program Files identity changed during protected cleanup");
+    }
     let actual_install = final_path_by_handle(identity.install_handle.0)?;
     if !same_path(&actual_install, &identity.install_dir) {
         bail!("protected install root identity changed during cleanup");
