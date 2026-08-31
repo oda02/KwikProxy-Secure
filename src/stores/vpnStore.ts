@@ -9,6 +9,8 @@ import {
   AsyncSingleFlight,
   AttemptEpoch,
   isSameConnectionSelection,
+  stopAndReconcile,
+  type BackendStopResult,
 } from "../lib/asyncControl";
 
 /** Anti-DPI опции в формате camelCase, который Rust десериализует через
@@ -224,9 +226,23 @@ class ConnectCancelled extends Error {
   }
 }
 
-const cleanupBackendConnection = async (): Promise<void> => {
-  await invoke("disconnect");
-};
+class BackendCleanupFailure extends Error {
+  constructor(
+    message: string,
+    readonly cleanupError: unknown,
+    readonly observedRunning: boolean | null,
+    readonly connectedResult: ConnectResult | null = null
+  ) {
+    super(`${message}: ${String(cleanupError)}`);
+    this.name = "BackendCleanupFailure";
+  }
+}
+
+const cleanupBackendConnection = (): Promise<BackendStopResult> =>
+  stopAndReconcile(
+    () => invoke("disconnect"),
+    () => invoke<boolean>("is_xray_running")
+  );
 
 export const useVpnStore = create<VpnState>((set, get) => ({
   status: "stopped",
@@ -287,6 +303,8 @@ export const useVpnStore = create<VpnState>((set, get) => ({
             await new Promise((r) => setTimeout(r, 200));
             await get().connect();
           } while (get().selectedIndex !== target);
+        } catch (error) {
+          console.warn("[vpn] server switch stopped:", error);
         } finally {
           switchingServer = false;
         }
@@ -295,18 +313,25 @@ export const useVpnStore = create<VpnState>((set, get) => ({
   },
 
   async refresh() {
+    const observedStatus = get().status;
+    if (observedStatus === "starting" || observedStatus === "stopping") return;
+    const observedAttempt = connectionAttempts.current();
     try {
-      const running = await invoke<boolean>("is_xray_running");
-      set((s) => ({
-        status: running ? "running" : "stopped",
-        errorMessage: null,
-        socksPort: running ? s.socksPort : null,
-        httpPort: running ? s.httpPort : null,
-        // Живое соединение без известного connectedAt (рестарт app при
-        // активном VPN) — стартуем таймер с текущего момента.
-        connectedAt: running ? s.connectedAt ?? Date.now() : null,
-      }));
+      await connectionLifecycle.runExclusive(async () => {
+        const running = await invoke<boolean>("is_xray_running");
+        if (!connectionAttempts.isCurrent(observedAttempt)) return;
+        set((s) => ({
+          status: running ? "running" : "stopped",
+          errorMessage: null,
+          socksPort: running ? s.socksPort : null,
+          httpPort: running ? s.httpPort : null,
+          // Живое соединение без известного connectedAt (рестарт app при
+          // активном VPN) — стартуем таймер с текущего момента.
+          connectedAt: running ? s.connectedAt ?? Date.now() : null,
+        }));
+      });
     } catch (e) {
+      if (!connectionAttempts.isCurrent(observedAttempt)) return;
       set({ status: "error", errorMessage: String(e) });
     }
   },
@@ -454,8 +479,16 @@ export const useVpnStore = create<VpnState>((set, get) => ({
               });
               const afterConnect = useSubscriptionStore.getState();
               if (!connectionAttempts.isCurrent(attempt)) {
-                await cleanupBackendConnection();
-                backendCleaned = true;
+                const cleanup = await cleanupBackendConnection();
+                backendCleaned = cleanup.stopped;
+                if (!cleanup.stopped) {
+                  throw new BackendCleanupFailure(
+                    "cancelled connection cleanup failed",
+                    cleanup.error,
+                    cleanup.observedRunning,
+                    response
+                  );
+                }
                 throw new ConnectCancelled();
               }
               if (
@@ -466,10 +499,21 @@ export const useVpnStore = create<VpnState>((set, get) => ({
                   server: afterConnect.servers[selectedIndex],
                 })
               ) {
-                await cleanupBackendConnection();
-                backendCleaned = true;
+                const selectionError = i18n.t(
+                  "vpnStore.connectError.selectionChanged"
+                );
+                const cleanup = await cleanupBackendConnection();
+                backendCleaned = cleanup.stopped;
+                if (!cleanup.stopped) {
+                  throw new BackendCleanupFailure(
+                    selectionError,
+                    cleanup.error,
+                    cleanup.observedRunning,
+                    response
+                  );
+                }
                 throw new ConnectFailure(
-                  i18n.t("vpnStore.connectError.selectionChanged"),
+                  selectionError,
                   i18n.t("vpnStore.connectError.title")
                 );
               }
@@ -516,7 +560,15 @@ export const useVpnStore = create<VpnState>((set, get) => ({
         if (!connectionAttempts.isCurrent(attempt) || e instanceof ConnectCancelled) {
           if (backendStarted && !backendCleaned) {
             try {
-              await connectionLifecycle.runExclusive(cleanupBackendConnection);
+              const cleanup = await connectionLifecycle.runExclusive(
+                cleanupBackendConnection
+              );
+              if (!cleanup.stopped) {
+                console.warn(
+                  "[vpn] cancelled connect cleanup left backend running:",
+                  cleanup.error
+                );
+              }
             } catch (cleanupError) {
               console.warn("[vpn] cancelled connect cleanup failed:", cleanupError);
             }
@@ -524,7 +576,27 @@ export const useVpnStore = create<VpnState>((set, get) => ({
           return;
         }
         const message = e instanceof Error ? e.message : String(e);
-        set({ status: "error", errorMessage: message });
+        if (e instanceof BackendCleanupFailure && e.connectedResult) {
+          set({
+            status: e.observedRunning === true ? "running" : "error",
+            socksPort:
+              e.observedRunning === true ? e.connectedResult.socks_port : null,
+            httpPort:
+              e.observedRunning === true ? e.connectedResult.http_port : null,
+            socksUsername:
+              e.observedRunning === true
+                ? e.connectedResult.socks_username ?? null
+                : null,
+            socksPassword:
+              e.observedRunning === true
+                ? e.connectedResult.socks_password ?? null
+                : null,
+            connectedAt: e.observedRunning === true ? Date.now() : null,
+            errorMessage: message,
+          });
+        } else {
+          set({ status: "error", errorMessage: message });
+        }
         showToast({
           kind: e instanceof ConnectFailure ? e.toastKind : "error",
           title:
@@ -542,9 +614,16 @@ export const useVpnStore = create<VpnState>((set, get) => ({
     const disconnectAttempt = connectionAttempts.cancel();
     set({ status: "stopping", errorMessage: null });
     try {
-      await connectionLifecycle.runExclusive(async () => {
-        await invoke("disconnect");
-      });
+      const cleanup = await connectionLifecycle.runExclusive(
+        cleanupBackendConnection
+      );
+      if (!cleanup.stopped) {
+        throw new BackendCleanupFailure(
+          "VPN disconnect failed",
+          cleanup.error,
+          cleanup.observedRunning
+        );
+      }
       // A disconnect→connect caller (server switch, network change, reset)
       // must not accidentally join the cancelled single-flight promise.
       await connectSingleFlight.waitForIdle();
@@ -559,8 +638,37 @@ export const useVpnStore = create<VpnState>((set, get) => ({
         errorMessage: null,
       });
     } catch (e) {
-      if (!connectionAttempts.isCurrent(disconnectAttempt)) return;
-      set({ status: "error", errorMessage: String(e) });
+      if (connectionAttempts.isCurrent(disconnectAttempt)) {
+        const message = e instanceof Error ? e.message : String(e);
+        const positivelyRunning =
+          e instanceof BackendCleanupFailure && e.observedRunning === true;
+        set({
+          status: positivelyRunning ? "running" : "error",
+          ...(!positivelyRunning
+            ? {
+                socksPort: null,
+                httpPort: null,
+                socksUsername: null,
+                socksPassword: null,
+                connectedAt: null,
+              }
+            : {}),
+          errorMessage: message,
+        });
+        showToast({
+          kind: "error",
+          title: i18n.t("vpnStore.connectError.title"),
+          message,
+          durationMs: 8000,
+        });
+      }
+      throw e;
     }
   },
 }));
+
+/** Apply a newer main-window broadcast in a secondary renderer. */
+export const applyExternalVpnStatus = (status: VpnStatus): void => {
+  connectionAttempts.cancel();
+  useVpnStore.setState({ status });
+};

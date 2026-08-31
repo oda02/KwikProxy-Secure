@@ -50,7 +50,9 @@ export function useTrustedWifi() {
         if (vpn.status === "running") {
           console.log("[trusted-wifi] зашли в", to, "— отключаем vpn");
           setAutoFlag(true);
-          void vpn.disconnect();
+          void vpn.disconnect().catch((error) => {
+            console.warn("[trusted-wifi] disconnect failed:", error);
+          });
         }
         return;
       }

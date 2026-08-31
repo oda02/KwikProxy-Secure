@@ -76,7 +76,9 @@ export function useGlobalShortcuts() {
     const onToggleVpn = () => {
       const v = useVpnStore.getState();
       if (v.status === "running") {
-        void v.disconnect();
+        void v.disconnect().catch((error) => {
+          console.warn("[shortcuts] VPN disconnect failed:", error);
+        });
       } else if (v.status === "stopped" || v.status === "error") {
         if (v.selectedIndex !== null) void v.connect();
       }

@@ -57,6 +57,93 @@ export class AttemptEpoch {
   isCurrent(attempt: number): boolean {
     return this.epoch === attempt;
   }
+
+  current(): number {
+    return this.epoch;
+  }
+}
+
+/** Generation fence for destructive finalization versus queued mutations. */
+export class MutationFence {
+  private epoch = 0;
+  private blocked = false;
+
+  snapshot(): number | null {
+    return this.blocked ? null : this.epoch;
+  }
+
+  beginExclusive(): number {
+    if (this.blocked) throw new Error("destructive mutation is already active");
+    this.blocked = true;
+    this.epoch += 1;
+    return this.epoch;
+  }
+
+  endExclusive(token: number): void {
+    if (this.epoch === token) this.blocked = false;
+  }
+
+  allows(snapshot: number): boolean {
+    return !this.blocked && snapshot === this.epoch;
+  }
+
+  isBlocked(): boolean {
+    return this.blocked;
+  }
+}
+
+export type BackendStopResult = {
+  stopped: boolean;
+  observedRunning: boolean | null;
+  error: unknown | null;
+};
+
+/**
+ * Stop a backend and verify the observed state. A failed stop is retried, and
+ * an unknown final state is treated as still running rather than reporting a
+ * false-safe stopped UI.
+ */
+export async function stopAndReconcile(
+  stop: () => Promise<void>,
+  isRunning: () => Promise<boolean>,
+  maxAttempts = 2
+): Promise<BackendStopResult> {
+  let firstError: unknown | null = null;
+  let observedRunning: boolean | null = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    // The stop call can change backend state, so an observation from the
+    // previous attempt is no longer evidence about the final state.
+    observedRunning = null;
+    try {
+      await stop();
+    } catch (error) {
+      firstError ??= error;
+    }
+    try {
+      observedRunning = await isRunning();
+      if (!observedRunning) {
+        return { stopped: true, observedRunning: false, error: firstError };
+      }
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
+  return {
+    stopped: false,
+    observedRunning,
+    error: firstError ?? new Error("backend remained running after cleanup"),
+  };
+}
+
+/** Publish local state only after an asynchronous backend commit succeeds. */
+export async function publishAfterCommit<T>(
+  commit: () => Promise<T | null>,
+  publish: (receipt: T) => void
+): Promise<T | null> {
+  const receipt = await commit();
+  if (receipt === null) return null;
+  publish(receipt);
+  return receipt;
 }
 
 export type ConnectionSelection<T> = {

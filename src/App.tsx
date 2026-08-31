@@ -161,11 +161,15 @@ function App() {
         const v = useVpnStore.getState();
         if (v.status === "running") {
           console.log("[network-watcher] reconnect:", event.payload);
-          await v.disconnect();
-          // Маленькая пауза чтобы старые маршруты помылись и
-          // platform::network успел отдать новый интерфейс.
-          await new Promise((r) => setTimeout(r, 800));
-          await v.connect();
+          try {
+            await v.disconnect();
+            // Маленькая пауза чтобы старые маршруты помылись и
+            // platform::network успел отдать новый интерфейс.
+            await new Promise((r) => setTimeout(r, 800));
+            await v.connect();
+          } catch (error) {
+            console.warn("[network-watcher] reconnect stopped:", error);
+          }
         }
       }
     ).then((fn) => {
@@ -194,13 +198,17 @@ function App() {
     let unlistenTray: (() => void) | undefined;
     let unlistenFloatingToggle: (() => void) | undefined;
     const toggleVpn = async () => {
-      const v = useVpnStore.getState();
-      if (v.status === "running") {
-        await v.disconnect();
-      } else if (v.status === "stopped" || v.status === "error") {
-        if (v.selectedIndex !== null) {
-          await v.connect();
+      try {
+        const v = useVpnStore.getState();
+        if (v.status === "running") {
+          await v.disconnect();
+        } else if (v.status === "stopped" || v.status === "error") {
+          if (v.selectedIndex !== null) {
+            await v.connect();
+          }
         }
+      } catch (error) {
+        console.warn("[tray] VPN toggle stopped:", error);
       }
       // starting / stopping — игнорируем повторный toggle.
     };

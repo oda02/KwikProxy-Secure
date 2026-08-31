@@ -171,7 +171,7 @@ export function SoftHome({ onOpenSettings }: { onOpenSettings: () => void }) {
 
   const toggle = () => {
     if (isBusy) return;
-    if (isRunning) void disconnect();
+    if (isRunning) void disconnect().catch(() => {});
     else if (selectedIndex !== null) void connect();
   };
 
@@ -182,63 +182,74 @@ export function SoftHome({ onOpenSettings }: { onOpenSettings: () => void }) {
   // только по кнопке «обновить» / авто-обновлению.
   const activate = async (id: string) => {
     if (isBusy) return;
-    if (id !== primaryId) {
-      const targetBeforeCommit = useSubscriptionStore
-        .getState()
-        .subscriptions.find((subscription) => subscription.id === id);
-      if (
-        useVpnStore.getState().status === "running" &&
-        targetBeforeCommit?.servers.length === 0
-      ) {
-        showToast({
-          kind: "warning",
-          title: "Подписка ещё не загружена",
-          message: "Сначала отключите VPN и обновите эту подписку.",
-          durationMs: 6000,
-        });
-        return;
-      }
-      const runtimeReady = await setPrimaryId(id);
-      if (!runtimeReady) {
-        showToast({
-          kind: "error",
-          title: "Подписка",
-          message: "Не удалось безопасно активировать выбранную подписку",
-        });
-        return;
-      }
-      const sub = useSubscriptionStore.getState().subscriptions.find((s) => s.id === id);
-      if (sub) {
-        if (sub.servers.length === 0) {
-          // Кеша нет (например, добавлена на старой версии без кеша или
-          // кеш потёрт) — единственный случай, когда нужен fetch. Дальше
-          // серверы лягут в sub.servers + localStorage и переключение
-          // станет мгновенным.
-          await useSubscriptionStore.getState().fetchSubscriptionById(id);
-        } else {
-          // Восстановление выбора: по имени; если имя из другой подписки
-          // не нашлось, а запись одна (full-mihomo «профиль») — авто-выбор,
-          // иначе сетка локаций не отрисуется и список выглядит «пустым»
-          // (раньше это и заставляло жать «обновить» при каждой смене).
-          const idx = findSelectedIndexByName(sub.servers);
-          const nextIndex = idx >= 0 ? idx : sub.servers.length === 1 ? 0 : null;
-          // The running engine still owns the old subscription. Disconnect
-          // before publishing the new index, then reconnect only after the
-          // awaited primary snapshot commit above. This also covers equal
-          // numeric indexes across two different subscriptions.
-          const wasRunning = useVpnStore.getState().status === "running";
-          if (wasRunning) await disconnect();
-          if (nextIndex !== null) selectServer(nextIndex);
-          else useVpnStore.setState({ selectedIndex: null });
-          if (wasRunning && nextIndex !== null) {
-            await new Promise((resolve) => window.setTimeout(resolve, 200));
-            await connect();
+    try {
+      if (id !== primaryId) {
+        const targetBeforeCommit = useSubscriptionStore
+          .getState()
+          .subscriptions.find((subscription) => subscription.id === id);
+        const wasRunning = useVpnStore.getState().status === "running";
+        if (wasRunning && targetBeforeCommit?.servers.length === 0) {
+          showToast({
+            kind: "warning",
+            title: "Подписка ещё не загружена",
+            message: "Сначала отключите VPN и обновите эту подписку.",
+            durationMs: 6000,
+          });
+          return;
+        }
+        // The old backend connection must be gone before either the backend
+        // runtime primary or the visible local primary can change.
+        if (wasRunning) {
+          await disconnect();
+          const stopped = useVpnStore.getState();
+          if (stopped.status !== "stopped") {
+            throw new Error(
+              stopped.errorMessage || "VPN disconnect did not finish"
+            );
           }
-          void useSubscriptionStore.getState().pingAll();
+        }
+
+        const runtimeReady = await setPrimaryId(id);
+        if (!runtimeReady) {
+          throw new Error(
+            "Не удалось безопасно активировать выбранную подписку"
+          );
+        }
+        const sub = useSubscriptionStore
+          .getState()
+          .subscriptions.find((s) => s.id === id);
+        if (sub) {
+          if (sub.servers.length === 0) {
+            // Кеша нет (например, добавлена на старой версии без кеша или
+            // кеш потёрт) — единственный случай, когда нужен fetch. Дальше
+            // серверы лягут в sub.servers + localStorage и переключение
+            // станет мгновенным.
+            await useSubscriptionStore.getState().fetchSubscriptionById(id);
+          } else {
+            // Восстановление выбора: по имени; если имя из другой подписки
+            // не нашлось, а запись одна (full-mihomo «профиль») — авто-выбор.
+            const idx = findSelectedIndexByName(sub.servers);
+            const nextIndex =
+              idx >= 0 ? idx : sub.servers.length === 1 ? 0 : null;
+            if (nextIndex !== null) selectServer(nextIndex);
+            else useVpnStore.setState({ selectedIndex: null });
+            if (wasRunning && nextIndex !== null) {
+              await new Promise((resolve) => window.setTimeout(resolve, 200));
+              await connect();
+            }
+            void useSubscriptionStore.getState().pingAll();
+          }
         }
       }
+      closeSheet();
+    } catch (error) {
+      showToast({
+        kind: "error",
+        title: "Подписка",
+        message: String(error),
+        durationMs: 8000,
+      });
     }
-    closeSheet();
   };
 
   let metaTop = isRunning ? "ЗАЩИЩЕНО" : "НЕ ЗАЩИЩЕНО";
@@ -575,7 +586,14 @@ function PickSheet({
                       disabled={disabled}
                       onClick={() => {
                         setConfirmId(null);
-                        void removeSubscription(s.id);
+                        void removeSubscription(s.id).catch((error) => {
+                          showToast({
+                            kind: "error",
+                            title: "Не удалось удалить подписку",
+                            message: String(error),
+                            durationMs: 8000,
+                          });
+                        });
                       }}
                     >
                       удалить

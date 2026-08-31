@@ -2,7 +2,11 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getAllWindows } from "@tauri-apps/api/window";
-import { useVpnStore, type VpnStatus } from "./stores/vpnStore";
+import {
+  applyExternalVpnStatus,
+  useVpnStore,
+  type VpnStatus,
+} from "./stores/vpnStore";
 import "./FloatingApp.css";
 
 /**
@@ -104,7 +108,7 @@ export function FloatingApp() {
             event.payload.status
           )
         ) {
-          useVpnStore.setState({ status: event.payload.status });
+          applyExternalVpnStatus(event.payload.status);
         }
       }
     ).then((fn) => {
