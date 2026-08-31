@@ -709,21 +709,25 @@ pub async fn connect(
             }
             mihomo.mark_helper_spawned(true);
             // mixed_port запоминаем для is_xray_running и др.
-            match mihomo.mixed_port.lock() {
-                Ok(mut port) => *port = cfg.mixed_port,
-                Err(error) => {
-                    let message = format!("mutex: {error}");
-                    drop(error);
-                    let rollback = rollback_connect(
-                        &mihomo,
-                        &mihomo_api,
-                        &ks_ctx,
-                        &proxy_attempt_id,
-                        tun_mode,
-                    )
-                    .await;
-                    return Err(append_rollback_error(message, rollback));
+            // Convert PoisonError<MutexGuard> into an owned String inside a
+            // lexical sync-only scope. Neither the lock Result nor its guard
+            // may live across the rollback await (Tauri command futures must
+            // remain Send).
+            let mixed_port_update: Result<(), String> = {
+                let lock_result = mihomo.mixed_port.lock();
+                match lock_result {
+                    Ok(mut port) => {
+                        *port = cfg.mixed_port;
+                        Ok(())
+                    }
+                    Err(error) => Err(format!("mutex: {error}")),
                 }
+            };
+            if let Err(message) = mixed_port_update {
+                let rollback =
+                    rollback_connect(&mihomo, &mihomo_api, &ks_ctx, &proxy_attempt_id, tun_mode)
+                        .await;
+                return Err(append_rollback_error(message, rollback));
             }
             vpn::diagnostics::record("tun_readiness", "ok", "helper_ready");
             stamp("mihomo built-in TUN: spawned via helper");
