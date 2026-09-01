@@ -7,15 +7,16 @@
 //! `ProxyEnable` / `ProxyServer` / `ProxyOverride` в JSON-файл
 //! `%LOCALAPPDATA%\KwikProxy Secure\proxy_backup.json`. Restore requires the
 //! exact attempt token. An exact saved-original state is accepted as an
-//! idempotent success; an unrelated state is preserved and releases the local
-//! listener only when WinINet no longer points at our published endpoint. This
-//! makes interrupted per-field restore retryable without granting authority
-//! over foreign changes. Если приложение
+//! idempotent success. A foreign state is preserved while the marker/listener
+//! remain retained until that application's delayed restore is reconciled.
+//! This makes interrupted and multi-VPN restore ordering retryable without
+//! granting authority over foreign changes. Если приложение
 //! крашнется в режиме proxy и не успеет очистить — на старте next-run-а мы
 //! детектим backup-файл и предлагаем пользователю восстановить.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -30,12 +31,17 @@ const INET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet
 const BACKUP_DIR: &str = "KwikProxy Secure";
 const BACKUP_FILE: &str = "proxy_backup.json";
 pub const MANUAL_RESTORE_REQUIRED_CODE: &str = "proxy_restore_confirmation_required";
+pub const MANUAL_INTERVENTION_REQUIRED_CODE: &str = "proxy_restore_manual_intervention_required";
+pub const FOREIGN_PROXY_PENDING_CODE: &str = "proxy_restore_foreign_state_pending";
 static RESTORE_MUTEX: Mutex<()> = Mutex::new(());
+static RESTORE_CHALLENGE: Mutex<RestoreChallengeSlot> =
+    Mutex::new(RestoreChallengeSlot { current: None });
 const KWIK_PROXY_OVERRIDE: &str =
     "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;\
 172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;\
 172.29.*;172.30.*;172.31.*;192.168.*;<local>";
 
+#[cfg(test)]
 fn exact_write_set_matches(
     expected_server: &str,
     expected_override: &str,
@@ -64,12 +70,20 @@ enum RestorePlan {
     /// Every changed field is still either our publication or its original,
     /// so field-wise compare-before-write recovery is safe.
     RestoreOwnedFields,
-    /// A foreign state replaced our endpoint. Never overwrite it; merely
-    /// release the stale ownership marker so the local listener can stop.
-    PreserveForeignState,
+    /// A foreign state currently replaced our endpoint. Retain marker and
+    /// listener because that VPN may later restore the stale Kwik mapping it
+    /// captured when it started.
+    ForeignStatePending,
     /// Foreign fields exist but WinINet is still actively using our endpoint.
     /// Stopping the listener would strand clients on a dead loopback proxy.
     ManualResolutionRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiscardPlan {
+    NotifyExactOriginal,
+    RefuseLiveEndpoint,
+    RefuseForeignOrDisabled,
 }
 
 fn classify_failed_publication_field<T: PartialEq>(
@@ -148,6 +162,53 @@ fn proxy_strings_share_owned_loopback(current: &str, published: &str) -> bool {
             .any(|port| owned.contains(&port))
 }
 
+/// Strict authority for a confirmed overwrite. Unlike the broad listener
+/// retention predicate above, this accepts only the exact protocol ->
+/// 127.0.0.1:port mapping published by this build. Reordering, protocol-name
+/// case and surrounding whitespace are harmless; aliases, URL forms, extra
+/// protocols, duplicate protocols and other 127/8 addresses are rejected.
+fn strict_proxy_mapping(proxy_server: &str) -> Option<BTreeMap<String, u16>> {
+    let mut mapping = BTreeMap::new();
+    for component in proxy_server.split(';') {
+        let component = component.trim();
+        if component.is_empty() {
+            return None;
+        }
+        let (protocol, endpoint) = component.split_once('=')?;
+        let protocol = protocol.trim().to_ascii_lowercase();
+        if protocol.is_empty() {
+            return None;
+        }
+        let (host, port) = endpoint.trim().rsplit_once(':')?;
+        if host.trim() != "127.0.0.1" {
+            return None;
+        }
+        let port = port.trim().parse::<u16>().ok()?;
+        if mapping.insert(protocol, port).is_some() {
+            return None;
+        }
+    }
+    (!mapping.is_empty()).then_some(mapping)
+}
+
+fn strict_published_mapping_matches(current: &ProxyBackup, backup: &ProxyBackup) -> bool {
+    current.proxy_enable == Some(1)
+        && current.proxy_server.as_deref().is_some_and(|current| {
+            backup
+                .published_proxy_server
+                .as_deref()
+                .and_then(strict_proxy_mapping)
+                .filter(|published| {
+                    published.len() == 3
+                        && published.contains_key("http")
+                        && published.contains_key("https")
+                        && published.contains_key("socks")
+                        && published.get("http") == published.get("https")
+                })
+                .is_some_and(|published| strict_proxy_mapping(current) == Some(published))
+        })
+}
+
 fn plan_restore(current: &ProxyBackup, backup: &ProxyBackup) -> RestorePlan {
     if exact_proxy_state_matches(current, backup) {
         return RestorePlan::AlreadyOriginal;
@@ -176,7 +237,17 @@ fn plan_restore(current: &ProxyBackup, backup: &ProxyBackup) -> RestorePlan {
     } else if points_to_published_endpoint(current, backup) {
         RestorePlan::ManualResolutionRequired
     } else {
-        RestorePlan::PreserveForeignState
+        RestorePlan::ForeignStatePending
+    }
+}
+
+fn plan_discard(current: &ProxyBackup, backup: &ProxyBackup) -> DiscardPlan {
+    if exact_proxy_state_matches(current, backup) {
+        DiscardPlan::NotifyExactOriginal
+    } else if points_to_published_endpoint(current, backup) {
+        DiscardPlan::RefuseLiveEndpoint
+    } else {
+        DiscardPlan::RefuseForeignOrDisabled
     }
 }
 
@@ -188,8 +259,23 @@ fn exact_attempt_matches(backup: &ProxyBackup, attempt_id: &str) -> bool {
             .is_some_and(|owner| !owner.is_empty() && owner == attempt_id)
 }
 
+fn has_complete_ownership_metadata(backup: &ProxyBackup) -> bool {
+    backup
+        .attempt_id
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        && backup
+            .published_proxy_server
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && backup
+            .published_proxy_override
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+}
+
 /// Снимок настроек системного прокси для backup/restore.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProxyBackup {
     /// Unique connect attempt that created this backup. Legacy backups have
     /// no owner and are intentionally not restorable.
@@ -207,6 +293,76 @@ pub struct ProxyBackup {
     pub proxy_server: Option<String>,
     /// Значение `ProxyOverride`. None — ключ отсутствовал.
     pub proxy_override: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RestoreChallenge {
+    token: String,
+    attempt_id: String,
+    backup: ProxyBackup,
+    observed: ProxyBackup,
+}
+
+#[derive(Default)]
+struct RestoreChallengeSlot {
+    current: Option<RestoreChallenge>,
+}
+
+impl RestoreChallengeSlot {
+    fn issue(&mut self, attempt_id: &str, backup: &ProxyBackup, observed: &ProxyBackup) -> String {
+        if let Some(existing) = self.current.as_ref().filter(|existing| {
+            existing.attempt_id == attempt_id
+                && existing.backup == *backup
+                && existing.observed == *observed
+        }) {
+            return existing.token.clone();
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        self.current = Some(RestoreChallenge {
+            token: token.clone(),
+            attempt_id: attempt_id.to_string(),
+            backup: backup.clone(),
+            observed: observed.clone(),
+        });
+        token
+    }
+
+    /// Consume before validating. Any wrong/stale caller or changed state
+    /// invalidates the one-use correlation token.
+    fn take(&mut self, token: &str, expected_attempt: Option<&str>) -> Option<RestoreChallenge> {
+        let challenge = self.current.take()?;
+        (!token.is_empty()
+            && challenge.token == token
+            && expected_attempt.is_none_or(|attempt| challenge.attempt_id == attempt))
+        .then_some(challenge)
+    }
+
+    fn invalidate(&mut self) {
+        self.current = None;
+    }
+}
+
+fn challenge_guard() -> Result<std::sync::MutexGuard<'static, RestoreChallengeSlot>> {
+    RESTORE_CHALLENGE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("proxy restore challenge lock is poisoned"))
+}
+
+fn invalidate_restore_challenge() -> Result<()> {
+    challenge_guard()?.invalidate();
+    Ok(())
+}
+
+fn manual_restore_error(backup: &ProxyBackup, current: &ProxyBackup) -> Result<bool> {
+    let attempt = backup
+        .attempt_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .context("proxy backup has no exact attempt ownership token")?;
+    let token = challenge_guard()?.issue(attempt, backup, current);
+    anyhow::bail!(
+        "[{MANUAL_RESTORE_REQUIRED_CODE}] challenge={token}; system proxy still references this KwikProxy endpoint, but other proxy fields were changed by another application; explicit confirmation is required before restoring the saved snapshot"
+    )
 }
 
 /// Путь к файлу backup'а в %LOCALAPPDATA%\KwikProxy Secure\proxy_backup.json.
@@ -274,7 +430,12 @@ fn save_backup(backup: &ProxyBackup) -> Result<()> {
         std::fs::create_dir_all(parent).context("create proxy backup directory")?;
     }
     let json = serde_json::to_vec_pretty(backup).context("serialize proxy backup")?;
-    std::fs::write(&path, json).context("write proxy backup")?;
+    let temp_path = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&temp_path, json).context("write temporary proxy backup")?;
+    if let Err(error) = std::fs::rename(&temp_path, &path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error).context("publish proxy backup atomically");
+    }
     Ok(())
 }
 
@@ -290,6 +451,31 @@ fn delete_backup() -> Result<()> {
     }
 }
 
+fn delete_backup_if_matches(backup: &ProxyBackup, expected_state: &ProxyBackup) -> Result<()> {
+    let current_backup = read_backup_strict()?
+        .context("proxy ownership backup disappeared before verified deletion")?;
+    if current_backup != *backup {
+        anyhow::bail!("proxy ownership backup changed before verified deletion");
+    }
+    #[cfg(windows)]
+    if !exact_proxy_state_matches(&read_current_proxy_state()?, expected_state) {
+        anyhow::bail!("system proxy changed before verified backup deletion");
+    }
+    delete_backup()?;
+    #[cfg(windows)]
+    {
+        let after_delete = read_current_proxy_state()?;
+        if !exact_proxy_state_matches(&after_delete, expected_state) {
+            // Restore the exact durable marker before denying teardown. This
+            // cannot close the external registry race, but prevents a detected
+            // delete->republish window from becoming unrecoverable.
+            save_backup(backup).context("restore backup after post-delete proxy change")?;
+            anyhow::bail!("system proxy changed immediately after backup deletion");
+        }
+    }
+    Ok(())
+}
+
 /// Проверить, существует ли файл backup'а. Используется на старте app
 /// для детекции прерванной прошлой сессии (краш или kill).
 pub fn has_pending_backup() -> bool {
@@ -303,12 +489,33 @@ pub fn read_backup() -> Option<ProxyBackup> {
     serde_json::from_str(&data).ok()
 }
 
+/// Mutation paths must distinguish an absent marker from an unreadable or
+/// malformed one. Treating parse/access errors as "no backup" could release a
+/// listener or overwrite a recoverable snapshot without authority.
+fn read_backup_strict() -> Result<Option<ProxyBackup>> {
+    let path = backup_path().context("LOCALAPPDATA is unavailable")?;
+    let data = match std::fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read proxy ownership backup"),
+    };
+    serde_json::from_str(&data)
+        .context("parse proxy ownership backup")
+        .map(Some)
+}
+
 /// True only for the durable marker created by this exact connect attempt.
 /// Used when publication returned an error after it may already have written
 /// registry values: rollback must retain the listener until that marker is
 /// reconciled instead of assuming no publication occurred.
 pub fn has_pending_backup_for_attempt(attempt_id: &str) -> bool {
-    read_backup().is_some_and(|backup| exact_attempt_matches(&backup, attempt_id))
+    match read_backup_strict() {
+        Ok(Some(backup)) => exact_attempt_matches(&backup, attempt_id),
+        Ok(None) => false,
+        // Unknown marker ownership is not permission to kill a listener after
+        // a publication that may already have reached the registry.
+        Err(_) => has_pending_backup(),
+    }
 }
 
 /// Включить системный прокси: SOCKS5 на socks_port, HTTP/HTTPS на http_port.
@@ -319,6 +526,8 @@ pub fn has_pending_backup_for_attempt(attempt_id: &str) -> bool {
 pub fn set_system_proxy_owned(socks_port: u16, http_port: u16, attempt_id: &str) -> Result<()> {
     #[cfg(windows)]
     {
+        let _guard = restore_guard()?;
+        invalidate_restore_challenge()?;
         if attempt_id.is_empty() {
             anyhow::bail!("proxy publication requires a non-empty attempt id");
         }
@@ -356,7 +565,9 @@ pub fn set_system_proxy_owned(socks_port: u16, http_port: u16, attempt_id: &str)
             notify_proxy_settings_changed()
         })();
         if let Err(publication_error) = publication {
-            if let Err(restore_error) = restore_owned_publication(&snapshot, Some(attempt_id)) {
+            if let Err(restore_error) =
+                restore_owned_publication_locked(&snapshot, Some(attempt_id))
+            {
                 anyhow::bail!(
                     "proxy publication failed ({publication_error:#}); immediate restore also failed ({restore_error:#})"
                 );
@@ -391,6 +602,7 @@ fn restore_owned_publication_locked(
         .filter(|value| !value.is_empty())
         .context("proxy backup has no exact attempt ownership token")?;
     if expected_attempt.is_some_and(|expected| expected != attempt) {
+        invalidate_restore_challenge()?;
         return Ok(false);
     }
     let published_server = backup
@@ -407,6 +619,7 @@ fn restore_owned_publication_locked(
     let current = read_current_proxy_state()?;
     match plan_restore(&current, backup) {
         RestorePlan::AlreadyOriginal => {
+            invalidate_restore_challenge()?;
             // Idempotent registry state does not prove that WinINet observed
             // it. A previous restore may have written the snapshot and then
             // failed its notification. Always retry the non-mutating refresh
@@ -420,28 +633,35 @@ fn restore_owned_publication_locked(
             if !exact_proxy_state_matches(&notified, backup) {
                 anyhow::bail!("system proxy changed while notifying an already-restored state");
             }
-            delete_backup()?;
+            delete_backup_if_matches(backup, &notified)?;
             return Ok(true);
         }
-        RestorePlan::PreserveForeignState => {
-            // The active proxy endpoint is no longer ours. Preserve all
-            // foreign values byte-for-byte, but release the stale marker so
-            // the now-unreferenced local Mihomo listener can be stopped.
+        RestorePlan::ForeignStatePending => {
+            invalidate_restore_challenge()?;
+            // A second VPN may have captured our mapping before replacing it,
+            // then restore that stale mapping when it later stops. Releasing
+            // our listener/marker because its foreign mapping is active *now*
+            // would recreate a dead loopback endpoint later.
             let revalidated = read_current_proxy_state()?;
             if !exact_proxy_state_matches(&revalidated, &current)
                 || points_to_published_endpoint(&revalidated, backup)
             {
                 anyhow::bail!("system proxy changed while preserving foreign state");
             }
-            delete_backup()?;
-            return Ok(true);
-        }
-        RestorePlan::ManualResolutionRequired => {
             anyhow::bail!(
-                "[{MANUAL_RESTORE_REQUIRED_CODE}] system proxy still references this KwikProxy endpoint, but other proxy fields were changed by another application; explicit confirmation is required before restoring the saved snapshot"
+                "[{FOREIGN_PROXY_PENDING_CODE}] another application currently owns the system proxy; stop that VPN/application, then retry Disconnect so its delayed proxy restore can be reconciled safely"
             );
         }
-        RestorePlan::RestoreOwnedFields => {}
+        RestorePlan::ManualResolutionRequired => {
+            if strict_published_mapping_matches(&current, backup) {
+                return manual_restore_error(backup, &current);
+            }
+            invalidate_restore_challenge()?;
+            anyhow::bail!(
+                "[{MANUAL_INTERVENTION_REQUIRED_CODE}] the enabled proxy still references a KwikProxy listener port, but its protocol mapping is not the exact mapping published by this attempt; change or disable the Windows system proxy manually"
+            );
+        }
+        RestorePlan::RestoreOwnedFields => invalidate_restore_challenge()?,
     }
 
     let published_enable = Some(1u32);
@@ -525,14 +745,12 @@ fn restore_owned_publication_locked(
     // Always retry notification, including a later invocation after a prior
     // restore wrote the original registry values but WinINet refresh failed.
     notify_proxy_settings_changed()?;
-    delete_backup()?;
+    let notified = read_current_proxy_state()?;
+    if !exact_proxy_state_matches(&notified, backup) {
+        anyhow::bail!("system proxy changed while notifying the restored original write-set");
+    }
+    delete_backup_if_matches(backup, &notified)?;
     Ok(true)
-}
-
-#[cfg(windows)]
-fn restore_owned_publication(backup: &ProxyBackup, expected_attempt: Option<&str>) -> Result<bool> {
-    let _guard = restore_guard()?;
-    restore_owned_publication_locked(backup, expected_attempt)
 }
 
 #[cfg(windows)]
@@ -581,55 +799,77 @@ fn write_original_snapshot(backup: &ProxyBackup) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn force_restore_owned_proxy_locked(
+    backup: &ProxyBackup,
+    attempt_id: &str,
+    challenge: &RestoreChallenge,
+) -> Result<bool> {
+    if !exact_attempt_matches(backup, attempt_id) {
+        invalidate_restore_challenge()?;
+        return Ok(false);
+    }
+
+    let current = read_current_proxy_state()?;
+    if challenge.attempt_id != attempt_id
+        || challenge.backup != *backup
+        || challenge.observed != current
+    {
+        anyhow::bail!("proxy restore confirmation challenge is stale or changed");
+    }
+    if plan_restore(&current, backup) != RestorePlan::ManualResolutionRequired
+        || !strict_published_mapping_matches(&current, backup)
+    {
+        anyhow::bail!(
+            "system proxy no longer has the exact published protocol mapping; retry ordinary recovery"
+        );
+    }
+
+    // The challenge is bound to the byte-exact observed state. Revalidate as
+    // close as possible to the write; the Windows registry has no multi-value
+    // compare-and-swap, so external writers remain a minimized best-effort
+    // race. All in-process restore attempts are serialized by RESTORE_MUTEX.
+    let revalidated = read_current_proxy_state()?;
+    if !exact_proxy_state_matches(&current, &revalidated)
+        || !strict_published_mapping_matches(&revalidated, backup)
+    {
+        anyhow::bail!("system proxy changed before confirmed restore; retry ordinary recovery");
+    }
+    write_original_snapshot(backup)?;
+    let restored = read_current_proxy_state()?;
+    if !exact_proxy_state_matches(&restored, backup) {
+        anyhow::bail!("confirmed proxy restore did not reach the saved snapshot");
+    }
+    notify_proxy_settings_changed()?;
+    let notified = read_current_proxy_state()?;
+    if !exact_proxy_state_matches(&notified, backup) {
+        anyhow::bail!("system proxy changed while notifying confirmed restore");
+    }
+    delete_backup_if_matches(backup, &notified)?;
+    Ok(true)
+}
+
 /// Explicit, user-confirmed recovery for the one ambiguous case where the
-/// enabled WinINet mapping still references this attempt's loopback listener
-/// but another field changed. Exact attempt ownership is mandatory. A foreign
-/// endpoint can never be force-restored by this API.
-pub fn force_restore_owned_proxy(attempt_id: &str) -> Result<bool> {
+/// enabled WinINet mapping still has the exact protocol/127.0.0.1/port map
+/// published by this attempt but another field changed. The one-use challenge
+/// is minted only by an immediately preceding ordinary restore request. It is
+/// correlation against direct invocation by the renderer, not a privileged
+/// security boundary: the renderer is part of the trusted application.
+pub fn force_restore_owned_proxy(attempt_id: &str, challenge: &str) -> Result<bool> {
     #[cfg(windows)]
     {
         let _guard = restore_guard()?;
-        let Some(backup) = read_backup() else {
+        let challenge = challenge_guard()?
+            .take(challenge, Some(attempt_id))
+            .context("proxy restore confirmation challenge is missing, invalid, or already used")?;
+        let Some(backup) = read_backup_strict()? else {
             return Ok(false);
         };
-        if !exact_attempt_matches(&backup, attempt_id) {
-            return Ok(false);
-        }
-
-        let current = read_current_proxy_state()?;
-        match plan_restore(&current, &backup) {
-            RestorePlan::ManualResolutionRequired => {
-                // Revalidate the complete observed state and semantic owned
-                // endpoint immediately before the confirmed write. Windows
-                // registry has no compare-and-swap; the remaining external
-                // writer race is best-effort, while our in-process attempts
-                // are serialized by RESTORE_MUTEX.
-                let revalidated = read_current_proxy_state()?;
-                if !exact_proxy_state_matches(&current, &revalidated)
-                    || !points_to_published_endpoint(&revalidated, &backup)
-                {
-                    anyhow::bail!(
-                        "system proxy changed before confirmed restore; retry Disconnect"
-                    );
-                }
-                write_original_snapshot(&backup)?;
-                let restored = read_current_proxy_state()?;
-                if !exact_proxy_state_matches(&restored, &backup) {
-                    anyhow::bail!("confirmed proxy restore did not reach the saved snapshot");
-                }
-                notify_proxy_settings_changed()?;
-                delete_backup()?;
-                Ok(true)
-            }
-            // State may have changed while the confirmation dialog was open.
-            // Fall back to the ordinary exact/preserve-foreign policy; it
-            // either reaches a safe-to-stop state or fails closed.
-            _ => restore_owned_publication_locked(&backup, Some(attempt_id)),
-        }
+        force_restore_owned_proxy_locked(&backup, attempt_id, &challenge)
     }
     #[cfg(not(windows))]
     {
-        let _ = attempt_id;
+        let _ = (attempt_id, challenge);
         Ok(false)
     }
 }
@@ -639,10 +879,11 @@ pub fn force_restore_owned_proxy(attempt_id: &str) -> Result<bool> {
 pub fn clear_system_proxy_owned(attempt_id: &str) -> Result<bool> {
     #[cfg(windows)]
     {
-        let Some(backup) = read_backup() else {
+        let _guard = restore_guard()?;
+        let Some(backup) = read_backup_strict()? else {
             return Ok(false);
         };
-        restore_owned_publication(&backup, Some(attempt_id))
+        restore_owned_publication_locked(&backup, Some(attempt_id))
     }
     #[cfg(not(windows))]
     {
@@ -657,13 +898,42 @@ pub fn clear_system_proxy_owned(attempt_id: &str) -> Result<bool> {
 pub fn restore_pending_owned_proxy() -> Result<bool> {
     #[cfg(windows)]
     {
-        let Some(backup) = read_backup() else {
+        let _guard = restore_guard()?;
+        let Some(backup) = read_backup_strict()? else {
+            invalidate_restore_challenge()?;
             return Ok(false);
         };
-        restore_owned_publication(&backup, None)
+        restore_owned_publication_locked(&backup, None)
     }
     #[cfg(not(windows))]
     {
+        Ok(false)
+    }
+}
+
+/// Confirmed crash/startup recovery. It uses the durable exact attempt token
+/// from the backup, so no in-memory Mihomo state is required, but otherwise
+/// enforces the same one-use challenge and strict mapping as live disconnect.
+pub fn force_restore_pending_owned_proxy(challenge: &str) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let _guard = restore_guard()?;
+        let challenge = challenge_guard()?
+            .take(challenge, None)
+            .context("proxy restore confirmation challenge is missing, invalid, or already used")?;
+        let Some(backup) = read_backup_strict()? else {
+            return Ok(false);
+        };
+        let attempt_id = backup
+            .attempt_id
+            .clone()
+            .filter(|value| !value.is_empty())
+            .context("proxy backup has no exact attempt ownership token")?;
+        force_restore_owned_proxy_locked(&backup, &attempt_id, &challenge)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = challenge;
         Ok(false)
     }
 }
@@ -696,13 +966,6 @@ fn notify_proxy_settings_changed() -> Result<()> {
     )
 }
 
-#[cfg(windows)]
-fn read_proxy_enable() -> Option<u32> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key = hkcu.open_subkey(INET_SETTINGS).ok()?;
-    key.get_value::<u32, _>("ProxyEnable").ok()
-}
-
 /// Прочитать `ProxyServer` напрямую — для startup poison check и
 /// pre-flight check при connect. None если ключа нет.
 #[cfg(windows)]
@@ -712,51 +975,50 @@ pub fn read_proxy_server() -> Option<String> {
     key.get_value::<String, _>("ProxyServer").ok()
 }
 
-#[cfg(windows)]
-fn read_proxy_override() -> Option<String> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key = hkcu.open_subkey(INET_SETTINGS).ok()?;
-    key.get_value::<String, _>("ProxyOverride").ok()
-}
-
 #[cfg(not(windows))]
 pub fn read_proxy_server() -> Option<String> {
     None
 }
 
-/// True only when a non-legacy backup carries an exact attempt token and its
-/// exact publication is still enabled in WinINet. Port ranges are never used
-/// as ownership evidence.
-pub fn is_proxy_pointing_to_us() -> bool {
+/// Startup-facing classification. The broad endpoint flag is only a signal to
+/// keep/recover state; overwrite authority still comes exclusively from exact
+/// ordinary ownership or the strict confirmed mapping.
+pub fn proxy_recovery_status() -> (bool, &'static str) {
     #[cfg(windows)]
     {
-        read_backup().is_some_and(|backup| {
-            backup
-                .attempt_id
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
-                && backup
-                    .published_proxy_server
-                    .as_deref()
-                    .is_some_and(|published| {
-                        backup.published_proxy_override.as_deref().is_some_and(
-                            |published_override| {
-                                exact_write_set_matches(
-                                    published,
-                                    published_override,
-                                    read_proxy_enable(),
-                                    read_proxy_server().as_deref(),
-                                    read_proxy_override().as_deref(),
-                                )
-                            },
-                        )
-                    })
-        })
+        let backup = match read_backup_strict() {
+            Ok(Some(backup)) => backup,
+            Ok(None) => return (false, "none"),
+            Err(_) => return (false, "unreadable"),
+        };
+        let current = match read_current_proxy_state() {
+            Ok(current) => current,
+            Err(_) => return (false, "unreadable"),
+        };
+        if !has_complete_ownership_metadata(&backup) {
+            return (false, "unreadable");
+        }
+        let endpoint_live = points_to_published_endpoint(&current, &backup);
+        let disposition = match plan_restore(&current, &backup) {
+            RestorePlan::ManualResolutionRequired
+                if strict_published_mapping_matches(&current, &backup) =>
+            {
+                "confirmation_required"
+            }
+            RestorePlan::ManualResolutionRequired => "manual_intervention_required",
+            RestorePlan::ForeignStatePending => "foreign_state_pending",
+            _ => "automatic",
+        };
+        (endpoint_live, disposition)
     }
     #[cfg(not(windows))]
     {
-        false
+        (false, "none")
     }
+}
+
+pub fn is_proxy_pointing_to_us() -> bool {
+    proxy_recovery_status().0
 }
 
 /// Удалить backup-файл без применения значений. Используется когда
@@ -764,6 +1026,42 @@ pub fn is_proxy_pointing_to_us() -> bool {
 /// (значит наши значения он уже не считает актуальными — продолжаем
 /// с текущим состоянием реестра).
 pub fn discard_backup() -> Result<()> {
+    let _guard = restore_guard()?;
+    invalidate_restore_challenge()?;
+    let Some(backup) = read_backup_strict()? else {
+        return Ok(());
+    };
+    let attempt = backup
+        .attempt_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .context("refusing to discard a legacy proxy backup without exact ownership")?;
+    let published = backup
+        .published_proxy_server
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .context("refusing to discard proxy backup without exact published endpoint")?;
+    let published_override = backup
+        .published_proxy_override
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .context("refusing to discard proxy backup without exact published bypass")?;
+    let _ = (attempt, published, published_override);
+    #[cfg(windows)]
+    {
+        let current = read_current_proxy_state()?;
+        if plan_discard(&current, &backup) == DiscardPlan::NotifyExactOriginal {
+            // The registry is already original, but a previous restore may
+            // have failed before WinINet observed it. Reuse the normal
+            // idempotent path so notification and post-notify revalidation
+            // happen before the durable marker is released.
+            return restore_owned_publication_locked(&backup, None).map(|_| ());
+        }
+        anyhow::bail!(
+            "refusing to discard recovery backup before the exact saved proxy snapshot is restored; another VPN may later reapply the captured KwikProxy endpoint"
+        );
+    }
+    #[cfg(not(windows))]
     delete_backup()
 }
 
@@ -923,12 +1221,12 @@ mod tests {
     }
 
     #[test]
-    fn foreign_endpoint_is_preserved_and_local_listener_may_stop() {
+    fn foreign_endpoint_is_preserved_but_delayed_restore_keeps_ownership() {
         let backup = owned_backup();
         let current = state(1, "http=127.0.0.1:20808", "foreign-bypass");
         assert_eq!(
             plan_restore(&current, &backup),
-            RestorePlan::PreserveForeignState
+            RestorePlan::ForeignStatePending
         );
         assert!(!points_to_published_endpoint(&current, &backup));
     }
@@ -973,7 +1271,84 @@ mod tests {
     }
 
     #[test]
-    fn disabled_proxy_with_retained_owned_server_is_safe_to_stop() {
+    fn confirmed_restore_requires_the_exact_normalized_protocol_map() {
+        let published = "socks=127.0.0.1:56800;http=127.0.0.1:56801;https=127.0.0.1:56801";
+        let mut backup = owned_backup();
+        backup.published_proxy_server = Some(published.into());
+
+        let equivalent = state(
+            1,
+            " HTTPS = 127.0.0.1:56801 ; SOCKS = 127.0.0.1:56800 ; HTTP = 127.0.0.1:56801 ",
+            "foreign-bypass",
+        );
+        assert!(strict_published_mapping_matches(&equivalent, &backup));
+
+        for rejected in [
+            "https=127.42.7.9:56801;socks=127.0.0.1:56800;http=127.0.0.1:56801",
+            "https=localhost:56801;socks=127.0.0.1:56800;http=127.0.0.1:56801",
+            "https=HTTP://127.0.0.1:56801;socks=127.0.0.1:56800;http=127.0.0.1:56801",
+            "https=127.0.0.1:56801;socks=127.0.0.1:56800;ftp=127.0.0.1:56801",
+            "https=127.0.0.1:56801;socks=127.0.0.1:56800;http=127.0.0.1:56802",
+            "https=127.0.0.1:56801;socks=127.0.0.1:56800",
+            "https=127.0.0.1:56801;socks=127.0.0.1:56800;http=127.0.0.1:56801;http=127.0.0.1:56801",
+        ] {
+            let current = state(1, rejected, "foreign-bypass");
+            assert!(points_to_published_endpoint(&current, &backup));
+            assert!(!strict_published_mapping_matches(&current, &backup));
+        }
+
+        let mut invalid_metadata = backup.clone();
+        invalid_metadata.published_proxy_server =
+            Some("ftp=127.0.0.1:56800;http=127.0.0.1:56801;https=127.0.0.1:56801".into());
+        let current = state(
+            1,
+            invalid_metadata.published_proxy_server.as_deref().unwrap(),
+            "foreign-bypass",
+        );
+        assert!(!strict_published_mapping_matches(
+            &current,
+            &invalid_metadata
+        ));
+    }
+
+    #[test]
+    fn manual_restore_challenge_is_stable_then_single_use() {
+        let backup = owned_backup();
+        let observed = state(1, "http=127.0.0.1:56800", "foreign-bypass");
+        let mut slot = RestoreChallengeSlot::default();
+        let first = slot.issue("attempt-a", &backup, &observed);
+        let repeated = slot.issue("attempt-a", &backup, &observed);
+        assert_eq!(first, repeated);
+        let issued = slot.take(&first, Some("attempt-a")).unwrap();
+        assert_eq!(issued.backup, backup);
+        assert_eq!(issued.observed, observed);
+        assert!(slot.take(&first, Some("attempt-a")).is_none());
+    }
+
+    #[test]
+    fn challenge_state_or_token_mismatch_invalidates_it() {
+        let backup = owned_backup();
+        let observed = state(1, "http=127.0.0.1:56800", "foreign-bypass");
+        let changed = state(1, "http=127.0.0.1:56800", "changed-again");
+        let mut slot = RestoreChallengeSlot::default();
+        let token = slot.issue("attempt-a", &backup, &observed);
+        let issued = slot.take(&token, Some("attempt-a")).unwrap();
+        assert_ne!(issued.observed, changed);
+        assert!(slot.take(&token, Some("attempt-a")).is_none());
+
+        let token = slot.issue("attempt-a", &backup, &observed);
+        assert!(slot.take("wrong-token", Some("attempt-a")).is_none());
+        assert!(slot.take(&token, Some("attempt-a")).is_none());
+
+        let token = slot.issue("attempt-a", &backup, &observed);
+        let mut replaced_backup = backup.clone();
+        replaced_backup.proxy_override = Some("different-saved-target".into());
+        let issued = slot.take(&token, Some("attempt-a")).unwrap();
+        assert_ne!(issued.backup, replaced_backup);
+    }
+
+    #[test]
+    fn disabled_proxy_with_retained_owned_server_keeps_recovery_marker() {
         let backup = owned_backup();
         let current = state(
             0,
@@ -983,7 +1358,45 @@ mod tests {
         assert!(!points_to_published_endpoint(&current, &backup));
         assert_eq!(
             plan_restore(&current, &backup),
-            RestorePlan::PreserveForeignState
+            RestorePlan::ForeignStatePending
+        );
+        assert_eq!(
+            plan_discard(&current, &backup),
+            DiscardPlan::RefuseForeignOrDisabled
+        );
+    }
+
+    #[test]
+    fn discard_refuses_any_enabled_broad_owned_endpoint() {
+        let backup = owned_backup();
+        let changed_bypass = state(1, "http=127.0.0.1:56800", "foreign-bypass");
+        assert_eq!(
+            plan_discard(&changed_bypass, &backup),
+            DiscardPlan::RefuseLiveEndpoint
+        );
+
+        let semantic_alias = state(1, "HTTP://127.42.7.9:56800", "foreign-bypass");
+        assert_eq!(
+            plan_discard(&semantic_alias, &backup),
+            DiscardPlan::RefuseLiveEndpoint
+        );
+
+        let foreign = state(1, "http=127.0.0.1:20808", "foreign-bypass");
+        assert_eq!(
+            plan_discard(&foreign, &backup),
+            DiscardPlan::RefuseForeignOrDisabled
+        );
+    }
+
+    #[test]
+    fn exact_original_wins_even_if_it_reuses_the_published_port() {
+        let mut backup = owned_backup();
+        backup.proxy_server = Some("http=127.0.0.1:56800".into());
+        let current = state(1, "http=127.0.0.1:56800", "<local>");
+        assert!(points_to_published_endpoint(&current, &backup));
+        assert_eq!(
+            plan_discard(&current, &backup),
+            DiscardPlan::NotifyExactOriginal
         );
     }
 

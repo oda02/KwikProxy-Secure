@@ -10,9 +10,19 @@ import {
   AttemptEpoch,
   isSameConnectionSelection,
   stopAndReconcile,
+  stopOnceAndReconcile,
   type BackendStopResult,
 } from "../lib/asyncControl";
-import { requiresProxyRestoreConfirmation } from "../lib/proxyRestore";
+import {
+  connectFailurePresentation,
+  ENTIRE_SESSION_RETAINED,
+  errorHasCode,
+  extractProxyRestoreChallenge,
+  proxyRestoreConfirmationArgs,
+  PROXY_RESTORE_FOREIGN_STATE_PENDING,
+  PROXY_RESTORE_MANUAL_INTERVENTION_REQUIRED,
+  preserveConnectionMetadataAfterCleanup,
+} from "../lib/proxyRestore";
 
 /** Anti-DPI опции в формате camelCase, который Rust десериализует через
  *  serde(rename_all = "camelCase") в struct AntiDpiOptions. */
@@ -232,7 +242,8 @@ class BackendCleanupFailure extends Error {
     message: string,
     readonly cleanupError: unknown,
     readonly observedRunning: boolean | null,
-    readonly connectedResult: ConnectResult | null = null
+    readonly connectedResult: ConnectResult | null = null,
+    readonly entireSessionRetained = false
   ) {
     super(`${message}: ${String(cleanupError)}`);
     this.name = "BackendCleanupFailure";
@@ -240,22 +251,41 @@ class BackendCleanupFailure extends Error {
 }
 
 class ProxyRestoreCancelled extends Error {
+  readonly entireSessionRetained = true;
+
   constructor(readonly observedRunning: boolean | null) {
     super(i18n.t("vpnStore.proxyRestore.cancelledMessage"));
     this.name = "ProxyRestoreCancelled";
   }
 }
 
+class ProxyRestoreBlocked extends Error {
+  readonly entireSessionRetained = true;
+
+  constructor(
+    message: string,
+    readonly observedRunning: boolean | null
+  ) {
+    super(message);
+    this.name = "ProxyRestoreBlocked";
+  }
+}
+
 const cleanupBackendConnection = (
-  forceProxyRestore = false
-): Promise<BackendStopResult> =>
-  stopAndReconcile(
-    () =>
-      invoke(
-        forceProxyRestore ? "disconnect_force_restore_proxy" : "disconnect"
-      ),
-    () => invoke<boolean>("is_xray_running")
-  );
+  proxyRestoreChallenge?: string
+): Promise<BackendStopResult> => {
+  const stop = () =>
+    invoke<void>(
+      proxyRestoreChallenge ? "disconnect_force_restore_proxy" : "disconnect",
+      proxyRestoreChallenge
+        ? proxyRestoreConfirmationArgs(proxyRestoreChallenge)
+        : undefined
+    );
+  const isRunning = () => invoke<boolean>("is_xray_running");
+  return proxyRestoreChallenge
+    ? stopOnceAndReconcile(stop, isRunning)
+    : stopAndReconcile(stop, isRunning);
+};
 
 export const useVpnStore = create<VpnState>((set, get) => ({
   status: "stopped",
@@ -501,7 +531,8 @@ export const useVpnStore = create<VpnState>((set, get) => ({
                     "cancelled connection cleanup failed",
                     cleanup.error,
                     cleanup.observedRunning,
-                    response
+                    response,
+                    errorHasCode(cleanup.error, ENTIRE_SESSION_RETAINED)
                   );
                 }
                 throw new ConnectCancelled();
@@ -524,7 +555,8 @@ export const useVpnStore = create<VpnState>((set, get) => ({
                     selectionError,
                     cleanup.error,
                     cleanup.observedRunning,
-                    response
+                    response,
+                    errorHasCode(cleanup.error, ENTIRE_SESSION_RETAINED)
                   );
                 }
                 throw new ConnectFailure(
@@ -591,34 +623,71 @@ export const useVpnStore = create<VpnState>((set, get) => ({
           return;
         }
         const message = e instanceof Error ? e.message : String(e);
+        const retainedRollback = errorHasCode(e, ENTIRE_SESSION_RETAINED);
+        let retainedRollbackRunning: boolean | null = null;
+        if (retainedRollback) {
+          try {
+            retainedRollbackRunning = await invoke<boolean>("is_xray_running");
+          } catch {
+            // The backend retention marker remains authoritative. A failed
+            // status probe must not turn the UI back into a Connect action.
+          }
+        }
+        const retainedPresentation = connectFailurePresentation(
+          e,
+          retainedRollbackRunning
+        );
+        const visibleMessage = retainedRollback
+          ? i18n.t("vpnStore.connectError.cleanupPending", { details: message })
+          : message;
         if (e instanceof BackendCleanupFailure && e.connectedResult) {
+          const presentation = connectFailurePresentation(
+            e.cleanupError,
+            e.observedRunning
+          );
+          const preserveConnectionMetadata =
+            preserveConnectionMetadataAfterCleanup(
+              e.observedRunning,
+              e.entireSessionRetained
+            );
           set({
-            status: e.observedRunning === true ? "running" : "error",
+            status: presentation.status,
             socksPort:
-              e.observedRunning === true ? e.connectedResult.socks_port : null,
+              preserveConnectionMetadata ? e.connectedResult.socks_port : null,
             httpPort:
-              e.observedRunning === true ? e.connectedResult.http_port : null,
+              preserveConnectionMetadata ? e.connectedResult.http_port : null,
             socksUsername:
-              e.observedRunning === true
+              preserveConnectionMetadata
                 ? e.connectedResult.socks_username ?? null
                 : null,
             socksPassword:
-              e.observedRunning === true
+              preserveConnectionMetadata
                 ? e.connectedResult.socks_password ?? null
                 : null,
-            connectedAt: e.observedRunning === true ? Date.now() : null,
-            errorMessage: message,
+            connectedAt: preserveConnectionMetadata ? Date.now() : null,
+            errorMessage: presentation.cleanupPending
+              ? i18n.t("vpnStore.connectError.cleanupPending", {
+                  details: message,
+                })
+              : message,
           });
+        } else if (retainedPresentation.cleanupPending) {
+          // Preserve all existing ports/credentials/connectedAt. The rollback
+          // explicitly retained backend ownership, so Disconnect must remain
+          // available even when the best-effort process probe is false/null.
+          set({ status: retainedPresentation.status, errorMessage: visibleMessage });
         } else {
           set({ status: "error", errorMessage: message });
         }
         showToast({
           kind: e instanceof ConnectFailure ? e.toastKind : "error",
           title:
-            e instanceof ConnectFailure
+            retainedRollback
+              ? i18n.t("vpnStore.connectError.cleanupPendingTitle")
+              : e instanceof ConnectFailure
               ? e.toastTitle
               : i18n.t("vpnStore.connectError.title"),
-          message,
+          message: visibleMessage,
           durationMs: 8000,
         });
       }
@@ -632,9 +701,10 @@ export const useVpnStore = create<VpnState>((set, get) => ({
       let cleanup = await connectionLifecycle.runExclusive(
         cleanupBackendConnection
       );
+      const proxyRestoreChallenge = extractProxyRestoreChallenge(cleanup.error);
       if (
         (!cleanup.stopped || !cleanup.cleanupSucceeded) &&
-        requiresProxyRestoreConfirmation(cleanup.error)
+        proxyRestoreChallenge
       ) {
         // The backend kept Mihomo alive, so Windows cannot be stranded on a
         // dead loopback proxy. It revalidates the exact attempt token and
@@ -646,14 +716,30 @@ export const useVpnStore = create<VpnState>((set, get) => ({
           throw new ProxyRestoreCancelled(cleanup.observedRunning);
         }
         cleanup = await connectionLifecycle.runExclusive(() =>
-          cleanupBackendConnection(true)
+          cleanupBackendConnection(proxyRestoreChallenge)
         );
       }
       if (!cleanup.stopped || !cleanup.cleanupSucceeded) {
+        if (errorHasCode(cleanup.error, PROXY_RESTORE_FOREIGN_STATE_PENDING)) {
+          throw new ProxyRestoreBlocked(
+            i18n.t("vpnStore.proxyRestore.foreignProxyPending"),
+            cleanup.observedRunning
+          );
+        }
+        if (
+          errorHasCode(cleanup.error, PROXY_RESTORE_MANUAL_INTERVENTION_REQUIRED)
+        ) {
+          throw new ProxyRestoreBlocked(
+            i18n.t("vpnStore.proxyRestore.manualIntervention"),
+            cleanup.observedRunning
+          );
+        }
         throw new BackendCleanupFailure(
           "VPN disconnect failed",
           cleanup.error,
-          cleanup.observedRunning
+          cleanup.observedRunning,
+          null,
+          errorHasCode(cleanup.error, ENTIRE_SESSION_RETAINED)
         );
       }
       // A disconnect→connect caller (server switch, network change, reset)
@@ -672,13 +758,22 @@ export const useVpnStore = create<VpnState>((set, get) => ({
     } catch (e) {
       if (connectionAttempts.isCurrent(disconnectAttempt)) {
         const message = e instanceof Error ? e.message : String(e);
-        const positivelyRunning =
-          (e instanceof BackendCleanupFailure ||
-            e instanceof ProxyRestoreCancelled) &&
-          e.observedRunning === true;
+        const lifecycleError =
+          e instanceof BackendCleanupFailure ||
+          e instanceof ProxyRestoreCancelled ||
+          e instanceof ProxyRestoreBlocked;
+        const observedRunning = lifecycleError ? e.observedRunning : null;
+        const positivelyRunning = observedRunning === true;
+        const entireSessionRetained =
+          lifecycleError && e.entireSessionRetained === true;
+        const preserveConnectionMetadata =
+          preserveConnectionMetadataAfterCleanup(
+            observedRunning,
+            entireSessionRetained
+          );
         set({
           status: positivelyRunning ? "running" : "error",
-          ...(!positivelyRunning
+          ...(!preserveConnectionMetadata
             ? {
                 socksPort: null,
                 httpPort: null,
@@ -690,10 +785,15 @@ export const useVpnStore = create<VpnState>((set, get) => ({
           errorMessage: message,
         });
         showToast({
-          kind: e instanceof ProxyRestoreCancelled ? "warning" : "error",
+          kind:
+            e instanceof ProxyRestoreCancelled || e instanceof ProxyRestoreBlocked
+              ? "warning"
+              : "error",
           title:
             e instanceof ProxyRestoreCancelled
               ? i18n.t("vpnStore.proxyRestore.cancelledTitle")
+              : e instanceof ProxyRestoreBlocked
+                ? i18n.t("vpnStore.proxyRestore.blockedTitle")
               : i18n.t("vpnStore.connectError.title"),
           message,
           durationMs: 8000,

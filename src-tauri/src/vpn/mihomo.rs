@@ -26,6 +26,47 @@ use tokio::net::TcpStream;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(8);
 const READINESS_POLL: Duration = Duration::from_millis(100);
+
+#[cfg(windows)]
+fn exact_mihomo_pid_alive(pid: u32) -> Option<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE, STILL_ACTIVE};
+    use windows_sys::Win32::System::ProcessStatus::K32GetModuleBaseNameW;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if handle.is_null() {
+            return Some(false);
+        }
+        let mut exit_code = 0u32;
+        let exit_ok = GetExitCodeProcess(handle, &mut exit_code) != 0;
+        let mut name = [0u16; 260];
+        let name_len = K32GetModuleBaseNameW(
+            handle,
+            std::ptr::null_mut(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+        );
+        CloseHandle(handle);
+        if !exit_ok {
+            return None;
+        }
+        if exit_code != STILL_ACTIVE as u32 {
+            return Some(false);
+        }
+        if name_len == 0 {
+            return None;
+        }
+        let name = String::from_utf16_lossy(&name[..name_len as usize]).to_ascii_lowercase();
+        Some(name == "mihomo.exe" || name == "mihomo")
+    }
+}
+
+#[cfg(not(windows))]
+fn exact_mihomo_pid_alive(_pid: u32) -> Option<bool> {
+    None
+}
 const READINESS_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Глобальный state Mihomo sidecar.
@@ -227,32 +268,33 @@ impl MihomoState {
                             let _ = f.flush();
                         }
                         let state = app_handle.state::<MihomoState>();
-                        let mut proxy_attempt = state.proxy_attempt_id.lock().ok();
-                        let is_current = state
-                            .current_pid
-                            .lock()
-                            .map(|g| *g == Some(my_pid))
-                            .unwrap_or(false);
+                        let mut proxy_attempt = match state.proxy_attempt_id.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => {
+                                state.local_cleanup_uncertain.store(true, Ordering::SeqCst);
+                                poisoned.into_inner()
+                            }
+                        };
+                        let is_current = match state.current_pid.lock() {
+                            Ok(current) => *current == Some(my_pid),
+                            Err(poisoned) => {
+                                state.local_cleanup_uncertain.store(true, Ordering::SeqCst);
+                                *poisoned.into_inner() == Some(my_pid)
+                            }
+                        };
                         if is_current {
-                            if let Ok(mut g) = state.child.lock() {
-                                *g = None;
-                            }
-                            if let Ok(mut g) = state.current_pid.lock() {
-                                *g = None;
-                            }
-                            state.local_cleanup_uncertain.store(false, Ordering::SeqCst);
-                            app_handle.state::<super::MihomoApiState>().clear();
-                            super::diagnostics::record("proxy_child", "error", "unexpected_exit");
-                            if let Some(attempt_id) =
-                                proxy_attempt.as_mut().and_then(|attempt| attempt.take())
-                            {
+                            // The process has already exited, so restore the
+                            // system proxy before doing any further local
+                            // state teardown to minimize the dead-loopback
+                            // window.
+                            let mut proxy_restore_verified = true;
+                            if let Some(attempt_id) = proxy_attempt.take() {
                                 if !matches!(
                                     crate::platform::proxy::clear_system_proxy_owned(&attempt_id),
                                     Ok(true)
                                 ) {
-                                    if let Some(current) = proxy_attempt.as_mut() {
-                                        **current = Some(attempt_id);
-                                    }
+                                    *proxy_attempt = Some(attempt_id);
+                                    proxy_restore_verified = false;
                                     super::diagnostics::record(
                                         "system_proxy",
                                         "error",
@@ -260,6 +302,22 @@ impl MihomoState {
                                     );
                                 }
                             }
+                            *state
+                                .child
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            *state
+                                .current_pid
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                            // The child is certainly gone, but failed proxy
+                            // recovery is still incomplete owned cleanup and
+                            // must remain visible/retryable to the renderer.
+                            state
+                                .local_cleanup_uncertain
+                                .store(!proxy_restore_verified, Ordering::SeqCst);
+                            app_handle.state::<super::MihomoApiState>().clear();
+                            super::diagnostics::record("proxy_child", "error", "unexpected_exit");
                         } else {
                             eprintln!(
                                 "[mihomo] pid={my_pid} устаревший — не трогаем state нового процесса"
@@ -280,41 +338,58 @@ impl MihomoState {
             // controller/proxy state. Normal termination and explicit stop
             // clear current_pid first, making this block a no-op.
             let state = app_handle.state::<MihomoState>();
-            let mut proxy_attempt = state.proxy_attempt_id.lock().ok();
-            let is_current = state
-                .current_pid
-                .lock()
-                .map(|current| *current == Some(my_pid))
-                .unwrap_or(false);
-            if is_current {
-                let child = state.child.lock().ok().and_then(|mut child| child.take());
-                let termination_verified = child.is_some_and(|child| child.kill().is_ok());
-                if termination_verified {
-                    if let Ok(mut current) = state.current_pid.lock() {
-                        *current = None;
-                    }
-                    state.local_cleanup_uncertain.store(false, Ordering::SeqCst);
-                } else {
+            let mut proxy_attempt = match state.proxy_attempt_id.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
                     state.local_cleanup_uncertain.store(true, Ordering::SeqCst);
+                    poisoned.into_inner()
                 }
-                app_handle.state::<super::MihomoApiState>().clear();
-                super::diagnostics::record("proxy_monitor", "error", "event_stream_lost");
-                if let Some(attempt_id) = proxy_attempt.as_mut().and_then(|attempt| attempt.take())
-                {
-                    if !matches!(
+            };
+            let is_current = match state.current_pid.lock() {
+                Ok(current) => *current == Some(my_pid),
+                Err(poisoned) => {
+                    state.local_cleanup_uncertain.store(true, Ordering::SeqCst);
+                    *poisoned.into_inner() == Some(my_pid)
+                }
+            };
+            if is_current {
+                // An event-stream failure does not mean the listener died.
+                // Reconcile WinINet first and retain the exact child handle
+                // when proxy restore is unsafe/ambiguous. Killing first could
+                // strand every WinINet client on a dead loopback endpoint.
+                let proxy_safe_to_stop = if let Some(attempt_id) = proxy_attempt.take() {
+                    if matches!(
                         crate::platform::proxy::clear_system_proxy_owned(&attempt_id),
                         Ok(true)
                     ) {
-                        if let Some(current) = proxy_attempt.as_mut() {
-                            **current = Some(attempt_id);
-                        }
-                        super::diagnostics::record(
-                            "system_proxy",
-                            "error",
-                            "monitor_restore_failed",
-                        );
+                        true
+                    } else {
+                        *proxy_attempt = Some(attempt_id);
+                        false
                     }
+                } else {
+                    true
+                };
+                if !proxy_safe_to_stop {
+                    state.local_cleanup_uncertain.store(true, Ordering::SeqCst);
+                    super::diagnostics::record(
+                        "system_proxy",
+                        "error",
+                        "monitor_restore_failed_listener_retained",
+                    );
+                    return;
                 }
+
+                // Keep the exact CommandChild handle. `kill(self)` consumes it
+                // even on failure, leaving only a reusable PID and no safe
+                // retry primitive. A user-visible disconnect can now retry
+                // proxy-first teardown with this handle still intact.
+                state.local_cleanup_uncertain.store(true, Ordering::SeqCst);
+                super::diagnostics::record(
+                    "proxy_monitor",
+                    "error",
+                    "event_stream_lost_listener_retained",
+                );
             }
         });
 
@@ -356,28 +431,56 @@ impl MihomoState {
     }
 
     pub fn clear_proxy_attempt(&self, attempt_id: &str) {
-        if let Ok(mut current) = self.proxy_attempt_id.lock() {
-            if current.as_deref() == Some(attempt_id) {
-                *current = None;
-            }
+        let mut current = self
+            .proxy_attempt_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.as_deref() == Some(attempt_id) {
+            *current = None;
         }
+    }
+
+    pub fn mark_local_cleanup_uncertain(&self, uncertain: bool) {
+        self.local_cleanup_uncertain
+            .store(uncertain, Ordering::SeqCst);
     }
 
     pub fn proxy_attempt_id(&self) -> Option<String> {
         self.proxy_attempt_id
             .lock()
-            .ok()
-            .and_then(|current| current.clone())
+            .unwrap_or_else(|poisoned| {
+                self.local_cleanup_uncertain.store(true, Ordering::SeqCst);
+                poisoned.into_inner()
+            })
+            .clone()
+    }
+
+    /// Conservative connect gate. A missing durable proxy backup is not
+    /// evidence that the current in-memory listener/attempt is safe to
+    /// replace: an external cleanup or disk failure may have removed it.
+    pub fn has_active_session_state(&self) -> bool {
+        self.proxy_attempt_id().is_some() || self.is_running()
     }
 
     /// Остановить Mihomo. Если не запущен — no-op.
     pub fn stop(&self) -> Result<(), String> {
         self.set_subscription_proxy_port(None);
-        let mut g = self.child.lock().map_err(|e| format!("mutex: {e}"))?;
+        let mut g = self.child.lock().unwrap_or_else(|poisoned| {
+            self.local_cleanup_uncertain.store(true, Ordering::SeqCst);
+            poisoned.into_inner()
+        });
         if let Some(child) = g.take() {
             let pid = child.pid();
             eprintln!("[mihomo] kill pid={pid} (явный stop)");
             if let Err(error) = child.kill() {
+                if exact_mihomo_pid_alive(pid) == Some(false) {
+                    self.local_cleanup_uncertain.store(false, Ordering::SeqCst);
+                    *self
+                        .current_pid
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                    return Ok(());
+                }
                 self.local_cleanup_uncertain.store(true, Ordering::SeqCst);
                 return Err(format!(
                     "kill local Mihomo pid={pid} failed; exact child state remains unknown: {error}"
@@ -385,15 +488,19 @@ impl MihomoState {
             }
             self.local_cleanup_uncertain.store(false, Ordering::SeqCst);
         } else if self.local_cleanup_uncertain.load(Ordering::SeqCst) {
-            let pid = self.current_pid.lock().ok().and_then(|current| *current);
+            let pid = *self
+                .current_pid
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             return Err(format!(
                 "local Mihomo termination is still unknown for exact pid {}",
                 pid.map_or_else(|| "unavailable".into(), |value| value.to_string())
             ));
         }
-        if let Ok(mut g) = self.current_pid.lock() {
-            *g = None;
-        }
+        *self
+            .current_pid
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         Ok(())
     }
 
@@ -402,8 +509,16 @@ impl MihomoState {
         if self.helper_spawned.load(Ordering::SeqCst) {
             return true;
         }
-        self.local_cleanup_uncertain.load(Ordering::SeqCst)
-            || self.child.lock().map(|g| g.is_some()).unwrap_or(false)
+        if self.local_cleanup_uncertain.load(Ordering::SeqCst) {
+            return true;
+        }
+        match self.child.lock() {
+            Ok(child) => child.is_some(),
+            Err(_) => {
+                self.local_cleanup_uncertain.store(true, Ordering::SeqCst);
+                true
+            }
+        }
     }
 }
 
@@ -505,6 +620,30 @@ mod readiness_tests {
         assert!(error.contains("4242"));
         assert!(state.is_running());
         assert_eq!(*state.current_pid.lock().unwrap(), Some(4242));
+    }
+
+    #[test]
+    fn terminated_child_proxy_restore_failure_stays_visible_until_reconciled() {
+        let state = MihomoState::new();
+        state.mark_local_cleanup_uncertain(true);
+        assert!(state.is_running());
+        assert!(state.stop().is_err());
+
+        // A later proxy-first disconnect clears this marker only after the
+        // durable restore succeeds; the already-terminated child then needs
+        // no additional kill.
+        state.mark_local_cleanup_uncertain(false);
+        assert!(state.stop().is_ok());
+        assert!(!state.is_running());
+    }
+
+    #[test]
+    fn in_memory_proxy_attempt_blocks_a_new_connect_without_a_durable_marker() {
+        let state = MihomoState::new();
+        *state.proxy_attempt_id.lock().unwrap() = Some("attempt-without-file".into());
+
+        assert!(state.has_active_session_state());
+        assert!(!state.is_running());
     }
 
     fn temporary_log() -> (std::path::PathBuf, Arc<Mutex<File>>) {

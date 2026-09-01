@@ -303,6 +303,27 @@ async fn rollback_connect(
 ) -> Result<(), String> {
     vpn::diagnostics::record("connect_rollback", "started", "post_spawn_failure");
     let mut errors = Vec::new();
+    // Restore/reconcile WinINet before tearing down either the local listener
+    // or protected tunnel/firewall. An ambiguous restore must leave the whole
+    // session intact so the user can confirm without losing connectivity.
+    if mihomo.proxy_attempt_id().as_deref() == Some(proxy_attempt_id) {
+        match platform::proxy::clear_system_proxy_owned(proxy_attempt_id) {
+            Ok(true) => {
+                mihomo.clear_proxy_attempt(proxy_attempt_id);
+                mihomo.mark_local_cleanup_uncertain(false);
+            }
+            Ok(false) => {
+                return Err(
+                    "attempt-owned system proxy publication was not found; session retained".into(),
+                );
+            }
+            Err(error) => {
+                return Err(format!(
+                    "restore attempt-owned system proxy before rollback teardown: {error:#}; session retained"
+                ));
+            }
+        }
+    }
     let mut privileged_cleanup_verified = !cleanup_helper;
     // Each stop is ownership-scoped: the local state owns only our sidecar,
     // and helper MihomoStop is authenticated/session-bound. No foreign VPN
@@ -348,15 +369,18 @@ async fn rollback_connect(
     }
     mihomo.mark_privileged_cleanup_uncertain(false);
     mihomo.mark_helper_spawned(false);
-    if let Err(error) = mihomo.stop() {
-        errors.push(format!("stop local Mihomo: {error}"));
+    let mut local_proxy_safe_to_stop = true;
+    if local_proxy_safe_to_stop {
+        if let Err(error) = mihomo.stop() {
+            local_proxy_safe_to_stop = false;
+            errors.push(format!("stop local Mihomo: {error}"));
+        }
+    } else {
+        errors.push("local Mihomo retained because its system proxy could not be restored".into());
     }
-    match platform::proxy::clear_system_proxy_owned(proxy_attempt_id) {
-        Ok(true) => mihomo.clear_proxy_attempt(proxy_attempt_id),
-        Ok(false) => errors.push("attempt-owned system proxy publication was not found".into()),
-        Err(error) => errors.push(format!("restore attempt-owned system proxy: {error:#}")),
+    if local_proxy_safe_to_stop {
+        mihomo_api.clear();
     }
-    mihomo_api.clear();
     *ks_ctx.0.lock().await = None;
     if errors.is_empty() {
         vpn::diagnostics::record("connect_rollback", "ok", "verified_owned_state_cleared");
@@ -403,7 +427,9 @@ async fn reconcile_privileged_before_tunnel_start() -> Result<(), String> {
 fn append_rollback_error(primary: String, rollback: Result<(), String>) -> String {
     match rollback {
         Ok(()) => primary,
-        Err(cleanup) => format!("{primary}; rollback incomplete: {cleanup}"),
+        Err(cleanup) => {
+            format!("[entire_session_retained] {primary}; rollback incomplete: {cleanup}")
+        }
     }
 }
 
@@ -423,6 +449,7 @@ mod rollback_tests {
         );
         assert!(message.contains("rollback incomplete"));
         assert!(message.contains("still running"));
+        assert!(message.contains("[entire_session_retained]"));
     }
 }
 
@@ -464,6 +491,10 @@ pub async fn connect(
     // 13.Q: если активного routing-профиля нет — применять встроенный
     // минимальный RU-шаблон (geosite:ru → DIRECT, ads → BLOCK).
     auto_apply_minimal_ru_rules: Option<bool>,
+    // Явный fallback для трафика, который не совпал ни с одним правилом.
+    // Отсутствующее поле от старого renderer'а сохраняет legacy-семантику
+    // routing-профиля/подписки (`auto`).
+    default_traffic: Option<String>,
     app_rules: Option<Vec<AppRule>>,
     // #4: разрешить IPv6 в конфиге mihomo (root + dns). По умолчанию false —
     // анти-leak. Не путать с `force_disable_ipv6` (WFP-блокировка v6 на уровне
@@ -487,11 +518,33 @@ pub async fn connect(
     // (warmup, helper round-trip, tun_start, и т.д.).
     let connect_start = std::time::Instant::now();
     let proxy_attempt_id = uuid::Uuid::new_v4().to_string();
+    let default_traffic = mihomo_config::DefaultTraffic::parse(default_traffic.as_deref())
+        .map_err(|error| error.to_string())?;
+    if kill_switch.unwrap_or(false)
+        && kill_switch_strict.unwrap_or(false)
+        && default_traffic == mihomo_config::DefaultTraffic::Direct
+    {
+        return Err(
+            "strict kill switch cannot be combined with Direct default traffic; choose VPN".into(),
+        );
+    }
     let stamp = |label: &str| {
         let elapsed = connect_start.elapsed().as_millis();
         eprintln!("[connect-timing][+{elapsed}ms] {label}");
     };
     stamp("start");
+
+    // The durable proxy marker is only one half of the ownership state. If
+    // the current process still retains a listener, uncertain child, helper,
+    // or attempt token, a missing/deleted marker must never authorize a
+    // second connect over it. The explicit disconnect path performs the
+    // proxy-first reconciliation and reports any required user action.
+    if mihomo.has_active_session_state() {
+        return Err(
+            "an existing KwikProxy session or proxy ownership attempt must be disconnected and reconciled before connecting again"
+                .into(),
+        );
+    }
 
     platform::helper_bootstrap::ensure_running()
         .await
@@ -658,6 +711,7 @@ pub async fn connect(
                 use_builtin_tun,
                 tun_device: tun_device.as_deref(),
                 routing_profile: active_profile.as_ref(),
+                default_traffic,
                 ipv6: ipv6_enabled,
                 custom_dns: custom_dns_slice,
             };
@@ -675,6 +729,7 @@ pub async fn connect(
                 auth_pair,
                 rules_slice,
                 active_profile.as_ref(),
+                default_traffic,
                 tun_mode,
                 tun_device.as_deref(),
                 ipv6_enabled,
@@ -919,13 +974,42 @@ pub async fn connect(
 /// Privileged cleanup is reconciled and verified before local ownership
 /// markers are cleared. If helper status is unknown, the command fails while
 /// retaining visible state so a later disconnect can retry safely.
-#[tauri::command]
-pub async fn disconnect(
-    mihomo: State<'_, MihomoState>,
-    mihomo_api: State<'_, vpn::MihomoApiState>,
-    ks_ctx: State<'_, KillSwitchState>,
+async fn disconnect_impl(
+    mihomo: &MihomoState,
+    mihomo_api: &vpn::MihomoApiState,
+    ks_ctx: &KillSwitchState,
+    proxy_restore_challenge: Option<&str>,
 ) -> Result<(), String> {
     let _lifecycle = platform::lifecycle::enter().await?;
+
+    // Proxy resolution is the transaction gate. Nothing else is stopped or
+    // disabled until Windows is safe without the local listener. Ordinary
+    // manual-required responses mint a stable one-use challenge; the force
+    // path consumes it after exact state revalidation.
+    if let Some(attempt_id) = mihomo.proxy_attempt_id() {
+        let restore = match proxy_restore_challenge {
+            Some(challenge) => platform::proxy::force_restore_owned_proxy(&attempt_id, challenge),
+            None => platform::proxy::clear_system_proxy_owned(&attempt_id),
+        };
+        match restore {
+            Ok(true) => {
+                mihomo.clear_proxy_attempt(&attempt_id);
+                mihomo.mark_local_cleanup_uncertain(false);
+            }
+            Ok(false) => {
+                return Err(
+                    "[entire_session_retained] disconnect cleanup incomplete: attempt-owned system proxy publication was not found; entire session retained"
+                        .into(),
+                );
+            }
+            Err(error) => {
+                return Err(format!(
+                    "[entire_session_retained] disconnect cleanup incomplete: restore attempt-owned system proxy before teardown: {error:#}; entire session retained"
+                ));
+            }
+        }
+    }
+
     let helper_owned = mihomo.helper_spawned();
     let firewall_owned = ks_ctx.0.lock().await.is_some();
     let mut errors = Vec::new();
@@ -974,24 +1058,7 @@ pub async fn disconnect(
         ));
     }
 
-    // Local proxy cleanup is independent from helper reachability. Restore
-    // the exact attempt-owned WinINet write-set while its listener is still
-    // alive; only then stop the local child. A failed restore deliberately
-    // keeps the listener alive instead of creating a dead loopback proxy.
     let mut local_cleanup_verified = true;
-    if let Some(attempt_id) = mihomo.proxy_attempt_id() {
-        match platform::proxy::clear_system_proxy_owned(&attempt_id) {
-            Ok(true) => mihomo.clear_proxy_attempt(&attempt_id),
-            Ok(false) => {
-                local_cleanup_verified = false;
-                errors.push("attempt-owned system proxy publication was not found".into());
-            }
-            Err(error) => {
-                local_cleanup_verified = false;
-                errors.push(format!("restore attempt-owned system proxy: {error:#}"));
-            }
-        }
-    }
     if local_cleanup_verified {
         if let Err(error) = mihomo.stop() {
             local_cleanup_verified = false;
@@ -1024,6 +1091,29 @@ pub async fn disconnect(
             errors.join("; ")
         ))
     }
+}
+
+#[tauri::command]
+pub async fn disconnect(
+    mihomo: State<'_, MihomoState>,
+    mihomo_api: State<'_, vpn::MihomoApiState>,
+    ks_ctx: State<'_, KillSwitchState>,
+) -> Result<(), String> {
+    disconnect_impl(&mihomo, &mihomo_api, &ks_ctx, None).await
+}
+
+/// Explicit second step after a UI confirmation. The proxy layer itself
+/// revalidates the exact attempt token and proves that the enabled endpoint
+/// still references this attempt's loopback listener; foreign endpoints are
+/// never overwritten. All other disconnect cleanup remains identical.
+#[tauri::command]
+pub async fn disconnect_force_restore_proxy(
+    challenge: String,
+    mihomo: State<'_, MihomoState>,
+    mihomo_api: State<'_, vpn::MihomoApiState>,
+    ks_ctx: State<'_, KillSwitchState>,
+) -> Result<(), String> {
+    disconnect_impl(&mihomo, &mihomo_api, &ks_ctx, Some(&challenge)).await
 }
 
 /// Запущен ли VPN-движок (Mihomo) прямо сейчас.
@@ -1213,6 +1303,9 @@ pub struct RecoveryState {
     pub proxy_backup_present: bool,
     pub tun_orphan: bool,
     pub orphan_wfp_filters: bool,
+    /// `automatic`, `confirmation_required`,
+    /// `manual_intervention_required`, `unreadable`, or `none`.
+    pub proxy_recovery_disposition: String,
 }
 
 fn sanitized_proxy_recovery_metadata(backup: &platform::proxy::ProxyBackup) -> serde_json::Value {
@@ -1256,7 +1349,7 @@ mod diagnostics_privacy_tests {
 
 #[tauri::command]
 pub async fn get_recovery_state() -> RecoveryState {
-    let proxy_orphan = platform::proxy::is_proxy_pointing_to_us();
+    let (proxy_orphan, proxy_recovery_disposition) = platform::proxy::proxy_recovery_status();
     let proxy_backup_present = platform::proxy::has_pending_backup();
     let tun_orphan = platform::network::has_orphan_tun_adapters();
 
@@ -1287,6 +1380,7 @@ pub async fn get_recovery_state() -> RecoveryState {
         proxy_backup_present,
         tun_orphan,
         orphan_wfp_filters,
+        proxy_recovery_disposition: proxy_recovery_disposition.to_string(),
     }
 }
 
@@ -1470,8 +1564,25 @@ pub async fn restore_proxy_backup() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Отбросить backup без применения (пользователь в диалоге выбрал
-/// «не восстанавливать»). Текущее состояние реестра остаётся как есть.
+/// Second, explicit startup-recovery step after `restore_proxy_backup`
+/// returned a one-use confirmation challenge. The proxy layer binds the
+/// challenge to the durable backup and byte-exact observed registry state.
+#[tauri::command]
+pub async fn restore_proxy_backup_confirmed(challenge: String) -> Result<(), String> {
+    let _lifecycle = platform::lifecycle::enter().await?;
+    platform::proxy::force_restore_pending_owned_proxy(&challenge)
+        .and_then(|restored| {
+            if restored {
+                Ok(())
+            } else {
+                anyhow::bail!("owned proxy publication was not restored")
+            }
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Отбросить backup без применения только when Windows no longer references
+/// its enabled listener. Corrupt/legacy/owned-live markers are retained.
 #[tauri::command]
 pub async fn discard_proxy_backup() -> Result<(), String> {
     let _lifecycle = platform::lifecycle::enter().await?;
@@ -1589,58 +1700,10 @@ pub struct MihomoNodePing {
 #[tauri::command]
 pub async fn ping_mihomo_nodes(nodes: Vec<MihomoNodePing>) -> Vec<(String, Option<u32>)> {
     let futures = nodes.into_iter().map(|n| async move {
-        let latency = ping_node(&n.server, n.port).await;
+        let latency = vpn::ping::ping_node(&n.server, n.port).await;
         (n.name, latency)
     });
     futures::future::join_all(futures).await
-}
-
-/// Универсальный pre-connect ping одной ноды.
-///
-/// 1. **TCP-connect** к `server:port` — подтверждает живой TCP-сервис
-///    (vless / vmess / trojan / ss поверх TCP), даёт RTT до порта.
-/// 2. **Fallback ICMP-echo** к хосту — для UDP-протоколов
-///    (hysteria2 / tuic / wireguard), которые не слушают TCP, и когда
-///    TCP закрыт фаерволом. ICMP даёт network-RTT независимо от протокола
-///    (если сервер отвечает на эхо).
-async fn ping_node(server: &str, port: u16) -> Option<u32> {
-    // Без порта (старый кеш до добавления поля `port`) не пингуем: иначе
-    // весь список ушёл бы в ICMP, а ICMP к CDN-фронтед хостам отвечает
-    // за ~1мс (ближайший anycast-edge) → «1 ms везде». Пусть UI покажет
-    // «—», пока подписка не обновлена (refresh заполнит порты).
-    if server.is_empty() || port == 0 {
-        return None;
-    }
-    // TCP-connect к реальному серверу ноды — честный RTT для TCP-протоколов
-    // (vless/vmess/trojan/ss).
-    if let Some(ms) = vpn::ping::tcp_ping(server, port).await {
-        return Some(ms);
-    }
-    // TCP молчит → нода на UDP (hysteria2/tuic/wireguard) или TCP закрыт
-    // фаерволом. Fallback ICMP-echo к хосту.
-    let ip = resolve_ipv4(server, port).await?;
-    tokio::task::spawn_blocking(move || platform::icmp::icmp_echo_ipv4(ip, 2500))
-        .await
-        .ok()
-        .flatten()
-}
-
-/// Резолв хоста в IPv4 (host уже IP — возвращаем как есть, иначе DNS-lookup).
-async fn resolve_ipv4(host: &str, port: u16) -> Option<std::net::Ipv4Addr> {
-    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-        return vpn::ping::is_public_probe_ip(std::net::IpAddr::V4(ip)).then_some(ip);
-    }
-    let p = if port == 0 { 443 } else { port };
-    tokio::net::lookup_host((host, p))
-        .await
-        .ok()?
-        .find_map(|a| match a.ip() {
-            std::net::IpAddr::V4(v4) if vpn::ping::is_public_probe_ip(std::net::IpAddr::V4(v4)) => {
-                Some(v4)
-            }
-            std::net::IpAddr::V6(_) => None,
-            _ => None,
-        })
 }
 
 // ─── 14.F — export logs для саппорта ──────────────────────────────────────────
@@ -1729,12 +1792,14 @@ pub async fn export_diagnostics() -> Result<String, String> {
 
     // 4. recovery-state.json (без orphan_wfp_filters — оно требует
     // helper round-trip, не нужно в синхронном export-flow)
+    let (proxy_orphan, proxy_recovery_disposition) = platform::proxy::proxy_recovery_status();
     let state = RecoveryState {
-        proxy_orphan: platform::proxy::is_proxy_pointing_to_us(),
+        proxy_orphan,
         proxy_backup_present: platform::proxy::has_pending_backup(),
         tun_orphan: platform::network::has_orphan_tun_adapters(),
         orphan_wfp_filters: false,
         was_crashed: false,
+        proxy_recovery_disposition: proxy_recovery_disposition.to_string(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&state) {
         let _ = zip.start_file("recovery-state.json", opts);

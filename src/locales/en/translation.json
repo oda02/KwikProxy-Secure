@@ -274,7 +274,10 @@
     "proxyRestore": {
       "confirmMessage": "Another VPN changed the system proxy after KwikProxy connected, but Windows is still using KwikProxy's local proxy.\n\nChoose OK to restore the settings snapshot saved before connecting. This will overwrite proxy address and bypass-list changes made since then by another VPN or manually.\n\nChoose Cancel to overwrite nothing and leave KwikProxy running.",
       "cancelledTitle": "disconnect cancelled",
-      "cancelledMessage": "Proxy settings were not changed; KwikProxy was left running."
+      "blockedTitle": "disconnect needs attention",
+      "cancelledMessage": "Proxy settings were not changed; KwikProxy was left running.",
+      "foreignProxyPending": "Another VPN currently controls the system proxy. Stop it first, then retry disconnecting KwikProxy.",
+      "manualIntervention": "The system proxy address changed ambiguously. Change or disable the Windows proxy manually, then retry disconnecting KwikProxy."
     },
     "staleSelection": {
       "title": "no server selected",
@@ -284,7 +287,9 @@
       "title": "Could not connect",
       "retry": "Retry",
       "noSelection": "Select a server before connecting.",
-      "selectionChanged": "The subscription or selected server changed while connecting. Please retry."
+      "selectionChanged": "The subscription or selected server changed while connecting. Please retry.",
+      "cleanupPendingTitle": "Disconnect required",
+      "cleanupPending": "The connection failed and automatic rollback could not be verified. The existing session and protections were kept. Use Disconnect before trying to connect again. Details: {{details}}"
     }
   },
   "notification": {
@@ -712,11 +717,17 @@
     "crashRecovery": {
       "title": "leftovers from a previous session detected",
       "intro": "the previous run did not exit cleanly (crash or forced shutdown). we found:",
-      "explainBase": "«fix everything» — removes any of our wfp filters, deletes orphan tun adapters and force-clears the system proxy.",
+      "explainBase": "«fix everything» — removes our wfp filters, deletes orphan tun adapters and safely restores the system proxy; a conflict requires separate confirmation.",
       "explainRestoreProxy": "«restore proxy» — reverts the registry to the original values from before the connection.",
       "leaveAsIs": "leave as is",
       "restoreProxy": "restore proxy",
       "fixAll": "fix everything",
+      "confirmRestoreWarning": "Proxy settings changed after KwikProxy connected. Restoring the saved snapshot will overwrite the current ProxyEnable, ProxyServer and ProxyOverride values, including changes made by another VPN. Cancel keeps the current settings and backup.",
+      "cancelRestore": "cancel",
+      "confirmRestoreSnapshot": "restore saved snapshot",
+      "manualIntervention": "Windows still uses a KwikProxy port, but the proxy address no longer matches the exact published mapping. Change or disable the system proxy manually, then retry recovery.",
+      "foreignProxyPending": "Another VPN currently controls the system proxy. Stop it first, then retry recovery so KwikProxy can safely reconcile the settings that VPN restores when it stops.",
+      "unreadableProxyBackup": "The saved proxy recovery metadata cannot be read or verified. Automatic restore is disabled to avoid overwriting unknown Windows proxy settings. Keep the backup and repair or remove it only after inspecting the current proxy settings.",
       "findings": {
         "proxy": "system proxy is pointing to us",
         "backup": "a backup of the original proxy settings is saved",

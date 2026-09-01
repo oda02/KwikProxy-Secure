@@ -14,6 +14,7 @@ import {
   publishRequiredTombstone,
   readOptional,
   stopAndReconcile,
+  stopOnceAndReconcile,
   withAsyncRollback,
 } from "../src/lib/asyncControl.ts";
 
@@ -166,6 +167,46 @@ test("backend cleanup reports unknown when the final state probe fails", async (
   assert.equal(result.stopped, false);
   assert.equal(result.cleanupSucceeded, false);
   assert.equal(result.observedRunning, null);
+  assert.strictEqual(result.error, exact);
+});
+
+test("one-use cleanup invokes stop once and only polls status afterward", async () => {
+  let stopCalls = 0;
+  let statusCalls = 0;
+  const result = await stopOnceAndReconcile(
+    async () => {
+      stopCalls += 1;
+    },
+    async () => {
+      statusCalls += 1;
+      return statusCalls < 3;
+    },
+    3,
+    0
+  );
+
+  assert.equal(stopCalls, 1);
+  assert.equal(statusCalls, 3);
+  assert.equal(result.stopped, true);
+  assert.equal(result.cleanupSucceeded, true);
+});
+
+test("one-use cleanup never replays a consumed receipt after failure", async () => {
+  const exact = new Error("receipt consumed before cleanup failed");
+  let stopCalls = 0;
+  const result = await stopOnceAndReconcile(
+    async () => {
+      stopCalls += 1;
+      throw exact;
+    },
+    async () => false,
+    3,
+    0
+  );
+
+  assert.equal(stopCalls, 1);
+  assert.equal(result.stopped, true);
+  assert.equal(result.cleanupSucceeded, false);
   assert.strictEqual(result.error, exact);
 });
 

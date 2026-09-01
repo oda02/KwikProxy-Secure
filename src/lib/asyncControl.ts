@@ -144,6 +144,60 @@ export async function stopAndReconcile(
   };
 }
 
+/**
+ * Invoke a non-idempotent stop exactly once, then perform only bounded status
+ * polling. This is required for one-use confirmation receipts: retrying the
+ * command would replay an already-consumed receipt, while a short status poll
+ * still allows an asynchronously exiting backend to become observable.
+ */
+export async function stopOnceAndReconcile(
+  stop: () => Promise<void>,
+  isRunning: () => Promise<boolean>,
+  maxStatusAttempts = 3,
+  pollDelayMs = 75
+): Promise<BackendStopResult> {
+  let firstError: unknown | null = null;
+  let stopSucceeded = false;
+  let observedRunning: boolean | null = null;
+
+  try {
+    await stop();
+    stopSucceeded = true;
+  } catch (error) {
+    firstError = error;
+  }
+
+  const attempts = Math.max(1, maxStatusAttempts);
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      observedRunning = await isRunning();
+      if (!observedRunning) break;
+    } catch (error) {
+      firstError ??= error;
+      observedRunning = null;
+    }
+    if (attempt + 1 < attempts && pollDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, pollDelayMs));
+    }
+  }
+
+  if (stopSucceeded && observedRunning === false) {
+    return {
+      stopped: true,
+      cleanupSucceeded: true,
+      observedRunning: false,
+      error: firstError,
+    };
+  }
+  return {
+    stopped: observedRunning === false,
+    cleanupSucceeded: false,
+    observedRunning,
+    error:
+      firstError ?? new Error("backend remained running after one-use cleanup"),
+  };
+}
+
 /** Publish local state only after an asynchronous backend commit succeeds. */
 export async function publishAfterCommit<T>(
   commit: () => Promise<T | null>,
